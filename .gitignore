@@ -1,0 +1,187 @@
+# =================================================
+# Android / Gradle / Android Studio .gitignore
+# Stable (low-collateral) version
+# =================================================
+
+# -------------------------------
+# OS temporary files
+# -------------------------------
+.DS_Store
+**/.DS_Store
+Thumbs.db
+**/Thumbs.db
+
+# -------------------------------
+# IDE / editors
+# -------------------------------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+
+# Android Studio generated
+captures/
+.navigation/
+**/.navigation/
+
+# If you ever decide to commit parts of .idea/, keep these ignored:
+.idea/**/misc.xml
+.idea/**/deploymentTargetDropDown.xml
+.idea/**/render.experimental.xml
+.idea/**/workspace.xml
+
+# -------------------------------
+# Gradle / build outputs
+# -------------------------------
+.gradle/
+**/.gradle/
+**/build/
+
+# Keep Gradle wrapper JAR
+!gradle/wrapper/gradle-wrapper.jar
+
+# Local machine config
+local.properties
+**/local.properties
+
+# Kotlin compiler/cache
+.kotlin/
+**/.kotlin/
+.kotlinc/
+
+# -------------------------------
+# Android / NDK / CMake outputs
+# -------------------------------
+.externalNativeBuild/
+**/.externalNativeBuild/
+.cxx/
+**/.cxx/
+**/cmake-build-*/
+
+# Android packaging metadata (generated)
+output-metadata.json
+**/output-metadata.json
+
+# -------------------------------
+# Artifacts
+# -------------------------------
+*.apk
+*.ap_
+*.aab
+*.aar
+
+# -------------------------------
+# Secrets / signing (NEVER COMMIT)
+# -------------------------------
+gradle.properties.local
+keystore.properties
+signing.properties
+release.properties
+
+*.jks
+*.keystore
+*.pem
+*.p12
+*.pfx
+*.cer
+*.der
+*.crt
+*.key
+
+.env
+.env.*
+secrets*.gradle
+secret*.properties
+
+# -------------------------------
+# Google / Firebase
+# -------------------------------
+**/google-services.json
+**/GoogleService-Info.plist
+
+# R8/ProGuard mappings & Crashlytics props (generated)
+**/outputs/mapping/
+**/crashlytics-build.properties
+
+# -------------------------------
+# Logs / profiler / dumps
+# -------------------------------
+*.log
+*.hprof
+.traces/
+**/.traces/
+perf-*.json
+
+# -------------------------------
+# Lint / reports / coverage
+# -------------------------------
+**/lint-results*.xml
+**/lint-results*.html
+**/lint-baseline.txt
+**/reports/
+**/test-results*/
+**/jacoco/*.exec
+**/jacocoTestReport.xml
+**/coverage.ec
+
+# -------------------------------
+# KAPT / KSP / generated sources
+# -------------------------------
+**/kapt*/
+**/ksp*/
+**/generated/
+
+# -------------------------------
+# Dependency caches (optional)
+# -------------------------------
+.caches/
+.cache/
+node_modules/
+
+# -------------------------------
+# fastlane (generated outputs)
+# -------------------------------
+fastlane/report.xml
+fastlane/Preview.html
+fastlane/screenshots
+fastlane/test_output
+
+# -------------------------------
+# ★ Models / large assets (stable exclusion)
+#   Strategy:
+#   - Exclude by directory name to avoid collateral damage.
+#   - Do NOT globally ignore generic extensions like *.bin.
+# -------------------------------
+models/**
+**/models/**
+app/src/main/assets/models/**
+!app/src/main/assets/models/.keep
+
+# Optional: if you also use these folders, uncomment:
+# weights/**
+# **/weights/**
+# checkpoints/**
+# **/checkpoints/**
+# llm/**
+# **/llm/**
+
+# "Safe" global model extensions (rarely used for non-model assets).
+# If you have legitimate non-model files with these extensions, remove the relevant line.
+*.gguf
+*.safetensors
+*.onnx
+*.tflite
+*.litertlm
+*.mlmodel
+*.mlpackage
+
+# -------------------------------
+# Other temp / backups
+# -------------------------------
+*.swp
+*.swo
+*~
+*.orig
+*.bak
+*.tmp
