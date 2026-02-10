@@ -25,10 +25,12 @@ import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.width
@@ -60,6 +62,7 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -85,33 +88,54 @@ import com.negi.surveys.chat.FakeSlmRepository
 import com.negi.surveys.chat.InMemoryChatDraftStore
 import com.negi.surveys.chat.Repository
 import com.negi.surveys.chat.SlmAnswerValidator
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.debounce
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.filterNotNull
 
+@OptIn(FlowPreview::class)
 @Composable
 fun ChatQuestionScreen(
     questionId: String,
     prompt: String = "Question prompt for $questionId (placeholder)",
     repository: Repository? = null,
-    onNext: (answerCombined: String) -> Unit,
+
+    /**
+     * Called when user taps Next.
+     *
+     * Contract:
+     * - Provides a full snapshot log for Review.
+     * - log.payload is always non-empty (skipped payload is generated when needed).
+     */
+    onNext: (log: ReviewQuestionLog) -> Unit,
+
     onBack: () -> Unit
 ) {
-    // Keep latest callback to avoid capturing stale lambdas in long-lived handlers.
+    // NOTE:
+    // - Keep the latest callback to avoid capturing stale lambdas inside long-lived coroutines/effects.
     val onNextLatest by rememberUpdatedState(onNext)
 
-    // Per-question streaming bridge instance.
+    // NOTE:
+    // - Per-question streaming bridge instance (kept stable while questionId is stable).
     val streamBridge = remember(questionId) { ChatStreamBridge() }
 
-    // Process-lifetime draft store (SmallStep default).
+    // NOTE:
+    // - Process-lifetime draft store (SmallStep default). This survives screen swaps in the same process.
     val draftStore: ChatDraftStore = remember { ChatDraftStoreHolder.store }
 
-    // Draft identity: keep stable for the same question + prompt text.
+    // NOTE:
+    // - Draft identity: stable for the same question + prompt text.
     val draftKey = remember(questionId, prompt) {
         DraftKey(questionId = questionId, promptHash = prompt.hashCode())
     }
 
-    // Choose repository: real one from DI, or fake.
-    val repo: Repository = repository ?: remember(questionId) { FakeSlmRepository() }
+    // NOTE:
+    // - Choose repository: real one from DI, or fake.
+    // - Remember by (questionId, prompt) to avoid mismatching prompt vs repository output in tests.
+    val repo: Repository = repository ?: remember(questionId, prompt) { FakeSlmRepository() }
 
-    // Build SLM validator (streaming-enabled).
+    // NOTE:
+    // - Build SLM validator (streaming-enabled).
     val validator: AnswerValidator = remember(questionId, prompt, repo, streamBridge) {
         SlmAnswerValidator(
             repository = repo,
@@ -120,7 +144,8 @@ fun ChatQuestionScreen(
         )
     }
 
-    // VM identity key: changes when prompt changes to avoid reusing stale state.
+    // NOTE:
+    // - VM identity key: changes when prompt changes to avoid reusing stale state.
     val vmKey = remember(questionId, prompt) {
         "ChatQuestionViewModel:$questionId:${prompt.hashCode()}"
     }
@@ -142,19 +167,20 @@ fun ChatQuestionScreen(
     val messages by vm.messages.collectAsStateWithLifecycle()
     val input by vm.input.collectAsStateWithLifecycle()
     val isBusy by vm.isBusy.collectAsStateWithLifecycle()
-
-    // Sticky completion payload (may be null if unanswered or not accepted yet).
     val completionPayload by vm.completionPayload.collectAsStateWithLifecycle()
 
-    // Submit is allowed when user typed something and VM is not busy.
+    // NOTE:
+    // - Submit is allowed when user typed something and VM is not busy.
     val canSubmit = input.trim().isNotEmpty() && !isBusy
 
-    // Debounce latch for Next onClick.
+    // NOTE:
+    // - Debounce latch for Next onClick (prevents double navigation taps).
     var nextInFlight by remember(vmKey) { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
 
-    // Measure bottom bar height (excluding IME padding) so we can pad the list correctly.
+    // NOTE:
+    // - Measure bottom bar height so we can pad the list correctly.
     var bottomBarPx by remember(vmKey) { mutableIntStateOf(0) }
     val density = LocalDensity.current
     val bottomBarDp = remember(bottomBarPx, density) {
@@ -163,8 +189,8 @@ fun ChatQuestionScreen(
 
     /**
      * Per-message expand state for:
-     * - MODEL bubble (while STREAMING)
      * - ASSISTANT embedded "Model output" section (collapsed by default)
+     * - MODEL bubble (if it ever becomes non-streaming in the future)
      *
      * This is UI-only state (does not mutate VM).
      */
@@ -175,18 +201,45 @@ fun ChatQuestionScreen(
         Log.d(TAG, "Next latch reset. qid=$questionId vmKey=$vmKey")
     }
 
-    LaunchedEffect(messages.size, bottomBarPx) {
-        if (messages.isNotEmpty()) {
-            val lastIndex = messages.size - 1
-            runCatching { listState.animateScrollToItem(lastIndex) }
-                .onFailure { e ->
+    // NOTE:
+    // - Auto-scroll must respond not only to message count changes, but also to streaming text growth.
+    LaunchedEffect(vmKey, bottomBarPx) {
+        snapshotFlow {
+            val last = messages.lastOrNull()
+            if (last == null) {
+                null
+            } else {
+                val streamLen = last.streamText?.length ?: 0
+                val textLen = last.text.length
+                val sig = (last.id.hashCode() * 31) + (textLen * 7) + streamLen
+                Pair(messages.size, sig)
+            }
+        }
+            .filterNotNull()
+            .distinctUntilChanged()
+            .debounce(80)
+            .collect {
+                if (messages.isEmpty()) return@collect
+                val lastIndex = messages.size - 1
+                val lastMsg = messages[lastIndex]
+                val streaming = lastMsg.role == ChatRole.MODEL && lastMsg.streamState == ChatStreamState.STREAMING
+
+                runCatching {
+                    if (streaming) {
+                        listState.scrollToItem(lastIndex)
+                    } else {
+                        listState.animateScrollToItem(lastIndex)
+                    }
+                }.onFailure { e ->
                     Log.w(TAG, "Auto-scroll failed (non-fatal). size=${messages.size}", e)
                 }
-        }
+            }
     }
 
     DisposableEffect(vm) {
         onDispose {
+            // NOTE:
+            // - Ensure we stop streaming when screen is disposed (navigation/back stack).
             vm.cancelValidation("screen_dispose")
         }
     }
@@ -200,13 +253,21 @@ fun ChatQuestionScreen(
     Surface(
         modifier = Modifier
             .fillMaxSize()
-            .windowInsetsPadding(WindowInsets.safeDrawing),
+            /**
+             * IMPORTANT:
+             * - App-level TopBar consumes TOP statusBars inset.
+             * - Do NOT apply TOP safeDrawing here, or you get double top padding.
+             */
+            .windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
+            ),
         color = MaterialTheme.colorScheme.background
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 12.dp, vertical = 10.dp)
+                // NOTE: Keep the header as high as possible.
+                .padding(horizontal = 12.dp, vertical = 0.dp)
         ) {
             HeaderCard(
                 questionId = questionId,
@@ -217,7 +278,6 @@ fun ChatQuestionScreen(
 
             Spacer(Modifier.height(10.dp))
 
-            // Subtle background panel to make chat area feel “contained”.
             Box(
                 modifier = Modifier
                     .weight(1f)
@@ -238,7 +298,10 @@ fun ChatQuestionScreen(
                             detailsExpanded = detailsExpanded[msg.id] ?: false,
                             onToggleDetailsExpand = { expand ->
                                 detailsExpanded[msg.id] = expand
-                                Log.d(TAG, "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}")
+                                Log.d(
+                                    TAG,
+                                    "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}"
+                                )
                             }
                         )
                     }
@@ -268,14 +331,33 @@ fun ChatQuestionScreen(
                         Log.w(TAG, "Next clicked while inFlight=true (ignored). qid=$questionId")
                         return@BottomComposerCard
                     }
+
                     nextInFlight = true
-                    vm.cancelValidation("next_click")
-                    val payload = completionPayload ?: buildSkippedPayload(questionId, prompt)
-                    Log.d(
-                        TAG,
-                        "Next clicked. qid=$questionId skipped=${completionPayload == null} payloadLen=${payload.length}"
-                    )
-                    onNextLatest(payload)
+                    try {
+                        vm.cancelValidation("next_click")
+
+                        val skipped = (completionPayload == null)
+                        val payload = completionPayload ?: buildSkippedPayload(questionId, prompt)
+
+                        val log = buildReviewQuestionLog(
+                            questionId = questionId,
+                            prompt = prompt,
+                            isSkipped = skipped,
+                            payload = payload,
+                            messagesSnapshot = messages
+                        )
+
+                        Log.d(
+                            TAG,
+                            "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}"
+                        )
+                        onNextLatest(log)
+                    } finally {
+                        // NOTE:
+                        // - In most navigation flows, the screen will dispose immediately.
+                        // - This still protects against "no navigation happened" cases.
+                        nextInFlight = false
+                    }
                 },
                 onMeasuredHeightPx = { bottomBarPx = it }
             )
@@ -302,7 +384,6 @@ private fun HeaderCard(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 Column(modifier = Modifier.weight(1f)) {
-                    // Smaller title (compact)
                     Text(
                         text = "Question $questionId",
                         style = MaterialTheme.typography.labelLarge,
@@ -416,19 +497,14 @@ private fun BottomComposerCard(
                     onClick = onBack,
                     modifier = Modifier.weight(1f),
                     enabled = true
-                ) {
-                    Text("Back")
-                }
+                ) { Text("Back") }
 
                 Button(
                     onClick = onSubmit,
                     modifier = Modifier.weight(1f),
                     enabled = canSubmit
-                ) {
-                    Text("Submit")
-                }
+                ) { Text("Submit") }
 
-                // Primary CTA: Next
                 Button(
                     onClick = onNext,
                     modifier = Modifier.weight(1f),
@@ -436,14 +512,11 @@ private fun BottomComposerCard(
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary
                     )
-                ) {
-                    Text("Next")
-                }
+                ) { Text("Next") }
             }
 
             Spacer(Modifier.height(6.dp))
 
-            // Small hint line, tasteful and not shouty.
             Text(
                 text = if (hasCompletion) {
                     "Next will use the accepted answer."
@@ -463,11 +536,6 @@ private fun BottomComposerCard(
  * Requirements:
  * - USER: right aligned
  * - ASSISTANT/MODEL: left aligned
- *
- * Visual policy:
- * - ASSISTANT: show explanation (assistantMessage) and question (followUpQuestion) as separate blocks.
- * - ASSISTANT: if streamText exists, render an embedded "Model output" section (collapsed by default).
- * - MODEL: show streaming text while running (separate bubble); allow collapse only if VM ever emits ended MODEL.
  */
 @Composable
 private fun ChatBubbleStructured(
@@ -480,11 +548,8 @@ private fun ChatBubbleStructured(
     val isAssistant = msg.role == ChatRole.ASSISTANT
 
     val hasStreamDetails = !msg.streamText.isNullOrBlank() && msg.streamState != ChatStreamState.NONE
-
-    // VM policy:
-    // - MODEL: STREAMING bubble only (usually)
-    // - ASSISTANT: embeds model output in streamText after End/Error (collapsed by default)
     val isStreamingModelBubble = isModel && (msg.streamState == ChatStreamState.STREAMING)
+
     val rowAlign = if (isUser) Arrangement.End else Arrangement.Start
 
     val shape = if (isUser) {
@@ -507,18 +572,15 @@ private fun ChatBubbleStructured(
 
     val outline = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
 
-    // Expand rule:
-    // - MODEL streaming: always expanded for readability.
-    // - ASSISTANT embedded details: collapsed by default if msg.streamCollapsed=true.
     val expanded = when {
         isStreamingModelBubble -> true
         hasStreamDetails -> (detailsExpanded || !msg.streamCollapsed)
         else -> false
     }
 
-    // Width policy:
-    // - Compact when embedded model output is collapsed (inside assistant) OR ended model bubble collapsed.
-    val isCompactPill = (hasStreamDetails && !expanded) || (isModel && !isStreamingModelBubble && !expanded && !msg.streamText.isNullOrBlank())
+    val isCompactPill =
+        (hasStreamDetails && !expanded) ||
+                (isModel && !isStreamingModelBubble && !expanded && !msg.streamText.isNullOrBlank())
 
     val maxWidth = when {
         isCompactPill -> 360.dp
@@ -544,7 +606,6 @@ private fun ChatBubbleStructured(
 
             Column(modifier = Modifier.padding(horizontal = basePaddingH, vertical = basePaddingV)) {
 
-                // Header tag
                 if (!isUser && !isCompactPill) {
                     val header = if (isModel) "MODEL" else "AI"
                     val headerBg = if (isModel) {
@@ -583,7 +644,6 @@ private fun ChatBubbleStructured(
                         val a = msg.assistantMessage?.trim().orEmpty()
                         val q = msg.followUpQuestion?.trim().orEmpty()
 
-                        // Assistant explanation block
                         if (a.isNotEmpty()) {
                             Text(
                                 text = a,
@@ -598,7 +658,6 @@ private fun ChatBubbleStructured(
                             )
                         }
 
-                        // Follow-up question block (distinct color)
                         if (q.isNotEmpty()) {
                             Spacer(Modifier.height(10.dp))
 
@@ -632,12 +691,10 @@ private fun ChatBubbleStructured(
                             }
                         }
 
-                        // Embedded model output section (collapsed pill by default)
                         if (hasStreamDetails) {
                             Spacer(Modifier.height(10.dp))
 
                             val raw = msg.streamText.orEmpty()
-                            val state = msg.streamState
                             val canClick = raw.isNotBlank()
                             val clickMod = if (canClick) {
                                 Modifier.clickable { onToggleDetailsExpand(!expanded) }
@@ -646,7 +703,6 @@ private fun ChatBubbleStructured(
                             }
 
                             if (!expanded) {
-                                // Compact pill (collapsed)
                                 val pillShape = RoundedCornerShape(12.dp)
                                 Row(
                                     modifier = Modifier
@@ -657,13 +713,8 @@ private fun ChatBubbleStructured(
                                         .padding(horizontal = 10.dp, vertical = 6.dp),
                                     verticalAlignment = Alignment.CenterVertically
                                 ) {
-                                    val label = when (state) {
-                                        ChatStreamState.ERROR -> "Model output (error)"
-                                        else -> "Model output"
-                                    }
-
                                     Text(
-                                        text = label,
+                                        text = "Model output",
                                         style = MaterialTheme.typography.labelSmall,
                                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                                         fontWeight = FontWeight.SemiBold
@@ -682,7 +733,6 @@ private fun ChatBubbleStructured(
                                     )
                                 }
                             } else {
-                                // Expanded details block
                                 val blockShape = RoundedCornerShape(14.dp)
                                 Column(
                                     modifier = Modifier
@@ -717,7 +767,6 @@ private fun ChatBubbleStructured(
                     }
 
                     isModel -> {
-                        // MODEL bubble is meant for streaming. Still robust if VM ever emits ended MODEL.
                         val raw = msg.streamText?.takeIf { it.isNotBlank() } ?: msg.text
 
                         val canClick = !isStreamingModelBubble && raw.isNotBlank()
@@ -781,14 +830,8 @@ private fun ChatBubbleStructured(
 
                                 Spacer(Modifier.height(6.dp))
 
-                                val hint = when {
-                                    isStreamingModelBubble -> "Streaming…"
-                                    expanded -> "Tap to collapse"
-                                    else -> "Tap to expand"
-                                }
-
                                 Text(
-                                    text = hint,
+                                    text = if (isStreamingModelBubble) "Streaming…" else if (expanded) "Tap to collapse" else "Tap to expand",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -820,6 +863,70 @@ private fun buildSkippedPayload(questionId: String, prompt: String): String {
         append("PROMPT_HASH: ").append(promptHash).append('\n')
         append("ANSWER: (none)\n")
     }.trim()
+}
+
+/**
+ * Converts the current chat messages into a Review snapshot.
+ *
+ * Notes:
+ * - We intentionally preserve all roles (USER/ASSISTANT/MODEL).
+ * - ASSISTANT may contribute multiple lines (answer + follow-up + embedded model raw).
+ */
+private fun buildReviewQuestionLog(
+    questionId: String,
+    prompt: String,
+    isSkipped: Boolean,
+    payload: String,
+    messagesSnapshot: List<ChatMessage>
+): ReviewQuestionLog {
+    val lines = ArrayList<ReviewChatLine>(messagesSnapshot.size * 2)
+
+    for (m in messagesSnapshot) {
+        when (m.role) {
+            ChatRole.USER -> {
+                val t = m.text.trim()
+                if (t.isNotEmpty()) {
+                    lines += ReviewChatLine(kind = ReviewChatKind.USER, text = t)
+                }
+            }
+
+            ChatRole.ASSISTANT -> {
+                val a = m.assistantMessage?.trim().orEmpty()
+                val fallback = m.text.trim()
+                val q = m.followUpQuestion?.trim().orEmpty()
+
+                if (a.isNotEmpty()) {
+                    lines += ReviewChatLine(kind = ReviewChatKind.AI, text = a)
+                } else if (fallback.isNotEmpty()) {
+                    lines += ReviewChatLine(kind = ReviewChatKind.AI, text = fallback)
+                }
+
+                if (q.isNotEmpty()) {
+                    lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = q)
+                }
+
+                val raw = m.streamText?.trim().orEmpty()
+                if (raw.isNotEmpty() && m.streamState != ChatStreamState.NONE) {
+                    lines += ReviewChatLine(kind = ReviewChatKind.MODEL_RAW, text = raw)
+                }
+            }
+
+            ChatRole.MODEL -> {
+                val raw = (m.streamText?.takeIf { it.isNotBlank() } ?: m.text).trim()
+                if (raw.isNotEmpty()) {
+                    lines += ReviewChatLine(kind = ReviewChatKind.MODEL_RAW, text = raw)
+                }
+            }
+        }
+    }
+
+    return ReviewQuestionLog(
+        questionId = questionId,
+        prompt = prompt,
+        isSkipped = isSkipped,
+        payload = payload,
+        lines = lines
+    )
 }
 
 /**

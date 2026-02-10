@@ -89,7 +89,7 @@ fun SurveyStartScreen(
 
     Column(
         modifier = Modifier
-            .windowInsetsPadding(WindowInsets.safeDrawing)
+            //.windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {

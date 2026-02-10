@@ -27,24 +27,21 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 
 /**
  * ViewModel that drives a chat-style Q/A with validation + multi follow-up support,
  * and survives navigation by persisting/restoring state via [ChatDraftStore].
  *
- * Notes:
- * - Some UIs allow "Skip" externally (e.g., Next without completionPayload). This VM still
- *   maintains completionPayload for the "accepted answer" path and draft restoration.
- *
- * Editing after completion:
- * - If the user revisits a completed question and submits a new message, the VM re-opens the question,
- *   clears completion payload, and re-validates as a new attempt (when allowResubmitAfterDone=true).
- *
- * Streaming UX policy (implemented here):
+ * Streaming UX policy:
  * - While streaming: show ONE MODEL bubble (expanded).
  * - When stream ends: remove MODEL bubble and embed output into the next ASSISTANT outcome bubble
  *   as collapsible "Model output" details (collapsed by default).
+ *
+ * Concurrency note:
+ * - Chat transcript is updated from both validation coroutine and stream collector coroutine.
+ * - Always use StateFlow.update { ... } for atomic list mutations to avoid lost updates.
  */
 class ChatQuestionViewModel(
     private val questionId: String,
@@ -68,21 +65,20 @@ class ChatQuestionViewModel(
     val isBusy: StateFlow<Boolean> = _isBusy.asStateFlow()
 
     /**
-     * One-shot completion event (optional).
+     * One-shot completion event (legacy).
      *
-     * Notes:
-     * - Keep for legacy flows that still react to events.
-     * - UI should NOT rely on this for enabling Next; use completionPayload state instead.
+     * NOTE:
+     * - UI should prefer [completionPayload] (state) for enabling Next across navigation.
      */
     private val _completion = MutableSharedFlow<String>(extraBufferCapacity = 1)
     val completion: SharedFlow<String> = _completion.asSharedFlow()
 
     /**
-     * Sticky completion payload for enabling Next even after returning via Back.
+     * Sticky completion payload.
      *
-     * Notes:
-     * - This is state, not an event.
-     * - UI should read this for enabling Next.
+     * NOTE:
+     * - This is "state", not an event.
+     * - UI should read this to enable Next even after returning via Back.
      */
     private val _completionPayload = MutableStateFlow<String?>(null)
     val completionPayload: StateFlow<String?> = _completionPayload.asStateFlow()
@@ -129,15 +125,21 @@ class ChatQuestionViewModel(
         Log.d(TAG, "VM init questionId=$questionId draftKey=$draftKey stage=$stage")
     }
 
+    override fun onCleared() {
+        // NOTE:
+        // - Avoid leaving streaming UI in an inconsistent state after VM disposal.
+        // - Suppress "cancelled" error rendering because this is an intentional lifecycle cancellation.
+        runCatching { cancelValidation("onCleared") }
+        super.onCleared()
+    }
+
     fun setInput(text: String) {
         _input.value = text
         // NOTE:
         // - Input is ephemeral. Avoid persisting on every keystroke for performance.
     }
 
-    /**
-     * Backward-compatible alias for older UI code.
-     */
+    /** Backward-compatible alias for older UI code. */
     fun send() = submit()
 
     /**
@@ -152,18 +154,16 @@ class ChatQuestionViewModel(
         if (text.isEmpty()) return
         if (_isBusy.value) return
 
-        // If completed, allow the user to re-answer by re-opening.
         if (stage == ChatStage.DONE && allowResubmitAfterDone) {
             reopenForEdit()
         } else if (stage == ChatStage.DONE) {
-            // Hard stop if editing is disabled.
             return
         }
 
         _input.value = ""
         appendUser(text)
 
-        // Cancel any previous validation job defensively.
+        // Defensive cancel. Streaming UI is only active when busy, so this should be rare.
         validationJob?.cancel()
         validationJob = null
 
@@ -178,7 +178,7 @@ class ChatQuestionViewModel(
             } finally {
                 _isBusy.value = false
                 validationJob = null
-                persistDraft()
+                safePersistDraft("submit.finally")
             }
         }
     }
@@ -193,10 +193,8 @@ class ChatQuestionViewModel(
     fun cancelValidation(reason: String) {
         Log.d(TAG, "cancelValidation: qid=$questionId reason=$reason")
 
-        // Mark that the next "cancelled" error event should be suppressed in the stream collector.
         suppressNextCancelledError.set(true)
 
-        // Remember which session we are cancelling to ignore late deltas.
         val cancelledSession = activeStreamSessionId
         if (cancelledSession > 0L) {
             lastCancelledStreamSessionId = cancelledSession
@@ -206,21 +204,21 @@ class ChatQuestionViewModel(
         validationJob = null
         _isBusy.value = false
 
-        // Remove active MODEL stream bubble immediately (if any).
         val msgId = activeStreamMsgId
         if (msgId != null) {
             removeMessage(msgId)
         }
 
-        // Clear active stream markers.
         activeStreamMsgId = null
         activeStreamSessionId = 0L
 
-        // Clear pending embed state (do not attach cancelled output).
         clearPendingModelEmbed("cancelValidation")
-
-        persistDraft()
+        safePersistDraft("cancelValidation")
     }
+
+    // ---------------------------------------------------------------------
+    // Validation handlers
+    // ---------------------------------------------------------------------
 
     private suspend fun handleMain(answer: String) {
         mainAnswer = answer
@@ -234,9 +232,6 @@ class ChatQuestionViewModel(
             null
         }
 
-        // Render a structured assistant bubble:
-        // - assistantMessage + followUpQuestion (if any)
-        // - embed pending model output (if available)
         appendAssistantOutcome(
             assistantMessage = out.assistantMessage,
             followUpQuestion = followUp
@@ -245,13 +240,13 @@ class ChatQuestionViewModel(
         if (out.status == ValidationStatus.NEED_FOLLOW_UP) {
             currentFollowUpQuestion = followUp.orEmpty()
             stage = ChatStage.AWAIT_FOLLOW_UP
-            persistDraft()
+            safePersistDraft("handleMain.need_follow_up")
         } else {
             stage = ChatStage.DONE
             val payload = buildCombined(mainAnswer, followUps)
             _completionPayload.value = payload
             _completion.tryEmit(payload)
-            persistDraft()
+            safePersistDraft("handleMain.done")
         }
     }
 
@@ -262,11 +257,10 @@ class ChatQuestionViewModel(
             val payload = buildCombined(mainAnswer, followUps)
             _completionPayload.value = payload
             _completion.tryEmit(payload)
-            persistDraft()
+            safePersistDraft("handleFollowUp.max_followups")
             return
         }
 
-        // Save turn (assistant Q + user A).
         val q = currentFollowUpQuestion.ifEmpty { "(follow-up)" }
         followUps += FollowUpTurn(question = q, answer = userAnswer)
         logAnswerDigest("followup#${followUps.size}", userAnswer)
@@ -293,13 +287,13 @@ class ChatQuestionViewModel(
         if (out.status == ValidationStatus.NEED_FOLLOW_UP) {
             currentFollowUpQuestion = followUp.orEmpty()
             stage = ChatStage.AWAIT_FOLLOW_UP
-            persistDraft()
+            safePersistDraft("handleFollowUp.need_follow_up")
         } else {
             stage = ChatStage.DONE
             val payload = buildCombined(mainAnswer, followUps)
             _completionPayload.value = payload
             _completion.tryEmit(payload)
-            persistDraft()
+            safePersistDraft("handleFollowUp.done")
         }
     }
 
@@ -308,7 +302,7 @@ class ChatQuestionViewModel(
      *
      * Strategy:
      * - Keep the prior transcript (auditability).
-     * - Clear completion payload so Next becomes disabled until re-accepted (if UI uses it).
+     * - Clear completion payload so Next becomes disabled until re-accepted.
      * - Clear follow-up state so we start fresh from main answer.
      */
     private fun reopenForEdit() {
@@ -318,14 +312,18 @@ class ChatQuestionViewModel(
         currentFollowUpQuestion = ""
         followUps.clear()
         _completionPayload.value = null
-        persistDraft()
+        safePersistDraft("reopenForEdit")
     }
 
+    // ---------------------------------------------------------------------
+    // Follow-up context and payload
+    // ---------------------------------------------------------------------
+
     /**
-     * Builds a compact, model-friendly follow-up history string.
+     * Builds a compact, deterministic follow-up history string.
      *
-     * Notes:
-     * - Deterministic and compact.
+     * NOTE:
+     * - This is deliberately simple and stable.
      * - Avoid re-printing MAIN_ANSWER here; validator already has it separately.
      */
     private fun buildFollowUpContext(turns: List<FollowUpTurn>): String {
@@ -357,18 +355,20 @@ class ChatQuestionViewModel(
         }.trim()
     }
 
+    // ---------------------------------------------------------------------
+    // Transcript mutations (must be atomic)
+    // ---------------------------------------------------------------------
+
     private fun appendUser(text: String) {
         val msg = ChatMessage.user(
             id = UUID.randomUUID().toString(),
             text = text
         )
-        _messages.value = _messages.value + msg
-        persistDraft()
+        _messages.update { it + msg }
+        safePersistDraft("appendUser")
     }
 
-    /**
-     * Append a plain assistant message (non-structured).
-     */
+    /** Append a plain assistant message (non-structured). */
     private fun appendAssistantText(text: String) {
         val msg = ChatMessage.assistant(
             id = UUID.randomUUID().toString(),
@@ -376,16 +376,15 @@ class ChatQuestionViewModel(
             followUpQuestion = null,
             textFallback = text
         )
-        _messages.value = _messages.value + msg
-        persistDraft()
+        _messages.update { it + msg }
+        safePersistDraft("appendAssistantText")
     }
 
     /**
      * Append a structured assistant outcome bubble.
      *
      * Embedding rule:
-     * - If there is pending model output (stored by stream End/Error), embed it into this assistant bubble
-     *   as streamText + streamState + streamCollapsed=true.
+     * - If there is pending model output (stored by stream End/Error), embed it into this assistant bubble.
      */
     private fun appendAssistantOutcome(
         assistantMessage: String,
@@ -394,7 +393,6 @@ class ChatQuestionViewModel(
         val a = assistantMessage.trim()
         val q = followUpQuestion?.trim().orEmpty()
 
-        // Text fallback for older UIs that only render msg.text.
         val composite = buildString {
             if (a.isNotEmpty()) append(a)
             if (q.isNotEmpty()) {
@@ -404,8 +402,8 @@ class ChatQuestionViewModel(
         }.trim()
 
         val id = UUID.randomUUID().toString()
-
         val pending = pendingModelOutput?.takeIf { it.isNotBlank() }
+
         val msg = if (pending != null && pendingModelState != ChatStreamState.NONE) {
             ChatMessage.assistantWithModelOutput(
                 id = id,
@@ -425,24 +423,23 @@ class ChatQuestionViewModel(
             )
         }
 
-        _messages.value = _messages.value + msg
+        _messages.update { it + msg }
         lastOutcomeAssistantMsgId = id
 
-        // If we embedded pending output now, clear it.
         if (pending != null) {
             clearPendingModelEmbed("appendAssistantOutcome(embed)")
         }
 
-        persistDraft()
+        safePersistDraft("appendAssistantOutcome")
     }
 
     private fun removeMessage(id: String) {
-        _messages.value = _messages.value.filterNot { it.id == id }
+        _messages.update { it.filterNot { m -> m.id == id } }
     }
 
     private fun updateMessage(id: String, transform: (ChatMessage) -> ChatMessage) {
-        _messages.value = _messages.value.map { m ->
-            if (m.id == id) transform(m) else m
+        _messages.update { list ->
+            list.map { m -> if (m.id == id) transform(m) else m }
         }
     }
 
@@ -450,11 +447,13 @@ class ChatQuestionViewModel(
         return _messages.value.any { it.id == id }
     }
 
+    // ---------------------------------------------------------------------
+    // Model output embedding
+    // ---------------------------------------------------------------------
+
     /**
-     * Attach model output to the most recent assistant outcome bubble, if available.
-     *
-     * If no assistant outcome exists yet, store it as pending so it will be embedded
-     * into the next appended assistant outcome.
+     * Attach model output to the most recent assistant outcome bubble if available.
+     * Otherwise, store it as pending for the next appended assistant outcome bubble.
      */
     private fun attachOrPendModelOutput(
         sessionId: Long,
@@ -469,7 +468,6 @@ class ChatQuestionViewModel(
 
         if (canAttachNow) {
             updateMessage(targetId!!) { m ->
-                // Keep assistant fields intact and add stream details.
                 m.copy(
                     streamText = raw,
                     streamState = state,
@@ -480,7 +478,6 @@ class ChatQuestionViewModel(
             return
         }
 
-        // Otherwise, pend for the next assistant outcome bubble.
         pendingModelSessionId = sessionId
         pendingModelOutput = raw
         pendingModelState = state
@@ -493,24 +490,10 @@ class ChatQuestionViewModel(
         Log.d(TAG, "Pending model embed cleared. reason=$reason")
     }
 
-    /**
-     * Stream bridge collector.
-     *
-     * Goals:
-     * - Show model deltas as a single MODEL bubble while validation is running (expanded).
-     * - When stream ends, remove MODEL bubble and embed output into the next ASSISTANT outcome bubble
-     *   (collapsed by default).
-     *
-     * Robustness:
-     * - Handles missing Begin by treating the first Delta as an implicit Begin (DROP_OLDEST protection).
-     * - Ignores late deltas for a session that was cancelled via cancelValidation().
-     * - Throttles UI updates to reduce recomposition pressure.
-     *
-     * Implementation notes:
-     * - Cap visible buffer to [maxModelCharsInUi] using in-place delete to avoid allocations.
-     * - Avoid persisting on every delta (heavy write pattern).
-     * - Suppress "cancelled" error rendering when cancellation was intentional.
-     */
+    // ---------------------------------------------------------------------
+    // Stream collector (MODEL bubble -> embed into ASSISTANT outcome)
+    // ---------------------------------------------------------------------
+
     private fun startStreamCollector() {
         viewModelScope.launch {
             var localActiveSession = 0L
@@ -546,12 +529,10 @@ class ChatQuestionViewModel(
                 activeStreamSessionId = sessionId
                 activeStreamMsgId = id
 
-                // MODEL streaming bubble (expanded).
                 val bubble = ChatMessage.modelStreaming(id).copy(text = "Validating…")
-                _messages.value = _messages.value + bubble
+                _messages.update { it + bubble }
 
-                // Persist once at begin (not per-delta).
-                persistDraft()
+                safePersistDraft("stream.begin")
             }
 
             fun maybeUpdateUi(force: Boolean = false) {
@@ -569,8 +550,6 @@ class ChatQuestionViewModel(
                 val rendered = buf.toString()
 
                 updateMessage(id) { m ->
-                    // Keep msg.text updated during streaming for legacy UI,
-                    // and keep streamText for the details section embedding later.
                     m.copy(
                         role = ChatRole.MODEL,
                         text = rendered.ifBlank { "Validating…" },
@@ -586,15 +565,10 @@ class ChatQuestionViewModel(
 
             fun finalizeAndRemoveModelBubble(state: ChatStreamState, errorMessage: String? = null) {
                 val id = localStreamMsgId ?: return
+                val raw = buf.toString().ifBlank { errorMessage.orEmpty() }
 
-                val raw = buf.toString().ifBlank {
-                    errorMessage.orEmpty()
-                }
-
-                // Remove the MODEL bubble from the transcript.
                 removeMessage(id)
 
-                // Attach to last outcome assistant if possible; otherwise pend.
                 attachOrPendModelOutput(
                     sessionId = localActiveSession,
                     output = raw,
@@ -606,7 +580,6 @@ class ChatQuestionViewModel(
                 streamBridge.events.collect { ev ->
                     when (ev) {
                         is ChatStreamBridge.Event.Begin -> {
-                            // New session overrides any stale local state.
                             beginSession(ev.sessionId)
                         }
 
@@ -619,12 +592,7 @@ class ChatQuestionViewModel(
                                 return@collect
                             }
 
-                            // If local state still points to a cancelled session, reset it so a new session can recover.
-                            if (cancelledId > 0L && localActiveSession == cancelledId && activeStreamSessionId == 0L) {
-                                resetLocalStreamState()
-                            }
-
-                            // Recover if Begin was dropped.
+                            // Recover if Begin was dropped (DROP_OLDEST may drop Begin first).
                             val sessionMismatch = ev.sessionId != localActiveSession || localStreamMsgId == null
                             if (sessionMismatch) {
                                 if (localActiveSession == 0L && localStreamMsgId == null) {
@@ -636,6 +604,7 @@ class ChatQuestionViewModel(
 
                             buf.append(ev.chunk)
 
+                            // Hard cap UI buffer to avoid unbounded allocations.
                             if (buf.length > maxModelCharsInUi) {
                                 val drop = buf.length - maxModelCharsInUi
                                 buf.delete(0, drop)
@@ -654,12 +623,11 @@ class ChatQuestionViewModel(
                             resetLocalStreamState()
                             activeStreamSessionId = 0L
                             activeStreamMsgId = null
-                            persistDraft()
+                            safePersistDraft("stream.end")
                         }
 
                         is ChatStreamBridge.Event.Error -> {
                             if (ev.sessionId != localActiveSession) return@collect
-                            val id = localStreamMsgId ?: return@collect
 
                             val msg = ev.message.trim().lowercase()
                             val suppressed =
@@ -667,9 +635,9 @@ class ChatQuestionViewModel(
                                         suppressNextCancelledError.getAndSet(false)
 
                             if (suppressed) {
-                                // Remove the MODEL bubble, do not attach anything.
-                                removeMessage(id)
-                                clearPendingModelEmbed("stream_error_suppressed")
+                                // Remove MODEL bubble, do not attach anything.
+                                localStreamMsgId?.let { removeMessage(it) }
+                                clearPendingModelEmbed("stream.error_suppressed")
                             } else {
                                 maybeUpdateUi(force = true)
                                 finalizeAndRemoveModelBubble(
@@ -681,7 +649,7 @@ class ChatQuestionViewModel(
                             resetLocalStreamState()
                             activeStreamSessionId = 0L
                             activeStreamMsgId = null
-                            persistDraft()
+                            safePersistDraft("stream.error")
                         }
                     }
                 }
@@ -693,9 +661,10 @@ class ChatQuestionViewModel(
         }
     }
 
-    /**
-     * Restore draft if present, otherwise seed initial assistant message.
-     */
+    // ---------------------------------------------------------------------
+    // Draft restore/seed + persistence
+    // ---------------------------------------------------------------------
+
     private fun restoreOrSeed() {
         val draft = draftStore.load(draftKey)
         if (draft != null) {
@@ -708,7 +677,6 @@ class ChatQuestionViewModel(
             _completionPayload.value = draft.completionPayload
             _isBusy.value = false
 
-            // Clear ephemeral attachment state on restore.
             activeStreamMsgId = null
             activeStreamSessionId = 0L
             lastOutcomeAssistantMsgId = null
@@ -718,7 +686,6 @@ class ChatQuestionViewModel(
             return
         }
 
-        // Seed initial assistant message for a new question.
         val seeded = ChatMessage.assistant(
             id = UUID.randomUUID().toString(),
             assistantMessage = "Question: $questionId",
@@ -735,7 +702,7 @@ class ChatQuestionViewModel(
         _isBusy.value = false
 
         clearPendingModelEmbed("seed")
-        persistDraft()
+        safePersistDraft("seed")
     }
 
     /**
@@ -758,8 +725,23 @@ class ChatQuestionViewModel(
     }
 
     /**
-     * Logs non-PII debug info: length and short SHA-256 prefix.
+     * Safe wrapper around draft persistence.
+     *
+     * Rationale:
+     * - DraftStore may be backed by IO. It should not crash UI if something goes wrong.
+     * - Logging only metadata to avoid leaking user content.
      */
+    private fun safePersistDraft(reason: String) {
+        runCatching { persistDraft() }
+            .onFailure { t ->
+                Log.w(TAG, "persistDraft failed (non-fatal). reason=$reason err=${t.javaClass.simpleName}", t)
+            }
+    }
+
+    // ---------------------------------------------------------------------
+    // Debug helpers (non-PII)
+    // ---------------------------------------------------------------------
+
     private fun logAnswerDigest(label: String, text: String) {
         val t = text.trim()
         val sha8 = sha256Hex(t).take(8)
@@ -783,7 +765,7 @@ class ChatQuestionViewModel(
     companion object {
         private const val TAG = "ChatQVM"
 
-        // UI throttling knobs for streaming deltas.
+        /** UI throttling knobs for streaming deltas. */
         private const val STREAM_UI_UPDATE_INTERVAL_NS = 50_000_000L // 50ms
         private const val STREAM_MIN_UPDATE_CHARS = 16
 
