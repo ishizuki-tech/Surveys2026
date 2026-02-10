@@ -58,26 +58,19 @@ fun SurveyStartScreen(
     onBack: () -> Unit,
     debugInfo: DebugInfo? = null
 ) {
-    /**
-     * Guard flag to prevent duplicate navigations caused by rapid multiple taps.
-     *
-     * Notes:
-     * - Use rememberSaveable to keep behavior stable across recompositions/rotations.
-     * - We add an automatic unlock timeout as a safety valve in case navigation fails.
-     */
+    // English comment:
+    // - Guard flag to prevent duplicate navigations caused by rapid multiple taps.
+    // - rememberSaveable keeps behavior stable across recompositions/rotations.
+    // - We add an automatic unlock timeout as a safety valve in case navigation fails.
     var beginLocked by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         Log.d(TAG, "SurveyStartScreen: composed")
     }
 
-    /**
-     * Auto-unlock if we stay on this screen for too long after "Begin".
-     *
-     * Notes:
-     * - If navigation succeeds, this composable will typically leave composition, so this effect cancels.
-     * - If navigation fails or is blocked, we prevent the UI from being stuck in a locked state.
-     */
+    // English comment:
+    // - Auto-unlock if we stay on this screen for too long after "Begin".
+    // - If navigation succeeds, this composable will typically leave composition, so this effect cancels.
     LaunchedEffect(beginLocked) {
         if (!beginLocked) return@LaunchedEffect
         delay(BEGIN_LOCK_TIMEOUT_MS)
@@ -89,19 +82,19 @@ fun SurveyStartScreen(
 
     Column(
         modifier = Modifier
-            //.windowInsetsPadding(WindowInsets.safeDrawing)
+            // English comment:
+            // - safeDrawing avoids content being overlapped by system bars (status/navigation, cutouts).
+            .windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Text("Survey Start")
 
-        Text(
-            "This step prepares the survey session before opening the first question."
-        )
+        Text("This step prepares the survey session before opening the first question.")
 
         if (debugInfo != null) {
             Spacer(Modifier.height(6.dp))
-            DebugPanel(debugInfo)
+            DebugPanel(debugInfo = debugInfo)
         }
 
         Spacer(Modifier.height(12.dp))

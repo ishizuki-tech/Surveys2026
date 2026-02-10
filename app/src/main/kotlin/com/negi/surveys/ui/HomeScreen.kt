@@ -17,7 +17,6 @@ import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -52,11 +51,8 @@ private const val TAG = "HomeScreen"
 fun HomeScreen(
     onStartSurvey: () -> Unit,
     onExport: () -> Unit,
-    // Optional debug info to display on the home screen.
-    // Supply these from the app shell if you want (e.g., stack size, current key name).
     debugInfo: DebugInfo? = null
 ) {
-    // Debug trace: helps verify that callbacks are invoked and recompositions are sane.
     LaunchedEffect(Unit) {
         Log.d(TAG, "HomeScreen: composed")
     }
@@ -66,7 +62,7 @@ fun HomeScreen(
             .fillMaxSize()
             // English comment:
             // - safeDrawing avoids content being overlapped by system bars (status/navigation, cutouts).
-            //.windowInsetsPadding(WindowInsets.safeDrawing)
+            .windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.safeDrawing)
             .padding(16.dp),
         verticalArrangement = Arrangement.Top
     ) {
@@ -82,7 +78,6 @@ fun HomeScreen(
             Spacer(Modifier.height(12.dp))
         }
 
-        // Primary actions.
         Button(
             onClick = {
                 Log.d(TAG, "HomeScreen: onStartSurvey clicked")
@@ -107,10 +102,6 @@ fun HomeScreen(
 
         Spacer(Modifier.height(24.dp))
 
-        // Reserved area for future expansion:
-        // - Resume session
-        // - Settings
-        // - Diagnostics
         Text(
             text = "Status: Prototype frame is running.",
             style = MaterialTheme.typography.bodyMedium

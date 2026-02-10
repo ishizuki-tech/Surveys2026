@@ -15,11 +15,7 @@ package com.negi.surveys.chat
 
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.TimeoutCancellationException
-import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 
 /**
@@ -53,15 +49,16 @@ class SlmAnswerValidator(
         )
         val modelPrompt = repository.buildPrompt(userPrompt, PromptPhase.VALIDATE_MAIN)
 
-        log("validateMain: qid=$questionId (request start)")
+        log("validateMain: qid=${questionId.trim()} (request start)")
 
         val raw = collectStreamingText(
-            flow = repository.request(modelPrompt),
+            promptChars = modelPrompt.length,
+            flowProvider = { repository.request(modelPrompt) },
             timeoutMs = timeoutMs,
             maxChars = maxChars
         )
 
-        log("validateMain: qid=$questionId (response received chars=${raw.length})")
+        log("validateMain: qid=${questionId.trim()} (response received chars=${raw.length})")
 
         return parseOutcomeOrFallback(
             questionId = questionId,
@@ -82,15 +79,16 @@ class SlmAnswerValidator(
         )
         val modelPrompt = repository.buildPrompt(userPrompt, PromptPhase.VALIDATE_FOLLOW_UP)
 
-        log("validateFollowUp: qid=$questionId (request start)")
+        log("validateFollowUp: qid=${questionId.trim()} (request start)")
 
         val raw = collectStreamingText(
-            flow = repository.request(modelPrompt),
+            promptChars = modelPrompt.length,
+            flowProvider = { repository.request(modelPrompt) },
             timeoutMs = timeoutMs,
             maxChars = maxChars
         )
 
-        log("validateFollowUp: qid=$questionId (response received chars=${raw.length})")
+        log("validateFollowUp: qid=${questionId.trim()} (response received chars=${raw.length})")
 
         return parseOutcomeOrFallback(
             questionId = questionId,
@@ -104,7 +102,38 @@ class SlmAnswerValidator(
         mainAnswer: String,
         followUpAnswer: String?
     ): String {
-        val fu = followUpAnswer?.trim().orEmpty()
+        val qid = questionId.trim()
+        val main = mainAnswer.trim()
+
+        val fuRaw = followUpAnswer?.trim().orEmpty()
+        val hasFollowUp = fuRaw.isNotBlank()
+
+        // Heuristic:
+        // - VM follow-up history format looks like:
+        //   FOLLOW_UP_1_Q: ...
+        //   FOLLOW_UP_1_A: ...
+        // - If it matches, wrap as HISTORY so FakeSlmRepository (and real models) can parse it cleanly.
+        val treatAsHistory = hasFollowUp && looksLikeFollowUpHistory(fuRaw)
+
+        val followUpBlock = if (!hasFollowUp) {
+            """
+FOLLOW_UP_ANSWER_BEGIN
+
+FOLLOW_UP_ANSWER_END
+""".trimIndent()
+        } else if (treatAsHistory) {
+            """
+FOLLOW_UP_HISTORY_BEGIN
+$fuRaw
+FOLLOW_UP_HISTORY_END
+""".trimIndent()
+        } else {
+            """
+FOLLOW_UP_ANSWER_BEGIN
+$fuRaw
+FOLLOW_UP_ANSWER_END
+""".trimIndent()
+        }
 
         // NOTE:
         // - Use explicit BEGIN/END markers to make extraction robust against multi-line answers.
@@ -130,15 +159,13 @@ VALIDATION GOAL:
 - If insufficient, return status=NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
 
 INPUT:
-QUESTION_ID: $questionId
+QUESTION_ID: $qid
 
 MAIN_ANSWER_BEGIN
-${mainAnswer.trim()}
+$main
 MAIN_ANSWER_END
 
-FOLLOW_UP_ANSWER_BEGIN
-$fu
-FOLLOW_UP_ANSWER_END
+$followUpBlock
 """.trimIndent()
     }
 
@@ -150,46 +177,61 @@ FOLLOW_UP_ANSWER_END
      *
      * Critical:
      * - Runs the streaming collection on Dispatchers.Default so UI can render deltas.
+     *
+     * Semantics:
+     * - timeoutMs <= 0 => no timeout (collect until completion or maxChars).
      */
     private suspend fun collectStreamingText(
-        flow: Flow<String>,
+        promptChars: Int,
+        flowProvider: suspend () -> kotlinx.coroutines.flow.Flow<String>,
         timeoutMs: Long,
         maxChars: Int
     ): String {
+        val maxCharsSafe = maxChars.coerceAtLeast(0)
+        val timeoutMsSafe = timeoutMs.coerceAtLeast(0L)
+
         val sessionId = streamBridge.begin()
-        val sb = StringBuilder(minOf(2048, maxChars))
+        log("collectStreamingText: session=$sessionId promptChars=$promptChars timeoutMs=$timeoutMsSafe maxChars=$maxCharsSafe")
 
         return try {
-            withContext(Dispatchers.Default) {
-                withTimeout(timeoutMs) {
-                    flow.collect { chunk ->
-                        if (chunk.isEmpty()) return@collect
-
+            val result = withContext(Dispatchers.Default) {
+                flowProvider().collectToTextSafely(
+                    timeoutMs = timeoutMsSafe,
+                    maxChars = maxCharsSafe,
+                    onChunk = { chunk, _ ->
                         // Bridge: UI can show incremental output.
-                        streamBridge.emitChunk(sessionId, chunk)
-
-                        // Memory bound.
-                        val remaining = maxChars - sb.length
-                        if (remaining <= 0) return@collect
-                        sb.append(chunk.take(remaining))
+                        if (chunk.isNotEmpty()) {
+                            streamBridge.emitChunk(sessionId, chunk)
+                        }
                     }
+                )
+            }
+
+            when (result.reason) {
+                FlowTextStopReason.COMPLETED,
+                FlowTextStopReason.MAX_CHARS -> {
+                    streamBridge.end(sessionId)
+                }
+                FlowTextStopReason.TIMEOUT -> {
+                    streamBridge.error(sessionId, "timeout")
+                }
+                FlowTextStopReason.ERROR -> {
+                    streamBridge.error(sessionId, result.errorToken ?: "error")
                 }
             }
-            streamBridge.end(sessionId)
-            sb.toString()
-        } catch (t: TimeoutCancellationException) {
-            // Timeout is a controlled cancellation; return partial buffer and mark error.
-            streamBridge.error(sessionId, "timeout")
-            sb.toString()
-        } catch (t: CancellationException) {
-            // Real coroutine cancellation should propagate.
+
+            log("collectStreamingText: session=$sessionId stop=${result.reason} buffered=${result.text.length}")
+            result.text
+        } catch (ce: CancellationException) {
+            // Respect structured concurrency: notify UI + rethrow.
             streamBridge.error(sessionId, "cancelled")
-            throw t
+            log("collectStreamingText: session=$sessionId cancelled")
+            throw ce
         } catch (t: Throwable) {
-            streamBridge.error(sessionId, t.javaClass.simpleName)
-            sb.toString()
-        } finally {
-            log("collectStreamingText: session=$sessionId buffered=${sb.length}")
+            // Best-effort: notify UI + return whatever we have (none here because exception escaped collector).
+            streamBridge.error(sessionId, t.javaClass.simpleName.ifBlank { "error" }.take(32))
+            log("collectStreamingText: session=$sessionId crashed err=${t.javaClass.simpleName}")
+            ""
         }
     }
 
@@ -202,7 +244,7 @@ FOLLOW_UP_ANSWER_END
         val jsonStr = extractFirstJsonObject(cleaned)
 
         if (jsonStr == null) {
-            log("parseOutcome: qid=$questionId JSON not found -> fallback NEED_FOLLOW_UP")
+            log("parseOutcome: qid=${questionId.trim()} JSON not found -> fallback NEED_FOLLOW_UP")
             return ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = "I couldn't reliably parse the validation result. One more detail would help.",
@@ -214,7 +256,9 @@ FOLLOW_UP_ANSWER_END
             val obj = JSONObject(jsonStr)
             val statusStr = obj.optString("status", "").trim()
             val assistantMessage = obj.optString("assistantMessage", "").trim().ifEmpty { "Thanks." }
-            val followUpQuestion = obj.optString("followUpQuestion", "").trim().ifEmpty { null }
+
+            val followUpQuestionRaw = obj.optString("followUpQuestion", "").trim()
+            val followUpQuestion: String? = followUpQuestionRaw.takeIf { it.isNotEmpty() }
 
             val status = when (statusStr) {
                 "ACCEPTED" -> ValidationStatus.ACCEPTED
@@ -236,7 +280,7 @@ FOLLOW_UP_ANSWER_END
                 )
             }
         } catch (t: Throwable) {
-            log("parseOutcome: qid=$questionId JSON parse error -> fallback NEED_FOLLOW_UP")
+            log("parseOutcome: qid=${questionId.trim()} JSON parse error -> fallback NEED_FOLLOW_UP")
             ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = "Validation output was malformed. Please add one more detail.",
@@ -288,6 +332,19 @@ FOLLOW_UP_ANSWER_END
             i++
         }
         return null
+    }
+
+    /**
+     * Detects the VM-style follow-up history format.
+     *
+     * Expected examples:
+     * - FOLLOW_UP_1_Q: ...
+     * - FOLLOW_UP_1_A: ...
+     */
+    private fun looksLikeFollowUpHistory(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return false
+        return t.contains("FOLLOW_UP_1_A:") || t.lineSequence().any { it.trim().startsWith("FOLLOW_UP_") }
     }
 
     private fun log(msg: String) {

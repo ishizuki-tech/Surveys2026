@@ -22,6 +22,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
@@ -31,12 +32,26 @@ import androidx.compose.ui.unit.dp
  * Notes:
  * - Keep this minimal and non-sensitive (no user answers / PII).
  * - Prefer stable identifiers (route name, stack size, build label).
+ * - [extras] enables optional key/value rows without changing call sites.
  */
 @Immutable
 data class DebugInfo(
     val currentRoute: String,
     val backStackSize: Int,
-    val buildLabel: String? = null
+    val buildLabel: String? = null,
+    val extras: List<DebugRow> = emptyList()
+)
+
+/**
+ * One extra debug row.
+ *
+ * Notes:
+ * - Keep values short and non-sensitive.
+ */
+@Immutable
+data class DebugRow(
+    val label: String,
+    val value: String
 )
 
 /**
@@ -49,16 +64,34 @@ data class DebugInfo(
 @Composable
 fun DebugPanel(
     debugInfo: DebugInfo,
-    modifier: Modifier = Modifier
+    modifier: Modifier = Modifier,
+    maxCharsPerValue: Int = 96
 ) {
-    val route = debugInfo.currentRoute
-        .ifBlank { "(none)" }
-        .ellipsize(maxChars = 80)
+    val route = remember(debugInfo.currentRoute, maxCharsPerValue) {
+        debugInfo.currentRoute
+            .trim()
+            .ifBlank { "(none)" }
+            .ellipsize(maxChars = maxCharsPerValue)
+    }
 
-    val build = debugInfo.buildLabel
-        ?.trim()
-        ?.takeIf { it.isNotEmpty() }
-        ?.ellipsize(maxChars = 80)
+    val build = remember(debugInfo.buildLabel, maxCharsPerValue) {
+        debugInfo.buildLabel
+            ?.trim()
+            ?.takeIf { it.isNotEmpty() }
+            ?.ellipsize(maxChars = maxCharsPerValue)
+    }
+
+    val extras = remember(debugInfo.extras, maxCharsPerValue) {
+        debugInfo.extras
+            .asSequence()
+            .map { row ->
+                DebugRow(
+                    label = row.label.trim().ifBlank { "(key)" }.ellipsize(32),
+                    value = row.value.trim().ifBlank { "(none)" }.ellipsize(maxCharsPerValue)
+                )
+            }
+            .toList()
+    }
 
     Column(
         modifier = modifier
@@ -70,12 +103,38 @@ fun DebugPanel(
             style = MaterialTheme.typography.titleMedium
         )
         Spacer(Modifier.height(6.dp))
-        Text("Current: $route")
-        Text("BackStack: ${debugInfo.backStackSize}")
+
+        DebugLine(label = "Current", value = route)
+        DebugLine(label = "BackStack", value = debugInfo.backStackSize.toString())
+
         if (build != null) {
-            Text("Build: $build")
+            DebugLine(label = "Build", value = build)
+        }
+
+        if (extras.isNotEmpty()) {
+            Spacer(Modifier.height(6.dp))
+            for (row in extras) {
+                DebugLine(label = row.label, value = row.value)
+            }
         }
     }
+}
+
+/**
+ * Single debug line renderer.
+ *
+ * Notes:
+ * - Kept small for readability and stability.
+ */
+@Composable
+private fun DebugLine(
+    label: String,
+    value: String
+) {
+    Text(
+        text = "$label: $value",
+        style = MaterialTheme.typography.bodySmall
+    )
 }
 
 /**

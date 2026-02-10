@@ -49,12 +49,13 @@ enum class ChatStreamState {
  *
  * Backward-compatibility note:
  * - The primary constructor keeps (id, role, text) as the first 3 params.
- * - New structured fields are appended with defaults, so existing call sites keep compiling.
+ * - New fields are appended with defaults, so existing call sites keep compiling.
  *
  * Structured assistant/model rendering:
  * - [assistantMessage] and [followUpQuestion] are clean fields intended for colored UI.
  * - [streamText] is raw incremental output, intended for "details" and collapsible display.
  * - [streamCollapsed] can auto-collapse stream details once streaming ends.
+ * - [streamSessionId] optionally binds a MODEL/ASSISTANT message to a stream session.
  *
  * Typical UX policy (recommended):
  * - During streaming: show a separate MODEL bubble using [role]=MODEL, [streamState]=STREAMING, [streamCollapsed]=false.
@@ -69,6 +70,7 @@ enum class ChatStreamState {
  * @property streamText Raw streaming buffer (debug/details or embedded model output).
  * @property streamState Streaming state for UI behavior.
  * @property streamCollapsed Whether [streamText] should be collapsed by default.
+ * @property streamSessionId Optional stream session id (e.g., from ChatStreamBridge.begin()).
  */
 data class ChatMessage(
     val id: String,
@@ -78,7 +80,8 @@ data class ChatMessage(
     val followUpQuestion: String? = null,
     val streamText: String? = null,
     val streamState: ChatStreamState = ChatStreamState.NONE,
-    val streamCollapsed: Boolean = false
+    val streamCollapsed: Boolean = false,
+    val streamSessionId: Long? = null
 ) {
     /** True when this message is authored by the end user. */
     val isFromUser: Boolean get() = role == ChatRole.USER
@@ -90,9 +93,15 @@ data class ChatMessage(
     val hasStructuredAssistant: Boolean
         get() = !assistantMessage.isNullOrBlank() || !followUpQuestion.isNullOrBlank()
 
-    /** True when this message includes stream details (either streaming bubble or embedded details). */
+    /**
+     * True when this message includes stream details (either streaming bubble or embedded details).
+     *
+     * Important:
+     * - A STREAMING message must be treated as having stream details even if [streamText] is still empty.
+     *   Otherwise the UI might not render the streaming bubble until the first chunk arrives.
+     */
     val hasStreamDetails: Boolean
-        get() = !streamText.isNullOrBlank() && streamState != ChatStreamState.NONE
+        get() = streamState != ChatStreamState.NONE && (!streamText.isNullOrBlank() || streamState == ChatStreamState.STREAMING)
 
     /** True when this message is actively streaming. */
     val isStreaming: Boolean
@@ -129,6 +138,46 @@ data class ChatMessage(
         return ""
     }
 
+    /**
+     * Append a streaming chunk to [streamText] and return a new instance.
+     *
+     * Notes:
+     * - This is a pure helper; it does not mutate.
+     * - Applies an optional [maxChars] cap to bound memory usage.
+     */
+    fun appendStreamChunk(chunk: String, maxChars: Int = Int.MAX_VALUE): ChatMessage {
+        if (chunk.isEmpty()) return this
+        val cap = maxChars.coerceAtLeast(0)
+        if (cap == 0) return this
+
+        val base = (streamText ?: "")
+        val remain = cap - base.length
+        if (remain <= 0) return this
+
+        val toAdd = if (chunk.length <= remain) chunk else chunk.substring(0, remain)
+        return copy(streamText = base + toAdd)
+    }
+
+    /**
+     * Mark the stream as ended (normal).
+     */
+    fun markStreamEnded(collapsed: Boolean = true): ChatMessage {
+        return copy(
+            streamState = ChatStreamState.ENDED,
+            streamCollapsed = collapsed
+        )
+    }
+
+    /**
+     * Mark the stream as failed (error).
+     */
+    fun markStreamError(collapsed: Boolean = true): ChatMessage {
+        return copy(
+            streamState = ChatStreamState.ERROR,
+            streamCollapsed = collapsed
+        )
+    }
+
     companion object {
         /**
          * Factory: user message.
@@ -162,7 +211,8 @@ data class ChatMessage(
                 followUpQuestion = followUpQuestion,
                 streamText = null,
                 streamState = ChatStreamState.NONE,
-                streamCollapsed = true
+                streamCollapsed = true,
+                streamSessionId = null
             )
         }
 
@@ -180,7 +230,8 @@ data class ChatMessage(
             modelOutput: String,
             modelState: ChatStreamState = ChatStreamState.ENDED,
             streamCollapsed: Boolean = true,
-            textFallback: String = ""
+            textFallback: String = "",
+            streamSessionId: Long? = null
         ): ChatMessage {
             return ChatMessage(
                 id = id,
@@ -190,7 +241,8 @@ data class ChatMessage(
                 followUpQuestion = followUpQuestion,
                 streamText = modelOutput,
                 streamState = modelState,
-                streamCollapsed = streamCollapsed
+                streamCollapsed = streamCollapsed,
+                streamSessionId = streamSessionId
             )
         }
 
@@ -203,7 +255,10 @@ data class ChatMessage(
          * - On end, flip to ENDED/ERROR and set [streamCollapsed] as needed
          * - Optionally: remove this bubble and attach its final output to an ASSISTANT message
          */
-        fun modelStreaming(id: String): ChatMessage {
+        fun modelStreaming(
+            id: String,
+            streamSessionId: Long? = null
+        ): ChatMessage {
             return ChatMessage(
                 id = id,
                 role = ChatRole.MODEL,
@@ -212,7 +267,8 @@ data class ChatMessage(
                 followUpQuestion = null,
                 streamText = "",
                 streamState = ChatStreamState.STREAMING,
-                streamCollapsed = false
+                streamCollapsed = false,
+                streamSessionId = streamSessionId
             )
         }
 
@@ -222,7 +278,8 @@ data class ChatMessage(
         fun modelEnded(
             id: String,
             output: String,
-            collapsed: Boolean = true
+            collapsed: Boolean = true,
+            streamSessionId: Long? = null
         ): ChatMessage {
             return ChatMessage(
                 id = id,
@@ -232,7 +289,8 @@ data class ChatMessage(
                 followUpQuestion = null,
                 streamText = output,
                 streamState = ChatStreamState.ENDED,
-                streamCollapsed = collapsed
+                streamCollapsed = collapsed,
+                streamSessionId = streamSessionId
             )
         }
 
@@ -242,7 +300,8 @@ data class ChatMessage(
         fun modelError(
             id: String,
             outputOrError: String,
-            collapsed: Boolean = true
+            collapsed: Boolean = true,
+            streamSessionId: Long? = null
         ): ChatMessage {
             return ChatMessage(
                 id = id,
@@ -252,7 +311,8 @@ data class ChatMessage(
                 followUpQuestion = null,
                 streamText = outputOrError,
                 streamState = ChatStreamState.ERROR,
-                streamCollapsed = collapsed
+                streamCollapsed = collapsed,
+                streamSessionId = streamSessionId
             )
         }
     }

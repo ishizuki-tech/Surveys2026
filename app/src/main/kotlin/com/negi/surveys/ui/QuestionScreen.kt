@@ -18,7 +18,6 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -72,61 +71,55 @@ fun QuestionScreen(
     /** Navigate back. */
     onBack: () -> Unit
 ) {
-    // NOTE:
-    // - Use rememberSaveable so rotation/process recreation does not wipe input.
-    // - We intentionally do NOT put initialAnswer into the rememberSaveable initializer,
-    //   because that would "freeze" the initial value on the first composition.
+    // English comment:
+    // - rememberSaveable keeps draft text across rotation and process recreation.
+    // - Keyed by questionId so each question has its own draft slot.
     var answer by rememberSaveable(questionId) { mutableStateOf("") }
 
-    // NOTE:
-    // - If initialAnswer arrives later (e.g., ViewModel async restore),
-    //   we only apply it when the user hasn't typed anything yet.
+    // English comment:
+    // - Apply initialAnswer only if the user hasn't typed yet, to avoid overwriting input.
     LaunchedEffect(questionId, initialAnswer) {
         if (answer.isBlank() && initialAnswer.isNotBlank()) {
             answer = initialAnswer
-            Log.d(TAG, "QuestionScreen: applied initialAnswer questionId=$questionId len=${initialAnswer.length}")
+            Log.d(TAG, "QuestionScreen: applied initialAnswer qid=$questionId len=${initialAnswer.length}")
         }
     }
 
-    val trimmed by remember {
-        derivedStateOf { answer.trim() }
-    }
-    val isValid by remember {
-        derivedStateOf { trimmed.isNotEmpty() }
-    }
-    val answerLen by remember {
-        derivedStateOf { answer.length }
-    }
+    val trimmed by remember { derivedStateOf { answer.trim() } }
+    val isValid by remember { derivedStateOf { trimmed.isNotEmpty() } }
+    val answerLen by remember { derivedStateOf { answer.length } }
 
     LaunchedEffect(questionId) {
-        Log.d(TAG, "QuestionScreen: composed questionId=$questionId")
+        Log.d(TAG, "QuestionScreen: composed qid=$questionId")
     }
 
     DisposableEffect(questionId) {
         onDispose {
-            Log.d(TAG, "QuestionScreen: disposed questionId=$questionId")
+            Log.d(TAG, "QuestionScreen: disposed qid=$questionId")
         }
     }
 
     fun submitIfValid() {
         if (!isValid) {
-            Log.d(TAG, "QuestionScreen: submit blocked (invalid) questionId=$questionId len=$answerLen")
+            Log.d(TAG, "QuestionScreen: submit blocked (invalid) qid=$questionId len=$answerLen")
             return
         }
-        // NOTE:
+        // English comment:
         // - Avoid logging full answer (potentially sensitive user input).
         // - Log only length + short SHA-256 prefix.
         val sha8 = sha256Hex(trimmed).take(8)
-        Log.d(TAG, "QuestionScreen: next questionId=$questionId len=${trimmed.length} sha8=$sha8")
+        Log.d(TAG, "QuestionScreen: next qid=$questionId len=${trimmed.length} sha8=$sha8")
         onNext(trimmed)
     }
 
     Column(
         modifier = Modifier
             .fillMaxSize()
-            // Avoid being overlapped by system bars (status/navigation/cutouts).
-            //.windowInsetsPadding(WindowInsets.safeDrawing)
-            // Keep controls visible above the IME.
+            // English comment:
+            // - safeDrawing avoids content being overlapped by system bars (status/navigation, cutouts).
+            .windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.safeDrawing)
+            // English comment:
+            // - imePadding keeps the buttons visible above the on-screen keyboard.
             .imePadding()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -136,9 +129,7 @@ fun QuestionScreen(
 
         OutlinedTextField(
             value = answer,
-            onValueChange = { newValue ->
-                answer = newValue
-            },
+            onValueChange = { newValue -> answer = newValue },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("Your answer") },
             singleLine = false,
@@ -151,7 +142,7 @@ fun QuestionScreen(
                 onDone = { submitIfValid() }
             ),
             supportingText = {
-                // NOTE:
+                // English comment:
                 // - Show debug-friendly metadata without exposing the answer itself.
                 Text("Length: $answerLen")
             }
@@ -165,7 +156,7 @@ fun QuestionScreen(
         ) {
             OutlinedButton(
                 onClick = {
-                    Log.d(TAG, "QuestionScreen: back clicked questionId=$questionId")
+                    Log.d(TAG, "QuestionScreen: back clicked qid=$questionId")
                     onBack()
                 }
             ) {
@@ -189,7 +180,7 @@ fun QuestionScreen(
 /**
  * Computes SHA-256 hex for debug purposes.
  *
- * NOTE:
+ * Notes:
  * - This is used ONLY for non-PII logging (short prefix).
  * - Do not log full input values.
  */
