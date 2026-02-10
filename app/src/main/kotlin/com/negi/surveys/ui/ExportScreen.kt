@@ -29,6 +29,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -36,6 +37,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.produceState
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
@@ -46,13 +48,13 @@ import kotlinx.coroutines.withContext
  * Export screen (frame-ready).
  *
  * Goals:
- * - Provide a UI that can show a large export payload (e.g., JSON).
+ * - Render a potentially large export payload (e.g., JSON).
  * - Allow users to copy/share the export content.
- * - Include lightweight debug metadata (length + sha256) to help diagnose regressions.
+ * - Include lightweight debug metadata (length + sha256) to diagnose regressions.
  *
  * Notes:
- * - Keep this composable pure-ish: it receives the export text as input.
- * - In the next step, you'll typically feed [exportText] from a ViewModel state.
+ * - Keep this composable mostly pure: it receives the export text as input.
+ * - Typically, [exportText] is provided by a ViewModel state.
  */
 @Composable
 fun ExportScreen(
@@ -69,7 +71,7 @@ fun ExportScreen(
     /**
      * Compute SHA-256 off the main thread to avoid UI jank for large payloads.
      *
-     * English comment:
+     * Implementation detail:
      * - produceState launches a coroutine tied to this composition.
      * - Keyed by exportText so the digest recomputes only when the payload changes.
      */
@@ -79,7 +81,6 @@ fun ExportScreen(
         }
     }.value
 
-    // Debug trace: useful when export content changes unexpectedly.
     LaunchedEffect(sha256, len) {
         if (sha256 != SHA_COMPUTING) {
             Log.d(TAG, "ExportScreen: len=$len sha256=$sha256")
@@ -94,17 +95,32 @@ fun ExportScreen(
             .verticalScroll(scroll),
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
-        Text("Export")
-        Text("Length: $len")
-        Text("SHA-256: ${if (sha256 == SHA_COMPUTING) "(computing...)" else sha256}")
+        Text(
+            text = "Export",
+            style = MaterialTheme.typography.titleLarge
+        )
+
+        Text(
+            text = "Length: $len",
+            style = MaterialTheme.typography.bodySmall
+        )
+
+        Text(
+            text = "SHA-256: ${if (sha256 == SHA_COMPUTING) "(computing...)" else sha256}",
+            style = MaterialTheme.typography.bodySmall
+        )
 
         Spacer(Modifier.height(4.dp))
 
-        Text("Payload:")
+        Text(
+            text = "Payload:",
+            style = MaterialTheme.typography.titleMedium
+        )
 
         SelectionContainer {
             Text(
                 text = exportText,
+                style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
                 modifier = Modifier
                     .fillMaxWidth()
                     .padding(top = 4.dp)
@@ -155,10 +171,10 @@ private const val DEFAULT_EXPORT_PLACEHOLDER: String =
             "}\n"
 
 /**
- * Copies text to Android clipboard.
+ * Copies text to the Android clipboard.
  *
  * Notes:
- * - Clipboard can be restricted by device policy in some enterprise environments.
+ * - Clipboard access may be restricted by device policy in managed environments.
  * - This method intentionally does not show a toast; callers can decide UX feedback.
  *
  * @return true if clipboard write succeeded, false otherwise.
@@ -178,8 +194,8 @@ private fun copyToClipboard(context: Context, label: String, text: String): Bool
  * Launches Android Sharesheet to share plain text.
  *
  * Notes:
- * - This uses ACTION_SEND for maximum compatibility.
- * - Device policy or missing handlers can throw; we guard against crashes.
+ * - Uses ACTION_SEND for broad compatibility.
+ * - Missing handlers or policy restrictions can throw; guarded to avoid crashes.
  *
  * @return true if the sharesheet was launched, false otherwise.
  */
@@ -202,15 +218,20 @@ private fun shareText(context: Context, subject: String, text: String): Boolean 
  * Computes SHA-256 digest as lowercase hex.
  *
  * Why:
- * - Makes it easy to compare payloads across runs/logs without printing full content.
+ * - Enables quick payload comparison across runs/logs without printing the full content.
  */
 private fun sha256Hex(text: String): String {
     val bytes = text.toByteArray(StandardCharsets.UTF_8)
     val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
-    val sb = StringBuilder(digest.size * 2)
+
+    val hexChars = "0123456789abcdef".toCharArray()
+    val out = CharArray(digest.size * 2)
+
+    var j = 0
     for (b in digest) {
-        sb.append(((b.toInt() shr 4) and 0xF).toString(16))
-        sb.append((b.toInt() and 0xF).toString(16))
+        val v = b.toInt() and 0xFF
+        out[j++] = hexChars[v ushr 4]
+        out[j++] = hexChars[v and 0x0F]
     }
-    return sb.toString()
+    return String(out)
 }

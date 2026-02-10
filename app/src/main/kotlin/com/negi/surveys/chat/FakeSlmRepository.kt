@@ -193,7 +193,18 @@ $userPrompt
 
             val followUpAnswers = when {
                 !followUpHistory.isNullOrBlank() -> parseFollowUpAnswersFromHistory(followUpHistory)
-                !singleFollowUp.isNullOrBlank() -> listOf(singleFollowUp.trim()).filter { it.isNotBlank() }
+
+                !singleFollowUp.isNullOrBlank() -> {
+                    val s = singleFollowUp.trim()
+                    // If the single follow-up block actually contains a VM-generated history
+                    // like "FOLLOW_UP_1_A: ...", split it into multiple answers.
+                    if (looksLikeFollowUpHistory(s)) {
+                        parseFollowUpAnswersFromHistory(s)
+                    } else {
+                        listOf(s).filter { it.isNotBlank() }
+                    }
+                }
+
                 else -> emptyList()
             }
 
@@ -215,7 +226,8 @@ $userPrompt
             }
 
             config.logger?.invoke(
-                "FakeSlmRepository.request: meta phase=$phase mainLen=${mainAnswer.trim().length} followUps=${followUpAnswers.size} outChars=${finalText.length}"
+                "FakeSlmRepository.request: meta phase=$phase mainLen=${mainAnswer.trim().length} " +
+                        "followUps=${followUpAnswers.size} outChars=${finalText.length}"
             )
 
             var emitCount = 0
@@ -297,7 +309,10 @@ $userPrompt
         }
 
         // If any provided follow-up exists but is too short/vague, ask to clarify that slot.
-        val shortIdx = followUpAnswers.indexOfFirst { it.trim().isNotEmpty() && it.trim().length < config.minFollowUpAnswerChars }
+        val shortIdx = followUpAnswers.indexOfFirst {
+            val t = it.trim()
+            t.isNotEmpty() && t.length < config.minFollowUpAnswerChars
+        }
         if (shortIdx >= 0) {
             val q = "Could you make follow-up #${shortIdx + 1} more concrete (numbers, place, or example)?"
             return jsonNeedFollowUp(
@@ -423,6 +438,15 @@ $userPrompt
             }
         }
         return out
+    }
+
+    /**
+     * Heuristic: detect whether a text blob looks like VM follow-up history content.
+     */
+    private fun looksLikeFollowUpHistory(text: String): Boolean {
+        val t = text.trim()
+        if (t.isEmpty()) return false
+        return t.contains("FOLLOW_UP_") && t.contains("_A:")
     }
 
     // ---------------------------------------------------------------------

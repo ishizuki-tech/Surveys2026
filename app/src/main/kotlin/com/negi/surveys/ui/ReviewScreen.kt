@@ -25,6 +25,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
@@ -74,14 +75,15 @@ fun ReviewScreen(
     /**
      * IMPORTANT:
      * - Some callers may build logs from mutable sources.
-     * - Use a content-based key for deterministic recomputation.
+     * - Build a content-based key each recomposition for deterministic recomputation.
      */
-    val logsKey: List<Int> = logs.map {
-        var h = it.questionId.hashCode()
-        h = (h * 31) + it.prompt.hashCode()
-        h = (h * 31) + it.payload.hashCode()
-        h = (h * 31) + it.lines.size
-        h
+    val logsKey: List<Int> = logs.map { logFingerprint(it) }
+
+    /**
+     * Natural ordering for question IDs (Q1..Q10) to keep UI + metrics deterministic.
+     */
+    val sortedLogs: List<ReviewQuestionLog> = remember(logsKey) {
+        sortLogsNaturally(logs)
     }
 
     val metrics = produceState(
@@ -89,7 +91,7 @@ fun ReviewScreen(
         key1 = logsKey
     ) {
         value = withContext(Dispatchers.Default) {
-            computeMetrics(logs)
+            computeMetrics(sortedLogs)
         }
     }.value
 
@@ -108,8 +110,36 @@ fun ReviewScreen(
     }
 
     // NOTE:
-    // - Collapse/expand state for MODEL_RAW lines, keyed by "qid:index".
+    // - Collapse/expand state for MODEL_RAW lines.
+    // - Key must be stable across "line insertions" to avoid expanding the wrong line.
     val rawExpanded = remember { mutableStateMapOf<String, Boolean>() }
+
+    /**
+     * Prune expand state when logs change to avoid unbounded growth.
+     *
+     * Notes:
+     * - Keep only keys that still exist in the current logs.
+     * - This also prevents stale expansion state when transcripts are regenerated.
+     */
+    LaunchedEffect(logsKey) {
+        val alive = HashSet<String>(256)
+        for (log in sortedLogs) {
+            for (line in log.lines) {
+                if (line.kind == ReviewChatKind.MODEL_RAW && line.text.length > 260) {
+                    alive.add(rawLineKey(log.questionId, line.text))
+                }
+            }
+        }
+
+        if (rawExpanded.isNotEmpty()) {
+            val toRemove = rawExpanded.keys.filter { it !in alive }
+            if (toRemove.isNotEmpty()) {
+                val before = rawExpanded.size
+                for (k in toRemove) rawExpanded.remove(k)
+                Log.d(TAG, "rawExpanded pruned. before=$before after=${rawExpanded.size} removed=${toRemove.size}")
+            }
+        }
+    }
 
     Column(
         modifier = Modifier
@@ -144,15 +174,15 @@ fun ReviewScreen(
                 Text("Transcript lines: ${metrics.totalLines}")
                 Text("Total chars: ${metrics.totalChars}")
                 Text("SHA-256: ${if (metrics.sha256 == SHA_COMPUTING) "(computing...)" else metrics.sha256}")
-                Spacer(Modifier.padding(top = 6.dp))
+                Spacer(Modifier.height(6.dp))
                 Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
             }
 
-            if (logs.isEmpty()) {
+            if (sortedLogs.isEmpty()) {
                 item { Text("No answers yet.") }
             } else {
                 itemsIndexed(
-                    items = logs,
+                    items = sortedLogs,
                     key = { _, item -> item.questionId }
                 ) { _, log ->
                     QuestionTranscriptCard(
@@ -162,7 +192,7 @@ fun ReviewScreen(
                 }
             }
 
-            item { Spacer(Modifier.padding(bottom = 8.dp)) }
+            item { Spacer(Modifier.height(8.dp)) }
         }
 
         Row(
@@ -189,7 +219,7 @@ fun ReviewScreen(
 /**
  * Renders one question section including:
  * - Prompt
- * - Payload
+ * - Payload (completionPayload)
  * - Full transcript lines
  */
 @Composable
@@ -242,7 +272,7 @@ private fun QuestionTranscriptCard(
                 }
             }
 
-            Spacer(Modifier.padding(top = 8.dp))
+            Spacer(Modifier.height(8.dp))
 
             Text(
                 text = "Prompt",
@@ -256,7 +286,7 @@ private fun QuestionTranscriptCard(
                 )
             }
 
-            Spacer(Modifier.padding(top = 10.dp))
+            Spacer(Modifier.height(10.dp))
 
             Text(
                 text = "Payload",
@@ -265,21 +295,21 @@ private fun QuestionTranscriptCard(
             )
             SelectionContainer {
                 Text(
-                    text = log.payload,
+                    text = log.completionPayload,
                     style = MaterialTheme.typography.bodySmall
                 )
             }
 
-            Spacer(Modifier.padding(top = 10.dp))
+            Spacer(Modifier.height(10.dp))
             Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
-            Spacer(Modifier.padding(top = 10.dp))
+            Spacer(Modifier.height(10.dp))
 
             Text(
                 text = "Transcript",
                 style = MaterialTheme.typography.labelLarge,
                 fontWeight = FontWeight.SemiBold
             )
-            Spacer(Modifier.padding(top = 6.dp))
+            Spacer(Modifier.height(6.dp))
 
             if (log.lines.isEmpty()) {
                 Text("(no transcript)")
@@ -289,8 +319,8 @@ private fun QuestionTranscriptCard(
             val outline = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
 
             log.lines.forEachIndexed { index, line ->
-                val key = "${log.questionId}:$index"
                 val isRaw = line.kind == ReviewChatKind.MODEL_RAW
+                val key = if (isRaw) rawLineKey(log.questionId, line.text) else "${log.questionId}:$index"
                 val expanded = rawExpanded[key] ?: false
 
                 val header = when (line.kind) {
@@ -317,13 +347,16 @@ private fun QuestionTranscriptCard(
                 val bodyText = if (!isRaw) {
                     line.text
                 } else {
-                    if (expanded) line.text else line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
+                    if (expanded) {
+                        line.text
+                    } else {
+                        line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
+                    }
                 }
 
-                val clickMod = if (isRaw && line.text.length > 260) {
-                    Modifier.clickable {
-                        rawExpanded[key] = !expanded
-                    }
+                val canToggle = isRaw && line.text.length > 260
+                val clickMod = if (canToggle) {
+                    Modifier.clickable { rawExpanded[key] = !expanded }
                 } else {
                     Modifier
                 }
@@ -346,7 +379,7 @@ private fun QuestionTranscriptCard(
                             color = fg,
                             modifier = Modifier.weight(1f)
                         )
-                        if (isRaw && line.text.length > 260) {
+                        if (canToggle) {
                             Text(
                                 text = if (expanded) "Collapse" else "Expand",
                                 style = MaterialTheme.typography.labelSmall,
@@ -355,7 +388,7 @@ private fun QuestionTranscriptCard(
                         }
                     }
 
-                    Spacer(Modifier.padding(top = 4.dp))
+                    Spacer(Modifier.height(4.dp))
 
                     SelectionContainer {
                         Text(
@@ -388,11 +421,13 @@ private data class ReviewMetrics(
     }
 }
 
-private fun computeMetrics(logs: List<ReviewQuestionLog>): ReviewMetrics {
-    val questionCount = logs.size
-    val totalLines = logs.sumOf { it.lines.size }
-    val totalChars = logs.sumOf { it.prompt.length + it.payload.length + it.lines.sumOf { l -> l.text.length } }
-    val source = buildFingerprintSource(logs)
+private fun computeMetrics(sortedLogs: List<ReviewQuestionLog>): ReviewMetrics {
+    val questionCount = sortedLogs.size
+    val totalLines = sortedLogs.sumOf { it.lines.size }
+    val totalChars = sortedLogs.sumOf { q ->
+        q.prompt.length + q.completionPayload.length + q.lines.sumOf { it.text.length }
+    }
+    val source = buildFingerprintSource(sortedLogs)
     val sha = sha256Hex(source)
     return ReviewMetrics(
         questionCount = questionCount,
@@ -402,13 +437,13 @@ private fun computeMetrics(logs: List<ReviewQuestionLog>): ReviewMetrics {
     )
 }
 
-private fun buildFingerprintSource(logs: List<ReviewQuestionLog>): String {
+private fun buildFingerprintSource(sortedLogs: List<ReviewQuestionLog>): String {
     val sb = StringBuilder()
-    for (q in logs.sortedBy { it.questionId }) {
+    for (q in sortedLogs) {
         sb.append("Q=").append(q.questionId).append('\n')
         sb.append("P=").append(q.prompt).append('\n')
         sb.append("S=").append(q.isSkipped).append('\n')
-        sb.append("X=").append(q.payload).append('\n')
+        sb.append("X=").append(q.completionPayload).append('\n')
         for (l in q.lines) {
             sb.append("L=").append(l.kind.name).append(':').append(l.text).append('\n')
         }
@@ -434,46 +469,80 @@ private fun sha256Hex(text: String): String {
     return sb.toString()
 }
 
-private const val TAG = "ReviewScreen"
-private const val SHA_COMPUTING = "__computing__"
-
 /**
- * Review model types.
- *
- * Notes:
- * - These are UI-facing snapshot models (immutable).
- * - Keep them small and deterministic for logging/export/debug.
+ * Produces a compact content fingerprint for recomposition keys.
  */
-enum class ReviewChatKind {
-    USER,
-    AI,
-    FOLLOW_UP,
-    MODEL_RAW
+private fun logFingerprint(log: ReviewQuestionLog): Int {
+    var h = log.questionId.hashCode()
+    h = (h * 31) + log.prompt.hashCode()
+    h = (h * 31) + log.completionPayload.hashCode()
+    h = (h * 31) + if (log.isSkipped) 1 else 0
+    for (l in log.lines) {
+        h = (h * 31) + l.kind.ordinal
+        h = (h * 31) + l.text.hashCode()
+    }
+    return h
 }
 
-data class ReviewChatLine(
-    val kind: ReviewChatKind,
-    val text: String
+/**
+ * Stable key for a MODEL_RAW line.
+ *
+ * Notes:
+ * - Avoid index-based keys so the expanded state won't drift when lines are inserted.
+ * - Include length to reduce collisions further.
+ */
+private fun rawLineKey(questionId: String, rawText: String): String {
+    return "$questionId:raw:${rawText.length}:${rawText.hashCode()}"
+}
+
+// ---------------------------------------------------------------------
+// Natural ordering for question IDs (Q1..Q10)
+// ---------------------------------------------------------------------
+
+private fun sortLogsNaturally(logs: List<ReviewQuestionLog>): List<ReviewQuestionLog> {
+    return logs
+        .map { it to questionIdKey(it.questionId) }
+        .sortedWith(
+            compareBy<Pair<ReviewQuestionLog, QuestionIdKey>>(
+                { it.second.prefix },
+                { it.second.number },
+                { it.second.raw }
+            )
+        )
+        .map { it.first }
+}
+
+private data class QuestionIdKey(
+    val prefix: String,
+    val number: Int,
+    val raw: String
 )
 
-data class ReviewQuestionLog(
-    val questionId: String,
-    val prompt: String,
-    val isSkipped: Boolean,
-    val payload: String,
-    val lines: List<ReviewChatLine>
-)
+private fun questionIdKey(id: String): QuestionIdKey {
+    val m = ID_PATTERN.matchEntire(id)
+    if (m != null) {
+        val prefix = m.groupValues[1]
+        val number = m.groupValues[2].toIntOrNull() ?: Int.MAX_VALUE
+        return QuestionIdKey(prefix = prefix, number = number, raw = id)
+    }
+    return QuestionIdKey(prefix = id, number = Int.MAX_VALUE, raw = id)
+}
+
+private const val TAG = "ReviewScreen"
+private const val SHA_COMPUTING = "__computing__"
+private val ID_PATTERN = Regex("^([A-Za-z]+)(\\d+)$")
 
 private val DEFAULT_LOGS_PLACEHOLDER: List<ReviewQuestionLog> = listOf(
     ReviewQuestionLog(
         questionId = "Q1",
         prompt = "Example prompt for Q1.",
         isSkipped = false,
-        payload = "Example payload for Q1.",
+        completionPayload = "Example payload for Q1.",
         lines = listOf(
             ReviewChatLine(ReviewChatKind.USER, "Example user answer."),
             ReviewChatLine(ReviewChatKind.AI, "Example AI response."),
-            ReviewChatLine(ReviewChatKind.FOLLOW_UP, "Example follow-up question.")
+            ReviewChatLine(ReviewChatKind.FOLLOW_UP, "Example follow-up question."),
+            ReviewChatLine(ReviewChatKind.MODEL_RAW, "{ \"debug\": true, \"raw\": \"...\" }")
         )
     )
 )

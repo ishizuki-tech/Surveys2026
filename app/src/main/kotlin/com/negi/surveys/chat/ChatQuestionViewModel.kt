@@ -95,7 +95,7 @@ class ChatQuestionViewModel(
     @Volatile private var activeStreamMsgId: String? = null
     @Volatile private var activeStreamSessionId: Long = 0L
 
-    /** Remember the last cancelled stream session so we can ignore late deltas. */
+    /** Remember the last cancelled stream session so we can ignore late deltas/ends. */
     @Volatile private var lastCancelledStreamSessionId: Long = 0L
 
     /** Suppress "cancelled" error rendering when cancellation is intentional (Back/Next/dispose). */
@@ -105,13 +105,6 @@ class ChatQuestionViewModel(
     // Embedding pipeline (MODEL -> ASSISTANT)
     // ---------------------------------------------------------------------
 
-    /**
-     * Pending model output that should be embedded into the next assistant outcome bubble.
-     *
-     * Why pending?
-     * - Stream End can happen before the validator returns (outcome not appended yet).
-     * - Or stream End can happen after outcome was appended (we attach retroactively).
-     */
     @Volatile private var pendingModelOutput: String? = null
     @Volatile private var pendingModelState: ChatStreamState = ChatStreamState.NONE
     @Volatile private var pendingModelSessionId: Long = 0L
@@ -126,29 +119,16 @@ class ChatQuestionViewModel(
     }
 
     override fun onCleared() {
-        // NOTE:
-        // - Avoid leaving streaming UI in an inconsistent state after VM disposal.
-        // - Suppress "cancelled" error rendering because this is an intentional lifecycle cancellation.
         runCatching { cancelValidation("onCleared") }
         super.onCleared()
     }
 
     fun setInput(text: String) {
         _input.value = text
-        // NOTE:
-        // - Input is ephemeral. Avoid persisting on every keystroke for performance.
     }
 
-    /** Backward-compatible alias for older UI code. */
     fun send() = submit()
 
-    /**
-     * Submits the current user input into the chat.
-     *
-     * Rules:
-     * - If stage==DONE and allowResubmitAfterDone==true, re-open the question for editing.
-     * - No-op if busy.
-     */
     fun submit() {
         val text = _input.value.trim()
         if (text.isEmpty()) return
@@ -163,7 +143,6 @@ class ChatQuestionViewModel(
         _input.value = ""
         appendUser(text)
 
-        // Defensive cancel. Streaming UI is only active when busy, so this should be rare.
         validationJob?.cancel()
         validationJob = null
 
@@ -186,18 +165,26 @@ class ChatQuestionViewModel(
     /**
      * Cancels any in-flight validation and stops streaming UI.
      *
-     * Notes:
-     * - Used on Back/Next/dispose to prevent stale streaming from continuing.
-     * - We remove the transient streaming bubble immediately to avoid confusion.
+     * Root fix:
+     * - Always cancel the active stream session in [ChatStreamBridge], even if the VM has not yet
+     *   observed Begin/Delta (activeStreamSessionId may still be 0).
      */
     fun cancelValidation(reason: String) {
         Log.d(TAG, "cancelValidation: qid=$questionId reason=$reason")
 
         suppressNextCancelledError.set(true)
 
-        val cancelledSession = activeStreamSessionId
-        if (cancelledSession > 0L) {
-            lastCancelledStreamSessionId = cancelledSession
+        // Root fix:
+        // - Cancel active stream without requiring the VM to know the session id yet.
+        val cancelledId = streamBridge.cancelActive(CANCELLED_MESSAGE)
+        if (cancelledId > 0L) {
+            lastCancelledStreamSessionId = cancelledId
+        } else {
+            val sessionId = activeStreamSessionId
+            if (sessionId > 0L) {
+                lastCancelledStreamSessionId = sessionId
+                streamBridge.cancel(sessionId, CANCELLED_MESSAGE)
+            }
         }
 
         validationJob?.cancel()
@@ -212,6 +199,8 @@ class ChatQuestionViewModel(
         activeStreamMsgId = null
         activeStreamSessionId = 0L
 
+        // Prevent late attachments.
+        lastOutcomeAssistantMsgId = null
         clearPendingModelEmbed("cancelValidation")
         safePersistDraft("cancelValidation")
     }
@@ -297,14 +286,6 @@ class ChatQuestionViewModel(
         }
     }
 
-    /**
-     * Re-opens a completed question for editing.
-     *
-     * Strategy:
-     * - Keep the prior transcript (auditability).
-     * - Clear completion payload so Next becomes disabled until re-accepted.
-     * - Clear follow-up state so we start fresh from main answer.
-     */
     private fun reopenForEdit() {
         appendAssistantText("Re-opening this question for editing. Please submit your revised answer.")
         stage = ChatStage.AWAIT_MAIN
@@ -320,28 +301,24 @@ class ChatQuestionViewModel(
     // ---------------------------------------------------------------------
 
     /**
-     * Builds a compact, deterministic follow-up history string.
+     * Builds a follow-up context string intended to be consumed by repository-backed validators.
      *
-     * NOTE:
-     * - This is deliberately simple and stable.
-     * - Avoid re-printing MAIN_ANSWER here; validator already has it separately.
+     * Important:
+     * - Wrap with FOLLOW_UP_HISTORY_BEGIN/END so FakeSlmRepository can reliably extract and parse
+     *   the follow-up history from the overall prompt text.
      */
     private fun buildFollowUpContext(turns: List<FollowUpTurn>): String {
         if (turns.isEmpty()) return "(none)"
         return buildString {
+            append("FOLLOW_UP_HISTORY_BEGIN\n")
             turns.forEachIndexed { idx, t ->
                 append("FOLLOW_UP_${idx + 1}_Q: ").append(t.question.trim()).append('\n')
                 append("FOLLOW_UP_${idx + 1}_A: ").append(t.answer.trim()).append('\n')
             }
+            append("FOLLOW_UP_HISTORY_END")
         }.trim()
     }
 
-    /**
-     * Combine the final payload returned to the navigation layer.
-     *
-     * TODO:
-     * - Replace with a structured model (e.g., AnswerBundle(main, followUps, scores)).
-     */
     private fun buildCombined(main: String, turns: List<FollowUpTurn>): String {
         return buildString {
             append(main.trim())
@@ -368,7 +345,6 @@ class ChatQuestionViewModel(
         safePersistDraft("appendUser")
     }
 
-    /** Append a plain assistant message (non-structured). */
     private fun appendAssistantText(text: String) {
         val msg = ChatMessage.assistant(
             id = UUID.randomUUID().toString(),
@@ -380,12 +356,6 @@ class ChatQuestionViewModel(
         safePersistDraft("appendAssistantText")
     }
 
-    /**
-     * Append a structured assistant outcome bubble.
-     *
-     * Embedding rule:
-     * - If there is pending model output (stored by stream End/Error), embed it into this assistant bubble.
-     */
     private fun appendAssistantOutcome(
         assistantMessage: String,
         followUpQuestion: String?
@@ -451,10 +421,6 @@ class ChatQuestionViewModel(
     // Model output embedding
     // ---------------------------------------------------------------------
 
-    /**
-     * Attach model output to the most recent assistant outcome bubble if available.
-     * Otherwise, store it as pending for the next appended assistant outcome bubble.
-     */
     private fun attachOrPendModelOutput(
         sessionId: Long,
         output: String,
@@ -519,7 +485,6 @@ class ChatQuestionViewModel(
                 lastUiUpdateNs = 0L
                 lastRenderedLen = 0
 
-                // Reset per-attempt attachment markers.
                 lastOutcomeAssistantMsgId = null
                 clearPendingModelEmbed("beginSession")
 
@@ -579,20 +544,18 @@ class ChatQuestionViewModel(
             try {
                 streamBridge.events.collect { ev ->
                     when (ev) {
-                        is ChatStreamBridge.Event.Begin -> {
+                        is ChatStreamEvent.Begin -> {
                             beginSession(ev.sessionId)
                         }
 
-                        is ChatStreamBridge.Event.Delta -> {
-                            if (ev.chunk.isEmpty()) return@collect
+                        is ChatStreamEvent.Delta -> {
+                            if (ev.text.isEmpty()) return@collect
 
-                            // Ignore late deltas for a cancelled session.
                             val cancelledId = lastCancelledStreamSessionId
-                            if (cancelledId > 0L && ev.sessionId == cancelledId && activeStreamSessionId == 0L) {
+                            if (cancelledId > 0L && ev.sessionId == cancelledId) {
                                 return@collect
                             }
 
-                            // Recover if Begin was dropped (DROP_OLDEST may drop Begin first).
                             val sessionMismatch = ev.sessionId != localActiveSession || localStreamMsgId == null
                             if (sessionMismatch) {
                                 if (localActiveSession == 0L && localStreamMsgId == null) {
@@ -602,9 +565,8 @@ class ChatQuestionViewModel(
                                 }
                             }
 
-                            buf.append(ev.chunk)
+                            buf.append(ev.text)
 
-                            // Hard cap UI buffer to avoid unbounded allocations.
                             if (buf.length > maxModelCharsInUi) {
                                 val drop = buf.length - maxModelCharsInUi
                                 buf.delete(0, drop)
@@ -614,8 +576,19 @@ class ChatQuestionViewModel(
                             maybeUpdateUi(force = false)
                         }
 
-                        is ChatStreamBridge.Event.End -> {
+                        is ChatStreamEvent.End -> {
                             if (ev.sessionId != localActiveSession) return@collect
+
+                            val cancelledId = lastCancelledStreamSessionId
+                            if (cancelledId > 0L && ev.sessionId == cancelledId) {
+                                localStreamMsgId?.let { removeMessage(it) }
+                                clearPendingModelEmbed("stream.end_ignored_cancelled")
+                                resetLocalStreamState()
+                                activeStreamSessionId = 0L
+                                activeStreamMsgId = null
+                                safePersistDraft("stream.end_ignored_cancelled")
+                                return@collect
+                            }
 
                             maybeUpdateUi(force = true)
                             finalizeAndRemoveModelBubble(state = ChatStreamState.ENDED)
@@ -626,23 +599,22 @@ class ChatQuestionViewModel(
                             safePersistDraft("stream.end")
                         }
 
-                        is ChatStreamBridge.Event.Error -> {
+                        is ChatStreamEvent.Error -> {
                             if (ev.sessionId != localActiveSession) return@collect
 
-                            val msg = ev.message.trim().lowercase()
+                            val msg = ev.reason.trim().lowercase()
                             val suppressed =
                                 (msg == "cancelled" || msg == "canceled") &&
                                         suppressNextCancelledError.getAndSet(false)
 
                             if (suppressed) {
-                                // Remove MODEL bubble, do not attach anything.
                                 localStreamMsgId?.let { removeMessage(it) }
                                 clearPendingModelEmbed("stream.error_suppressed")
                             } else {
                                 maybeUpdateUi(force = true)
                                 finalizeAndRemoveModelBubble(
                                     state = ChatStreamState.ERROR,
-                                    errorMessage = ev.message
+                                    errorMessage = ev.reason
                                 )
                             }
 
@@ -705,13 +677,6 @@ class ChatQuestionViewModel(
         safePersistDraft("seed")
     }
 
-    /**
-     * Persist current VM state to draft store.
-     *
-     * Notes:
-     * - This writes user content. Keep store in-memory unless you handle encryption/consent.
-     * - Avoid calling this on every streaming delta.
-     */
     private fun persistDraft() {
         val draft = ChatDraft(
             stage = stage,
@@ -724,13 +689,6 @@ class ChatQuestionViewModel(
         draftStore.save(draftKey, draft)
     }
 
-    /**
-     * Safe wrapper around draft persistence.
-     *
-     * Rationale:
-     * - DraftStore may be backed by IO. It should not crash UI if something goes wrong.
-     * - Logging only metadata to avoid leaking user content.
-     */
     private fun safePersistDraft(reason: String) {
         runCatching { persistDraft() }
             .onFailure { t ->
@@ -771,5 +729,7 @@ class ChatQuestionViewModel(
 
         private const val DEFAULT_FOLLOW_UP_MAIN = "Could you add one concrete detail or example?"
         private const val DEFAULT_FOLLOW_UP_MORE = "Could you add one more concrete detail?"
+
+        private const val CANCELLED_MESSAGE = "cancelled"
     }
 }

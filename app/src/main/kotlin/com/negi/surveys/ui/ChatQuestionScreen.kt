@@ -105,37 +105,24 @@ fun ChatQuestionScreen(
      *
      * Contract:
      * - Provides a full snapshot log for Review.
-     * - log.payload is always non-empty (skipped payload is generated when needed).
+     * - log.completionPayload is always non-empty (skipped payload is generated when needed).
      */
     onNext: (log: ReviewQuestionLog) -> Unit,
 
     onBack: () -> Unit
 ) {
-    // NOTE:
-    // - Keep the latest callback to avoid capturing stale lambdas inside long-lived coroutines/effects.
     val onNextLatest by rememberUpdatedState(onNext)
 
-    // NOTE:
-    // - Per-question streaming bridge instance (kept stable while questionId is stable).
     val streamBridge = remember(questionId) { ChatStreamBridge() }
 
-    // NOTE:
-    // - Process-lifetime draft store (SmallStep default). This survives screen swaps in the same process.
     val draftStore: ChatDraftStore = remember { ChatDraftStoreHolder.store }
 
-    // NOTE:
-    // - Draft identity: stable for the same question + prompt text.
     val draftKey = remember(questionId, prompt) {
         DraftKey(questionId = questionId, promptHash = prompt.hashCode())
     }
 
-    // NOTE:
-    // - Choose repository: real one from DI, or fake.
-    // - Remember by (questionId, prompt) to avoid mismatching prompt vs repository output in tests.
     val repo: Repository = repository ?: remember(questionId, prompt) { FakeSlmRepository() }
 
-    // NOTE:
-    // - Build SLM validator (streaming-enabled).
     val validator: AnswerValidator = remember(questionId, prompt, repo, streamBridge) {
         SlmAnswerValidator(
             repository = repo,
@@ -144,8 +131,6 @@ fun ChatQuestionScreen(
         )
     }
 
-    // NOTE:
-    // - VM identity key: changes when prompt changes to avoid reusing stale state.
     val vmKey = remember(questionId, prompt) {
         "ChatQuestionViewModel:$questionId:${prompt.hashCode()}"
     }
@@ -169,31 +154,16 @@ fun ChatQuestionScreen(
     val isBusy by vm.isBusy.collectAsStateWithLifecycle()
     val completionPayload by vm.completionPayload.collectAsStateWithLifecycle()
 
-    // NOTE:
-    // - Submit is allowed when user typed something and VM is not busy.
     val canSubmit = input.trim().isNotEmpty() && !isBusy
 
-    // NOTE:
-    // - Debounce latch for Next onClick (prevents double navigation taps).
     var nextInFlight by remember(vmKey) { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
 
-    // NOTE:
-    // - Measure bottom bar height so we can pad the list correctly.
     var bottomBarPx by remember(vmKey) { mutableIntStateOf(0) }
     val density = LocalDensity.current
-    val bottomBarDp = remember(bottomBarPx, density) {
-        with(density) { bottomBarPx.toDp() }
-    }
+    val bottomBarDp = remember(bottomBarPx, density) { with(density) { bottomBarPx.toDp() } }
 
-    /**
-     * Per-message expand state for:
-     * - ASSISTANT embedded "Model output" section (collapsed by default)
-     * - MODEL bubble (if it ever becomes non-streaming in the future)
-     *
-     * This is UI-only state (does not mutate VM).
-     */
     val detailsExpanded = remember(vmKey) { mutableStateMapOf<String, Boolean>() }
 
     LaunchedEffect(vmKey) {
@@ -201,8 +171,6 @@ fun ChatQuestionScreen(
         Log.d(TAG, "Next latch reset. qid=$questionId vmKey=$vmKey")
     }
 
-    // NOTE:
-    // - Auto-scroll must respond not only to message count changes, but also to streaming text growth.
     LaunchedEffect(vmKey, bottomBarPx) {
         snapshotFlow {
             val last = messages.lastOrNull()
@@ -238,8 +206,6 @@ fun ChatQuestionScreen(
 
     DisposableEffect(vm) {
         onDispose {
-            // NOTE:
-            // - Ensure we stop streaming when screen is disposed (navigation/back stack).
             vm.cancelValidation("screen_dispose")
         }
     }
@@ -250,14 +216,11 @@ fun ChatQuestionScreen(
         else -> "DRAFT"
     }
 
+    val allowFollowUpUi = true
+
     Surface(
         modifier = Modifier
             .fillMaxSize()
-            /**
-             * IMPORTANT:
-             * - App-level TopBar consumes TOP statusBars inset.
-             * - Do NOT apply TOP safeDrawing here, or you get double top padding.
-             */
             .windowInsetsPadding(
                 WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
             ),
@@ -266,7 +229,6 @@ fun ChatQuestionScreen(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                // NOTE: Keep the header as high as possible.
                 .padding(horizontal = 12.dp, vertical = 0.dp)
         ) {
             HeaderCard(
@@ -295,6 +257,7 @@ fun ChatQuestionScreen(
                     items(items = messages, key = { it.id }) { msg ->
                         ChatBubbleStructured(
                             msg = msg,
+                            allowFollowUp = allowFollowUpUi,
                             detailsExpanded = detailsExpanded[msg.id] ?: false,
                             onToggleDetailsExpand = { expand ->
                                 detailsExpanded[msg.id] = expand
@@ -343,7 +306,7 @@ fun ChatQuestionScreen(
                             questionId = questionId,
                             prompt = prompt,
                             isSkipped = skipped,
-                            payload = payload,
+                            completionPayload = payload,
                             messagesSnapshot = messages
                         )
 
@@ -353,9 +316,6 @@ fun ChatQuestionScreen(
                         )
                         onNextLatest(log)
                     } finally {
-                        // NOTE:
-                        // - In most navigation flows, the screen will dispose immediately.
-                        // - This still protects against "no navigation happened" cases.
                         nextInFlight = false
                     }
                 },
@@ -530,16 +490,10 @@ private fun BottomComposerCard(
     }
 }
 
-/**
- * Structured bubble renderer.
- *
- * Requirements:
- * - USER: right aligned
- * - ASSISTANT/MODEL: left aligned
- */
 @Composable
 private fun ChatBubbleStructured(
     msg: ChatMessage,
+    allowFollowUp: Boolean,
     detailsExpanded: Boolean,
     onToggleDetailsExpand: (Boolean) -> Unit
 ) {
@@ -642,7 +596,7 @@ private fun ChatBubbleStructured(
 
                     isAssistant -> {
                         val a = msg.assistantMessage?.trim().orEmpty()
-                        val q = msg.followUpQuestion?.trim().orEmpty()
+                        val q = if (allowFollowUp) normalizeFollowUp(msg.followUpQuestion) else null
 
                         if (a.isNotEmpty()) {
                             Text(
@@ -658,7 +612,7 @@ private fun ChatBubbleStructured(
                             )
                         }
 
-                        if (q.isNotEmpty()) {
+                        if (q != null) {
                             Spacer(Modifier.height(10.dp))
 
                             val qShape = RoundedCornerShape(14.dp)
@@ -831,7 +785,9 @@ private fun ChatBubbleStructured(
                                 Spacer(Modifier.height(6.dp))
 
                                 Text(
-                                    text = if (isStreamingModelBubble) "Streaming…" else if (expanded) "Tap to collapse" else "Tap to expand",
+                                    text = if (isStreamingModelBubble) "Streaming…"
+                                    else if (expanded) "Tap to collapse"
+                                    else "Tap to expand",
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -852,9 +808,6 @@ private fun ChatBubbleStructured(
     }
 }
 
-/**
- * Build a deterministic payload for skipped questions.
- */
 private fun buildSkippedPayload(questionId: String, prompt: String): String {
     val promptHash = prompt.hashCode()
     return buildString {
@@ -868,18 +821,22 @@ private fun buildSkippedPayload(questionId: String, prompt: String): String {
 /**
  * Converts the current chat messages into a Review snapshot.
  *
- * Notes:
- * - We intentionally preserve all roles (USER/ASSISTANT/MODEL).
- * - ASSISTANT may contribute multiple lines (answer + follow-up + embedded model raw).
+ * Updated policy:
+ * - If skipped: export USER lines, plus FOLLOW_UP lines that happen after at least one USER line.
+ * - Seed prompt message is excluded (prompt is already shown in the card header).
+ * - MODEL_RAW is excluded when skipped.
  */
 private fun buildReviewQuestionLog(
     questionId: String,
     prompt: String,
     isSkipped: Boolean,
-    payload: String,
+    completionPayload: String,
     messagesSnapshot: List<ChatMessage>
 ): ReviewQuestionLog {
     val lines = ArrayList<ReviewChatLine>(messagesSnapshot.size * 2)
+
+    val promptTrimmed = prompt.trim()
+    var seenUser = false
 
     for (m in messagesSnapshot) {
         when (m.role) {
@@ -887,22 +844,57 @@ private fun buildReviewQuestionLog(
                 val t = m.text.trim()
                 if (t.isNotEmpty()) {
                     lines += ReviewChatLine(kind = ReviewChatKind.USER, text = t)
+                    seenUser = true
                 }
             }
 
             ChatRole.ASSISTANT -> {
                 val a = m.assistantMessage?.trim().orEmpty()
                 val fallback = m.text.trim()
-                val q = m.followUpQuestion?.trim().orEmpty()
+                val q = normalizeFollowUp(m.followUpQuestion)
 
+                // Detect the seeded "Question: Qx + prompt" entry (exclude from Review transcript).
+                val isSeedPrompt =
+                    !seenUser &&
+                            a == "Question: $questionId" &&
+                            (q?.trim().orEmpty() == promptTrimmed)
+
+                if (isSeedPrompt) continue
+
+                if (isSkipped) {
+                    // Skipped: keep assistant context only after the user has interacted.
+                    if (!seenUser) continue
+
+                    // Keep AI message if it exists (helps understand why the follow-up was asked).
+                    if (a.isNotEmpty()) {
+                        lines += ReviewChatLine(kind = ReviewChatKind.AI, text = a)
+                    } else if (fallback.isNotEmpty()) {
+                        lines += ReviewChatLine(kind = ReviewChatKind.AI, text = fallback)
+                    }
+
+                    // Keep follow-up question if it is meaningful and not identical to the prompt.
+                    val q2 = q?.trim()
+                    if (!q2.isNullOrBlank() && q2 != promptTrimmed) {
+                        lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = q2)
+                    }
+                    continue
+                }
+
+                // Not skipped: keep full assistant transcript.
                 if (a.isNotEmpty()) {
                     lines += ReviewChatLine(kind = ReviewChatKind.AI, text = a)
                 } else if (fallback.isNotEmpty()) {
                     lines += ReviewChatLine(kind = ReviewChatKind.AI, text = fallback)
                 }
 
-                if (q.isNotEmpty()) {
-                    lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = q)
+                val q2 = q?.trim()
+                if (!q2.isNullOrBlank() && q2 != promptTrimmed) {
+                    lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = q2)
+                } else {
+                    val rawQ = m.followUpQuestion
+                    if (!rawQ.isNullOrBlank()) {
+                        Log.d(TAG, "FOLLOW_UP suppressed: qid=$questionId raw='${rawQ.take(120)}'")
+                    }
                 }
 
                 val raw = m.streamText?.trim().orEmpty()
@@ -912,6 +904,8 @@ private fun buildReviewQuestionLog(
             }
 
             ChatRole.MODEL -> {
+                if (isSkipped) continue
+
                 val raw = (m.streamText?.takeIf { it.isNotBlank() } ?: m.text).trim()
                 if (raw.isNotEmpty()) {
                     lines += ReviewChatLine(kind = ReviewChatKind.MODEL_RAW, text = raw)
@@ -920,18 +914,57 @@ private fun buildReviewQuestionLog(
         }
     }
 
+    Log.d(
+        TAG,
+        "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}"
+    )
+
     return ReviewQuestionLog(
         questionId = questionId,
         prompt = prompt,
         isSkipped = isSkipped,
-        payload = payload,
+        completionPayload = completionPayload,
         lines = lines
     )
 }
 
-/**
- * ViewModel factory for [ChatQuestionViewModel].
- */
+private fun normalizeFollowUp(text: String?): String? {
+    val raw = text ?: return null
+    var t = raw.trim().replace("\u0000", "")
+    if (t.isBlank()) return null
+
+    val prefixPatterns = listOf(
+        "follow-up question:",
+        "follow up question:",
+        "follow-up:",
+        "follow up:",
+        "followup:",
+        "question:",
+        "next question:"
+    )
+    val lower = t.lowercase()
+    for (p in prefixPatterns) {
+        if (lower.startsWith(p)) {
+            t = t.drop(p.length).trim()
+            break
+        }
+    }
+
+    if (t.isBlank()) return null
+
+    val l2 = t.lowercase()
+    val garbage = setOf(
+        "none", "(none)", "n/a", "na", "null", "nil",
+        "no", "nope", "no follow up", "no follow-up",
+        "skip", "0", "-"
+    )
+    if (l2 in garbage) return null
+
+    if (t.length < 3) return null
+
+    return t
+}
+
 private class ChatQuestionViewModelFactory(
     private val questionId: String,
     private val prompt: String,
@@ -957,9 +990,6 @@ private class ChatQuestionViewModelFactory(
     }
 }
 
-/**
- * Process-lifetime draft store holder.
- */
 private object ChatDraftStoreHolder {
     val store: ChatDraftStore = InMemoryChatDraftStore()
 }

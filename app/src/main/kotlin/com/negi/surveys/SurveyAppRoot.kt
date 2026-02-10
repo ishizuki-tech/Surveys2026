@@ -38,12 +38,16 @@ import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavEntry
 import androidx.navigation3.runtime.NavKey
@@ -59,7 +63,6 @@ import com.negi.surveys.nav.SurveyStart
 import com.negi.surveys.ui.ChatQuestionScreen
 import com.negi.surveys.ui.ExportScreen
 import com.negi.surveys.ui.HomeScreen
-import com.negi.surveys.ui.ReviewQuestionLog
 import com.negi.surveys.ui.ReviewScreen
 import com.negi.surveys.ui.SurveyStartScreen
 
@@ -70,12 +73,42 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     val backStack: NavBackStack<NavKey> = rememberNavBackStack(Home)
     val nav = remember(backStack) { AppNavigator(backStack) }
 
-    BackHandler(enabled = nav.canPop()) {
+    /**
+     * Session-lifetime state holder.
+     *
+     * Notes:
+     * - Owns Review/Export logs across navigation.
+     * - Removes the need for remember() map-based storage in the root composable.
+     */
+    val sessionVm: SurveySessionViewModel = viewModel()
+
+    /**
+     * IMPORTANT:
+     * - Drive UI (TopBar / BackHandler) directly from backStack so Compose can recompose reliably.
+     * - Some wrapper properties (e.g., nav.current) may not be observable state.
+     */
+    val currentKey: NavKey by remember {
+        derivedStateOf { backStack.lastOrNull() ?: Home }
+    }
+    val canPop: Boolean by remember {
+        derivedStateOf { backStack.size > 1 }
+    }
+
+    BackHandler(enabled = canPop) {
+        Log.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
         nav.pop()
     }
 
-    // NOTE:
-    // - Stable prompts map for the current prototype.
+    LaunchedEffect(currentKey, canPop) {
+        Log.d(TAG, "NavState: size=${backStack.size} canPop=$canPop current=${currentKey.javaClass.simpleName}")
+    }
+
+    /**
+     * Stable prompts map for the current prototype.
+     *
+     * Notes:
+     * - Keep stable across recompositions to avoid changing downstream vmKey/hash behaviors.
+     */
     val prompts: Map<String, String> = remember {
         linkedMapOf(
             "Q1" to "Question prompt for Q1 (placeholder)",
@@ -83,23 +116,31 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         )
     }
 
-    // NOTE:
-    // - Session-lifetime review logs (questionId -> log).
-    val reviewLogsState = remember { mutableStateMapOf<String, ReviewQuestionLog>() }
-
-    val entries: (NavKey) -> NavEntry<NavKey> = remember {
+    val entries: (NavKey) -> NavEntry<NavKey> = remember(nav, prompts, sessionVm) {
         entryProvider {
             entry<Home> {
                 HomeScreen(
-                    onStartSurvey = { nav.startSurvey() },
-                    onExport = { nav.goExport() }
+                    onStartSurvey = {
+                        Log.d(TAG, "Home: startSurvey()")
+                        nav.startSurvey()
+                    },
+                    onExport = {
+                        Log.d(TAG, "Home: goExport()")
+                        nav.goExport()
+                    }
                 )
             }
 
             entry<SurveyStart> {
                 SurveyStartScreen(
-                    onBegin = { nav.beginQuestions("Q1") },
-                    onBack = { nav.pop() }
+                    onBegin = {
+                        Log.d(TAG, "SurveyStart: beginQuestions(Q1)")
+                        nav.beginQuestions("Q1")
+                    },
+                    onBack = {
+                        Log.d(TAG, "SurveyStart: pop()")
+                        nav.pop()
+                    }
                 )
             }
 
@@ -110,35 +151,90 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                     questionId = key.id,
                     prompt = prompt,
                     onNext = { log ->
-                        // NOTE:
-                        // - Persist full transcript for Review.
-                        reviewLogsState[key.id] = log
-                        Log.d(TAG, "Saved ReviewLog. qid=${key.id} skipped=${log.isSkipped} lines=${log.lines.size}")
+                        /**
+                         * Persist full transcript to session VM.
+                         *
+                         * Notes:
+                         * - Use log.questionId for safety (should match key.id).
+                         * - Review/Export read from session VM (StateFlow) so they remain reactive.
+                         */
+                        sessionVm.upsertLog(log)
+
+                        Log.d(
+                            TAG,
+                            "Saved ReviewLog -> sessionVm. qid=${log.questionId} keyId=${key.id} skipped=${log.isSkipped} lines=${log.lines.size}"
+                        )
 
                         when (key.id) {
-                            "Q1" -> nav.goQuestion("Q2")
-                            "Q2" -> nav.goReview()
-                            else -> nav.goReview()
+                            "Q1" -> {
+                                Log.d(TAG, "Nav: Q1 -> Q2")
+                                nav.goQuestion("Q2")
+                            }
+
+                            "Q2" -> {
+                                Log.d(TAG, "Nav: Q2 -> Review")
+                                nav.goReview()
+                            }
+
+                            else -> {
+                                Log.d(TAG, "Nav: ${key.id} -> Review (default)")
+                                nav.goReview()
+                            }
                         }
                     },
-                    onBack = { nav.pop() }
+                    onBack = {
+                        Log.d(TAG, "Question(${key.id}): pop()")
+                        nav.pop()
+                    }
                 )
             }
 
             entry<Review> {
-                // NOTE:
-                // - Pass a stable snapshot list sorted by questionId.
-                val logs = reviewLogsState.values.sortedBy { it.questionId }
+                /**
+                 * Reactive logs sourced from session VM.
+                 *
+                 * Notes:
+                 * - This is the single source of truth.
+                 * - If logs update while staying on Review, UI updates automatically.
+                 */
+                val logsState = sessionVm.logs.collectAsStateWithLifecycle()
+                val logs = logsState.value
+
+                LaunchedEffect(logs.size) {
+                    Log.d(
+                        TAG,
+                        "Review: render logs.size=${logs.size} keys=${logs.joinToString { it.questionId }}"
+                    )
+                }
 
                 ReviewScreen(
                     logs = logs,
-                    onExport = { nav.goExport() },
-                    onBack = { nav.pop() }
+                    onExport = {
+                        Log.d(TAG, "Review: goExport()")
+                        nav.goExport()
+                    },
+                    onBack = {
+                        Log.d(TAG, "Review: pop()")
+                        nav.pop()
+                    }
                 )
             }
 
             entry<Export> {
-                ExportScreen(onBack = { nav.pop() })
+                /**
+                 * Export screen should read from the same session VM.
+                 *
+                 * Notes:
+                 * - Preferred pattern inside ExportScreen:
+                 *   val vm: SurveySessionViewModel = viewModel()
+                 *   val json by vm.exportJson.collectAsStateWithLifecycle()
+                 */
+                ExportScreen(
+                    onBack = {
+                        Log.d(TAG, "Export: pop()")
+                        nav.pop()
+                    }
+                )
             }
         }
     }
@@ -152,9 +248,12 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
 
         topBar = {
             CompactTopBar(
-                title = titleFor(nav.current),
-                canPop = nav.canPop(),
-                onBack = { nav.pop() }
+                title = titleFor(currentKey),
+                canPop = canPop,
+                onBack = {
+                    Log.d(TAG, "TopBar: back clicked")
+                    nav.pop()
+                }
             )
         }
     ) { innerPadding ->

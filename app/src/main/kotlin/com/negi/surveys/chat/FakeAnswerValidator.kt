@@ -26,7 +26,8 @@ import kotlinx.coroutines.delay
  *
  * Notes:
  * - This class is intentionally simple and synchronous in logic, but suspends to simulate latency.
- * - Keep the API compatible with a future SLM-backed implementation of [AnswerValidator].
+ * - This implementation assumes inputs are already normalized (trimmed) as per [AnswerValidator] contract.
+ * - Prefer calling [AnswerValidator.validateMainRaw] / [AnswerValidator.validateFollowUpRaw] at call sites.
  */
 class FakeAnswerValidator(
     /**
@@ -47,7 +48,7 @@ class FakeAnswerValidator(
 
     /**
      * Optional debug logger. If provided, receives PII-safe messages.
-     * Example injection from UI:
+     * Example injection:
      *   FakeAnswerValidator(logger = { Log.d("FakeAnswerValidator", it) })
      */
     private val logger: ((String) -> Unit)? = null
@@ -60,21 +61,23 @@ class FakeAnswerValidator(
     override suspend fun validateMain(questionId: String, answer: String): ValidationOutcome {
         delay(simulatedLatencyMsSafe)
 
+        // Contract says inputs are normalized, but we keep this stable and defensive.
+        val qid = questionId.trim()
         val trimmed = answer.trim()
         val nonWsLen = nonWhitespaceLength(trimmed)
 
-        log("validateMain: qid=${questionId.trim()} nonWsLen=$nonWsLen threshold=$minMainCharsSafe")
+        log("validateMain: qid=$qid nonWsLen=$nonWsLen threshold=$minMainCharsSafe")
 
-        // Treat very short or "non-answers" as needing follow-up.
+        // Treat very short or obvious placeholders as needing follow-up.
         if (nonWsLen < minMainCharsSafe || looksLikeNonAnswer(trimmed)) {
-            log("validateMain: NEED_FOLLOW_UP qid=${questionId.trim()} nonWsLen=$nonWsLen")
+            log("validateMain: NEED_FOLLOW_UP qid=$qid nonWsLen=$nonWsLen")
             return ValidationOutcome.needFollowUp(
                 assistantMessage = "Thanks. I need one more detail to validate your answer.",
                 followUpQuestion = "Could you add one concrete detail or example?"
             )
         }
 
-        log("validateMain: ACCEPTED qid=${questionId.trim()} nonWsLen=$nonWsLen")
+        log("validateMain: ACCEPTED qid=$qid nonWsLen=$nonWsLen")
         return ValidationOutcome.accepted(
             assistantMessage = "Looks good. Thanks!"
         )
@@ -87,6 +90,7 @@ class FakeAnswerValidator(
     ): ValidationOutcome {
         delay(simulatedLatencyMsSafe)
 
+        val qid = questionId.trim()
         val mainTrimmed = mainAnswer.trim()
         val fuTrimmed = followUpAnswer.trim()
 
@@ -94,20 +98,20 @@ class FakeAnswerValidator(
         val fuNonWsLen = nonWhitespaceLength(fuTrimmed)
 
         log(
-            "validateFollowUp: qid=${questionId.trim()} mainNonWsLen=$mainNonWsLen " +
+            "validateFollowUp: qid=$qid mainNonWsLen=$mainNonWsLen " +
                     "fuNonWsLen=$fuNonWsLen threshold=$minFollowUpCharsSafe"
         )
 
         // Follow-up must contain at least a small amount of detail.
         if (fuNonWsLen < minFollowUpCharsSafe || looksLikeNonAnswer(fuTrimmed)) {
-            log("validateFollowUp: NEED_FOLLOW_UP qid=${questionId.trim()} fuNonWsLen=$fuNonWsLen")
+            log("validateFollowUp: NEED_FOLLOW_UP qid=$qid fuNonWsLen=$fuNonWsLen")
             return ValidationOutcome.needFollowUp(
                 assistantMessage = "I still need a bit more detail to proceed.",
                 followUpQuestion = "Please add one short concrete detail (e.g., a number, a place, or a specific example)."
             )
         }
 
-        log("validateFollowUp: ACCEPTED qid=${questionId.trim()} fuNonWsLen=$fuNonWsLen")
+        log("validateFollowUp: ACCEPTED qid=$qid fuNonWsLen=$fuNonWsLen")
         return ValidationOutcome.accepted(
             assistantMessage = "Great. Now your answer is complete."
         )
