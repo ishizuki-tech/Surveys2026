@@ -66,7 +66,7 @@ fun HomeScreen(
             .fillMaxSize()
             // English comment:
             // - safeDrawing avoids content being overlapped by system bars (status/navigation, cutouts).
-            .windowInsetsPadding(WindowInsets.safeDrawing)
+            //.windowInsetsPadding(WindowInsets.safeDrawing)
             .padding(16.dp),
         verticalArrangement = Arrangement.Top
     ) {

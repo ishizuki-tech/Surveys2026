@@ -20,12 +20,22 @@ import kotlinx.coroutines.flow.flow
 
 /**
  * Prompt phases used by [Repository.buildPrompt] for validation flows.
+ *
+ * NOTE:
+ * - Keep this enum consistent across the validator/repository stack.
+ * - If you already have this enum in another file, remove the duplicate from here.
  */
 enum class PromptPhase {
     VALIDATE_MAIN,
     VALIDATE_FOLLOW_UP
 }
 
+/**
+ * Repository interface used by [SlmAnswerValidator].
+ *
+ * NOTE:
+ * - If you already have this interface in another file, remove the duplicate from here.
+ */
 interface Repository {
     /** Execute a single streaming inference for the given [prompt]. */
     suspend fun request(prompt: String): Flow<String>
@@ -40,15 +50,22 @@ interface Repository {
 /**
  * A minimal fake "SLM" repository that returns streaming chunks as Flow<String>.
  *
- * Key improvements:
- * - Understands delimiter-based multi-line blocks:
- *   MAIN_ANSWER_BEGIN/END and FOLLOW_UP_HISTORY_BEGIN/END
- * - Can ask multiple follow-ups:
- *   returns NEED_FOLLOW_UP repeatedly until requirements are met.
+ * Goals:
+ * - Behave like a streaming LLM backend (chunk stream).
+ * - Produce deterministic JSON-only outputs compatible with SlmAnswerValidator.
+ * - Support BOTH follow-up formats used across SmallSteps:
+ *   (A) Single follow-up:
+ *       FOLLOW_UP_ANSWER_BEGIN ... FOLLOW_UP_ANSWER_END
+ *   (B) Multi follow-up history:
+ *       FOLLOW_UP_HISTORY_BEGIN ... FOLLOW_UP_HISTORY_END
+ *       with lines like "FOLLOW_UP_1_A: ..."
  *
  * Test hooks:
  * - requestSetupDelayMs: simulate slow request preparation (before Flow is returned).
  * - throwOnRequestSetup / throwAfterEmits: inject failures to exercise ERROR paths.
+ *
+ * Privacy:
+ * - Do NOT log raw prompts/answers. If you pass [logger], keep it metadata-only.
  */
 class FakeSlmRepository(
     private val config: Config = Config()
@@ -70,7 +87,13 @@ class FakeSlmRepository(
         /** Chunk size in characters emitted per Flow emission. Must be >= 1. */
         val chunkSizeChars: Int = 2,
 
-        /** If true, prefix output with non-JSON text (tests validator robustness). */
+        /**
+         * If true, sometimes prefix output with non-JSON text to test validator robustness.
+         *
+         * Implementation detail:
+         * - We decide "sometimes" deterministically using a prompt fingerprint,
+         *   so tests are reproducible across runs.
+         */
         val occasionallyPrependNonJson: Boolean = false,
 
         /** Add a trailing newline after JSON. */
@@ -79,7 +102,7 @@ class FakeSlmRepository(
         /** Minimum chars for main answer to avoid needing follow-ups. */
         val minMainAnswerChars: Int = 12,
 
-        /** Required number of follow-ups when main answer is short. */
+        /** Base required follow-ups when main answer is short. */
         val requiredFollowUps: Int = 3,
 
         /** Minimum chars per follow-up answer to be considered "useful". */
@@ -90,9 +113,14 @@ class FakeSlmRepository(
     )
 
     override fun buildPrompt(userPrompt: String): String {
+        // NOTE:
+        // - This wrapper simulates a "system + user" envelope.
+        // - Keep it strict: JSON-only, single object, no analysis.
         return """
 SYSTEM:
-You are a JSON-only assistant. Output must be a single JSON object.
+You are a JSON-only assistant.
+Output MUST be exactly one JSON object.
+No markdown. No extra text. No analysis.
 
 USER:
 $userPrompt
@@ -106,7 +134,10 @@ $userPrompt
         }
         return """
 SYSTEM:
-You are a JSON-only assistant. Output must be a single JSON object. PHASE=$phaseTag
+You are a JSON-only assistant.
+Output MUST be exactly one JSON object.
+No markdown. No extra text. No analysis.
+PHASE=$phaseTag
 
 USER:
 $userPrompt
@@ -136,29 +167,61 @@ $userPrompt
 
             val phase = detectPhase(prompt)
 
-            // Extract multi-line blocks.
-            val mainAnswer = extractBlock(prompt, "MAIN_ANSWER_BEGIN", "MAIN_ANSWER_END") ?: ""
-            val history = extractBlock(prompt, "FOLLOW_UP_HISTORY_BEGIN", "FOLLOW_UP_HISTORY_END") ?: "(none)"
+            // Extract the main answer from delimiter blocks (multi-line safe).
+            val mainAnswer = extractBlockAny(
+                text = prompt,
+                candidates = listOf(
+                    MarkerPair("MAIN_ANSWER_BEGIN", "MAIN_ANSWER_END")
+                )
+            ).orEmpty()
 
-            val followUpAnswers = parseFollowUpAnswers(history)
+            // Extract follow-ups from either:
+            // (A) history block or (B) single follow-up block.
+            val followUpHistory = extractBlockAny(
+                text = prompt,
+                candidates = listOf(
+                    MarkerPair("FOLLOW_UP_HISTORY_BEGIN", "FOLLOW_UP_HISTORY_END")
+                )
+            )
 
+            val singleFollowUp = extractBlockAny(
+                text = prompt,
+                candidates = listOf(
+                    MarkerPair("FOLLOW_UP_ANSWER_BEGIN", "FOLLOW_UP_ANSWER_END")
+                )
+            )
+
+            val followUpAnswers = when {
+                !followUpHistory.isNullOrBlank() -> parseFollowUpAnswersFromHistory(followUpHistory)
+                !singleFollowUp.isNullOrBlank() -> listOf(singleFollowUp.trim()).filter { it.isNotBlank() }
+                else -> emptyList()
+            }
+
+            // Decide whether to prepend non-JSON for robustness testing.
+            val prependNonJson = shouldPrependNonJson(prompt)
+
+            // Apply fake "validation" logic.
             val json = when (phase) {
                 PromptPhase.VALIDATE_MAIN -> validateMain(mainAnswer, followUpAnswers)
                 PromptPhase.VALIDATE_FOLLOW_UP -> validateFollowUp(mainAnswer, followUpAnswers)
             }
 
             val finalText = buildString {
-                if (config.occasionallyPrependNonJson) {
+                if (prependNonJson) {
                     append("analysis: (fake) streaming output begins\n")
                 }
                 append(json)
                 if (config.appendTrailingNewline) append("\n")
             }
 
+            config.logger?.invoke(
+                "FakeSlmRepository.request: meta phase=$phase mainLen=${mainAnswer.trim().length} followUps=${followUpAnswers.size} outChars=${finalText.length}"
+            )
+
             var emitCount = 0
+            var i = 0
 
             // Stream as chunks.
-            var i = 0
             while (i < finalText.length) {
                 if (throwAfter >= 0 && emitCount >= throwAfter) {
                     throw RuntimeException("fake_stream_error")
@@ -172,7 +235,7 @@ $userPrompt
                 if (safeChunkDelay > 0L) delay(safeChunkDelay)
             }
 
-            config.logger?.invoke("FakeSlmRepository.request: stream done (outChars=${finalText.length})")
+            config.logger?.invoke("FakeSlmRepository.request: stream done (chunks=$emitCount)")
         }
     }
 
@@ -209,30 +272,32 @@ $userPrompt
      * Fake validation logic for follow-up cycles.
      *
      * Behavior:
-     * - If enough follow-ups exist AND each follow-up is "useful" (min length), ACCEPTED.
-     * - Else ask the next follow-up question.
+     * - If main answer is already long enough, ACCEPTED immediately.
+     * - Otherwise, require N follow-ups (N may scale slightly based on main length).
+     * - Each follow-up must be "useful" (min length) to count.
      */
     private fun validateFollowUp(mainAnswer: String, followUpAnswers: List<String>): String {
         val a = mainAnswer.trim()
-
         val requiresFollowUp = a.length < config.minMainAnswerChars
+
         if (!requiresFollowUp) {
-            // Main answer alone is good; follow-up phase should immediately accept.
             return jsonAccepted("Looks good. Thanks!")
         }
 
-        // If we don't yet have enough follow-up answers, ask next.
-        val n = followUpAnswers.size
-        if (n < config.requiredFollowUps) {
-            val q = nextFollowUpQuestion(index = n + 1)
+        val required = requiredFollowUpsForMain(a)
+        val useful = followUpAnswers.filter { it.trim().length >= config.minFollowUpAnswerChars }
+
+        // Ask next follow-up if we don't have enough useful answers yet.
+        if (useful.size < required) {
+            val q = nextFollowUpQuestion(index = useful.size + 1)
             return jsonNeedFollowUp(
-                assistantMessage = "Good. One more detail would make this answer complete.",
+                assistantMessage = "Good. One more concrete detail would make this answer complete.",
                 followUpQuestion = q
             )
         }
 
-        // If any follow-up is too short, ask for a more concrete detail.
-        val shortIdx = followUpAnswers.indexOfFirst { it.trim().length < config.minFollowUpAnswerChars }
+        // If any provided follow-up exists but is too short/vague, ask to clarify that slot.
+        val shortIdx = followUpAnswers.indexOfFirst { it.trim().isNotEmpty() && it.trim().length < config.minFollowUpAnswerChars }
         if (shortIdx >= 0) {
             val q = "Could you make follow-up #${shortIdx + 1} more concrete (numbers, place, or example)?"
             return jsonNeedFollowUp(
@@ -244,11 +309,25 @@ $userPrompt
         return jsonAccepted("Great. Now your answer is complete.")
     }
 
+    /**
+     * Compute required follow-ups based on how short the main answer is.
+     *
+     * Rationale:
+     * - For extremely short answers, require slightly more detail to simulate stricter validation.
+     * - Keep this deterministic and simple for SmallStep testing.
+     */
+    private fun requiredFollowUpsForMain(main: String): Int {
+        val base = config.requiredFollowUps.coerceAtLeast(1)
+        val veryShortThreshold = (config.minMainAnswerChars / 2).coerceAtLeast(1)
+        return if (main.length < veryShortThreshold) base + 1 else base
+    }
+
     private fun nextFollowUpQuestion(index: Int): String {
         return when (index) {
             1 -> "Add one concrete example (what/where/when)."
             2 -> "Add one measurable detail (number, duration, frequency, or cost)."
             3 -> "Clarify one constraint or exception case."
+            4 -> "State one cause-and-effect detail (why it happened / why it matters)."
             else -> "Add one more concrete detail to remove ambiguity."
         }
     }
@@ -272,6 +351,12 @@ $userPrompt
 """.trimIndent()
     }
 
+    // ---------------------------------------------------------------------
+    // Block extraction helpers
+    // ---------------------------------------------------------------------
+
+    private data class MarkerPair(val begin: String, val end: String)
+
     /**
      * Extract a multi-line block between markers.
      *
@@ -283,46 +368,119 @@ $userPrompt
     private fun extractBlock(text: String, begin: String, end: String): String? {
         val b = text.indexOf(begin)
         if (b < 0) return null
-        val e = text.indexOf(end, startIndex = b + begin.length)
-        if (e < 0) return null
-
         val start = b + begin.length
+        val e = text.indexOf(end, startIndex = start)
+        if (e < 0) return null
         return text.substring(start, e).trim()
     }
 
     /**
+     * Try multiple marker pairs and return the first match.
+     *
+     * Why:
+     * - Different SmallSteps may evolve prompt markers.
+     * - The fake repository should be tolerant so integration doesn't break.
+     */
+    private fun extractBlockAny(text: String, candidates: List<MarkerPair>): String? {
+        for (p in candidates) {
+            val v = extractBlock(text, p.begin, p.end)
+            if (!v.isNullOrBlank()) return v
+        }
+        return null
+    }
+
+    // ---------------------------------------------------------------------
+    // Follow-up parsing
+    // ---------------------------------------------------------------------
+
+    /**
      * Parse follow-up answers from the history string produced by the VM.
      *
-     * Expected format (example):
-     * FOLLOW_UP_1_Q: ...
-     * FOLLOW_UP_1_A: ...
-     * FOLLOW_UP_2_Q: ...
-     * FOLLOW_UP_2_A: ...
+     * Expected format examples:
+     *   FOLLOW_UP_1_Q: ...
+     *   FOLLOW_UP_1_A: ...
+     *   FOLLOW_UP_2_Q: ...
+     *   FOLLOW_UP_2_A: ...
+     *
+     * Notes:
+     * - We only collect "_A:" lines.
+     * - This function intentionally avoids being "too smart".
      */
-    private fun parseFollowUpAnswers(history: String): List<String> {
+    private fun parseFollowUpAnswersFromHistory(history: String): List<String> {
         val h = history.trim()
         if (h.isEmpty() || h == "(none)") return emptyList()
 
         val out = mutableListOf<String>()
         h.lineSequence().forEach { line ->
             val t = line.trim()
+            if (!t.startsWith("FOLLOW_UP_")) return@forEach
+
+            // Accept patterns like "FOLLOW_UP_1_A: answer"
             val idx = t.indexOf("_A:")
-            if (idx > 0 && t.startsWith("FOLLOW_UP_")) {
-                out += t.substring(idx + 3).trim()
+            if (idx > 0 && idx + 3 < t.length) {
+                val ans = t.substring(idx + 3).trim()
+                if (ans.isNotBlank()) out += ans
             }
         }
         return out
     }
 
+    // ---------------------------------------------------------------------
+    // Robustness testing behavior
+    // ---------------------------------------------------------------------
+
+    /**
+     * Decide whether to prepend non-JSON text deterministically.
+     *
+     * Rationale:
+     * - Random behavior is annoying in tests.
+     * - Deterministic "pseudo-random" based on prompt fingerprint is reproducible.
+     */
+    private fun shouldPrependNonJson(prompt: String): Boolean {
+        if (!config.occasionallyPrependNonJson) return false
+        val fp = promptFingerprint(prompt)
+        // Roughly 1 out of 5 requests will prepend non-JSON text.
+        return (fp % 5) == 0
+    }
+
+    /**
+     * A tiny, deterministic fingerprint for a prompt string.
+     *
+     * NOTE:
+     * - This is NOT cryptographic. It is only used to drive reproducible fake behaviors.
+     */
+    private fun promptFingerprint(prompt: String): Int {
+        var h = 17
+        // Sample a subset to keep it fast even for large prompts.
+        val step = (prompt.length / 64).coerceAtLeast(1)
+        var i = 0
+        while (i < prompt.length) {
+            h = 31 * h + prompt[i].code
+            i += step
+        }
+        return h
+    }
+
+    // ---------------------------------------------------------------------
+    // JSON escaping
+    // ---------------------------------------------------------------------
+
     /**
      * JSON-string-escape and wrap with quotes.
+     *
+     * Notes:
+     * - Escapes control chars that commonly break JSON.
+     * - Keeps output safe for org.json parsing in the validator.
      */
     private fun String.jsonQuote(): String {
         val s = this
             .replace("\\", "\\\\")
             .replace("\"", "\\\"")
-            .replace("\r", "\\r")
+            .replace("\b", "\\b")
+            .replace("\u000C", "\\f")
             .replace("\n", "\\n")
+            .replace("\r", "\\r")
+            .replace("\t", "\\t")
         return "\"$s\""
     }
 }

@@ -125,7 +125,7 @@ fun QuestionScreen(
         modifier = Modifier
             .fillMaxSize()
             // Avoid being overlapped by system bars (status/navigation/cutouts).
-            .windowInsetsPadding(WindowInsets.safeDrawing)
+            //.windowInsetsPadding(WindowInsets.safeDrawing)
             // Keep controls visible above the IME.
             .imePadding()
             .padding(16.dp),

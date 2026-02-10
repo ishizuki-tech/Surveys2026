@@ -14,7 +14,12 @@
 package com.negi.surveys.chat
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.json.JSONObject
 
 /**
@@ -23,14 +28,14 @@ import org.json.JSONObject
  * Strategy:
  * - Build a model-ready prompt via Repository.buildPrompt(userPrompt, phase).
  * - Execute Repository.request(prompt) which returns Flow<String>.
- * - Collect the stream into a single text buffer (bounded + timeout).
+ * - Collect the stream into a single text (bounded + timeout) on a background dispatcher.
  * - Extract/parse a JSON object from the model output.
  *
  * Streaming:
  * - Emits Begin/Delta/End/Error to [streamBridge] so the ViewModel can render progress.
  *
  * Privacy:
- * - Never log raw answers (potentially PII). Only log metadata.
+ * - Never logs raw user answers. Logger must remain metadata-only.
  */
 class SlmAnswerValidator(
     private val repository: Repository,
@@ -44,23 +49,23 @@ class SlmAnswerValidator(
         val userPrompt = buildValidationUserPrompt(
             questionId = questionId,
             mainAnswer = answer,
-            followUpHistory = null
+            followUpAnswer = null
         )
-
         val modelPrompt = repository.buildPrompt(userPrompt, PromptPhase.VALIDATE_MAIN)
+
         log("validateMain: qid=$questionId (request start)")
 
-        val result = collectStreamingTextSafely(
-            flowProvider = { repository.request(modelPrompt) },
+        val raw = collectStreamingText(
+            flow = repository.request(modelPrompt),
             timeoutMs = timeoutMs,
             maxChars = maxChars
         )
 
-        log("validateMain: qid=$questionId (stop=${result.reason} chars=${result.text.length} err=${result.errorToken ?: "-"})")
+        log("validateMain: qid=$questionId (response received chars=${raw.length})")
 
         return parseOutcomeOrFallback(
             questionId = questionId,
-            raw = result.text,
+            raw = raw,
             fallbackFollowUp = "Could you add one concrete detail or example?"
         )
     }
@@ -73,150 +78,118 @@ class SlmAnswerValidator(
         val userPrompt = buildValidationUserPrompt(
             questionId = questionId,
             mainAnswer = mainAnswer,
-            followUpHistory = followUpAnswer
+            followUpAnswer = followUpAnswer
         )
-
         val modelPrompt = repository.buildPrompt(userPrompt, PromptPhase.VALIDATE_FOLLOW_UP)
+
         log("validateFollowUp: qid=$questionId (request start)")
 
-        val result = collectStreamingTextSafely(
-            flowProvider = { repository.request(modelPrompt) },
+        val raw = collectStreamingText(
+            flow = repository.request(modelPrompt),
             timeoutMs = timeoutMs,
             maxChars = maxChars
         )
 
-        log("validateFollowUp: qid=$questionId (stop=${result.reason} chars=${result.text.length} err=${result.errorToken ?: "-"})")
+        log("validateFollowUp: qid=$questionId (response received chars=${raw.length})")
 
         return parseOutcomeOrFallback(
             questionId = questionId,
-            raw = result.text,
+            raw = raw,
             fallbackFollowUp = "Please add one short concrete detail so I can proceed."
         )
     }
 
-    /**
-     * Build a strict, delimiter-based prompt so multi-line fields are unambiguous.
-     *
-     * Requirements:
-     * - JSON only output.
-     * - Ask at most ONE follow-up question at a time.
-     * - Do not echo full user answers.
-     */
     private fun buildValidationUserPrompt(
         questionId: String,
         mainAnswer: String,
-        followUpHistory: String?
+        followUpAnswer: String?
     ): String {
-        val historyBlock = followUpHistory?.trim().takeUnless { it.isNullOrEmpty() } ?: "(none)"
+        val fu = followUpAnswer?.trim().orEmpty()
 
+        // NOTE:
+        // - Use explicit BEGIN/END markers to make extraction robust against multi-line answers.
+        // - Require JSON-only output (no markdown, no analysis).
         return """
-You are an answer validation assistant for a survey app.
+You are a strict JSON generator for a survey answer validation system.
 
-TASK:
-- Decide if MAIN_ANSWER sufficiently answers the question for QUESTION_ID.
-- If insufficient, ask exactly ONE follow-up question to obtain missing detail.
-- Return JSON ONLY (no markdown, no extra text).
+OUTPUT RULES:
+- Output MUST be exactly ONE JSON object.
+- Do NOT output markdown, code fences, or additional text.
+- Do NOT include analysis or reasoning.
+- Do NOT repeat the full user answers.
 
-OUTPUT JSON SCHEMA:
+JSON SCHEMA:
 {
   "status": "ACCEPTED" | "NEED_FOLLOW_UP",
   "assistantMessage": "string",
   "followUpQuestion": "string (required when status=NEED_FOLLOW_UP)"
 }
 
-RULES:
-- Ask at most ONE follow-up at a time.
-- Do NOT include analysis or reasoning.
-- Do NOT quote or echo user answers verbatim.
-- Keep assistantMessage concise.
+VALIDATION GOAL:
+- If MAIN_ANSWER is sufficient, return status=ACCEPTED.
+- If insufficient, return status=NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
 
+INPUT:
 QUESTION_ID: $questionId
 
 MAIN_ANSWER_BEGIN
 ${mainAnswer.trim()}
 MAIN_ANSWER_END
 
-FOLLOW_UP_HISTORY_BEGIN
-$historyBlock
-FOLLOW_UP_HISTORY_END
+FOLLOW_UP_ANSWER_BEGIN
+$fu
+FOLLOW_UP_ANSWER_END
 """.trimIndent()
     }
 
     /**
-     * Collect a streaming flow safely while emitting chunks to UI.
+     * Collect a streaming Flow<String> into a single buffer with:
+     * - timeout
+     * - max character cap
+     * - Begin/Delta/End/Error events for UI
      *
-     * Design choice:
-     * - Timeout / max chars / non-cancellation errors should NOT surface as a "Validation error" bubble.
-     *   We end the stream and let the caller present a fallback assistant message.
-     * - Cancellation is a real control signal and should propagate upward, and should also emit "cancelled"
-     *   so the UI can suppress/cleanup transient stream bubbles deterministically.
-     *
-     * Timeout coverage:
-     * - Measures flow creation time (flowProvider) and subtracts it from timeout budget.
-     * - If budget is exhausted before collection begins, returns TIMEOUT immediately.
+     * Critical:
+     * - Runs the streaming collection on Dispatchers.Default so UI can render deltas.
      */
-    private suspend fun collectStreamingTextSafely(
-        flowProvider: suspend () -> Flow<String>,
+    private suspend fun collectStreamingText(
+        flow: Flow<String>,
         timeoutMs: Long,
         maxChars: Int
-    ): FlowTextResult {
+    ): String {
         val sessionId = streamBridge.begin()
+        val sb = StringBuilder(minOf(2048, maxChars))
 
-        try {
-            val startedNs = System.nanoTime()
+        return try {
+            withContext(Dispatchers.Default) {
+                withTimeout(timeoutMs) {
+                    flow.collect { chunk ->
+                        if (chunk.isEmpty()) return@collect
 
-            val flow = try {
-                flowProvider()
-            } catch (ce: CancellationException) {
-                streamBridge.error(sessionId, "cancelled")
-                throw ce
-            } catch (t: Throwable) {
-                streamBridge.end(sessionId)
-                return FlowTextResult(
-                    text = "",
-                    reason = FlowTextStopReason.ERROR,
-                    errorToken = t.javaClass.simpleName.ifBlank { "error" }.take(32)
-                )
-            }
+                        // Bridge: UI can show incremental output.
+                        streamBridge.emitChunk(sessionId, chunk)
 
-            val elapsedMs = (System.nanoTime() - startedNs) / 1_000_000L
-            val remainingMs = if (timeoutMs > 0L) (timeoutMs - elapsedMs).coerceAtLeast(0L) else timeoutMs
-
-            // IMPORTANT:
-            // FlowTextCollector treats timeoutMs<=0 as "no timeout".
-            // If we exhausted the budget, we must not pass 0; treat as TIMEOUT immediately.
-            if (timeoutMs > 0L && remainingMs <= 0L) {
-                streamBridge.end(sessionId)
-                return FlowTextResult(
-                    text = "",
-                    reason = FlowTextStopReason.TIMEOUT
-                )
-            }
-
-            val result = try {
-                flow.collectToTextSafely(
-                    timeoutMs = remainingMs,
-                    maxChars = maxChars
-                ) { chunk, _ ->
-                    // Keep UI output consistent with buffered content (collector already truncates).
-                    streamBridge.emitChunk(sessionId, chunk)
+                        // Memory bound.
+                        val remaining = maxChars - sb.length
+                        if (remaining <= 0) return@collect
+                        sb.append(chunk.take(remaining))
+                    }
                 }
-            } catch (ce: CancellationException) {
-                streamBridge.error(sessionId, "cancelled")
-                throw ce
             }
-
             streamBridge.end(sessionId)
-            return result
-        } catch (ce: CancellationException) {
-            throw ce
+            sb.toString()
+        } catch (t: TimeoutCancellationException) {
+            // Timeout is a controlled cancellation; return partial buffer and mark error.
+            streamBridge.error(sessionId, "timeout")
+            sb.toString()
+        } catch (t: CancellationException) {
+            // Real coroutine cancellation should propagate.
+            streamBridge.error(sessionId, "cancelled")
+            throw t
         } catch (t: Throwable) {
-            streamBridge.end(sessionId)
-            return FlowTextResult(
-                text = "",
-                reason = FlowTextStopReason.ERROR,
-                errorToken = t.javaClass.simpleName.ifBlank { "error" }.take(32)
-            )
+            streamBridge.error(sessionId, t.javaClass.simpleName)
+            sb.toString()
+        } finally {
+            log("collectStreamingText: session=$sessionId buffered=${sb.length}")
         }
     }
 
@@ -262,7 +235,7 @@ FOLLOW_UP_HISTORY_END
                     followUpQuestion = followUpQuestion
                 )
             }
-        } catch (_: Throwable) {
+        } catch (t: Throwable) {
             log("parseOutcome: qid=$questionId JSON parse error -> fallback NEED_FOLLOW_UP")
             ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
@@ -306,7 +279,9 @@ FOLLOW_UP_HISTORY_END
                     '{' -> depth++
                     '}' -> {
                         depth--
-                        if (depth == 0) return text.substring(start, i + 1).trim()
+                        if (depth == 0) {
+                            return text.substring(start, i + 1).trim()
+                        }
                     }
                 }
             }
