@@ -16,40 +16,67 @@ package com.negi.surveys.chat
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
 
 /**
  * A thin, UI-agnostic streaming bridge for model output.
  *
  * Why:
  * - The repository/validator layer may stream tokens (Flow<String>).
- * - The ViewModel should be able to update a single "streaming" bubble
- *   without tightly coupling model code to ViewModel internals.
+ * - The ViewModel updates a single "streaming" bubble without coupling model code to VM internals.
  *
  * Design:
- * - Producer calls begin() to obtain a session id, then emitChunk(sessionId,...),
+ * - Producer calls begin() -> session id, then emitChunk(sessionId,...),
  *   and finally end(sessionId) or error(sessionId,...).
  * - Consumer (ViewModel) collects [events] and ignores stale sessions.
  *
- * Cancellation policy:
- * - cancel(sessionId) ends the active session immediately and emits an Error event with "cancelled".
- * - cancelActive() cancels the currently active session without requiring the caller to know the id.
- * - After cancellation, emitChunk/end/error for that session are ignored.
+ * Important:
+ * - Session ids MUST be monotonically increasing and never reused.
+ *   Otherwise "cancelled session id" tracking in the VM can break future sessions.
+ *
+ * Replacement policy:
+ * - Only one active session is supported.
+ * - If begin() is called while another session is active:
+ *   (1) activeSessionId is cleared first (so late deltas are ignored)
+ *   (2) End(prev) is emitted
+ *   (3) Begin(new) is emitted
+ *
+ * Observability:
+ * - This bridge maintains lightweight counters and:
+ *   - snapshot API ([statsSnapshot])
+ *   - reactive StateFlow ([stats])
+ *   so the app can debug event drops and stale-event ignores without logging user content.
  *
  * Threading:
- * - Producer can emit from any dispatcher/thread; SharedFlow is thread-safe.
- * - Consumer typically collects on Main to update UI state.
+ * - Producers may emit from any thread/dispatcher; SharedFlow is thread-safe.
  */
-class ChatStreamBridge {
+class ChatStreamBridge(
+    /**
+     * Optional metadata logger.
+     *
+     * Notes:
+     * - Do NOT log user content.
+     * - Use this only for session ids / counters / stop reasons.
+     */
+    private val logger: ((String) -> Unit)? = null
+) {
 
-    private val activeSession = AtomicLong(0L)
+    private val lock = Any()
+
+    /** Monotonic id generator. Never reset. */
+    private val nextSessionId = AtomicLong(0L)
+
+    /** Currently active session id (0 => none). */
+    private val activeSessionId = AtomicLong(0L)
 
     private val _events = MutableSharedFlow<ChatStreamEvent>(
         replay = 0,
-        // NOTE:
-        // - Keep a reasonably large buffer to reduce Begin-drop risk.
-        // - The VM still has recovery logic for Delta without Begin.
+        // Keep a reasonably large buffer so Begin/End/Error are unlikely to be dropped.
+        // DROP_OLDEST means control events still get through even under heavy Delta load.
         extraBufferCapacity = 2048,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
@@ -57,16 +84,153 @@ class ChatStreamBridge {
     /** Stream of Begin/Delta/End/Error events. */
     val events: SharedFlow<ChatStreamEvent> = _events.asSharedFlow()
 
+    // ---------------------------------------------------------------------
+    // Stats (PII-safe)
+    // ---------------------------------------------------------------------
+
+    private val emittedBegin = AtomicLong(0L)
+    private val emittedDelta = AtomicLong(0L)
+    private val emittedEnd = AtomicLong(0L)
+    private val emittedError = AtomicLong(0L)
+
+    private val droppedEvents = AtomicLong(0L)
+
+    private val ignoredDelta = AtomicLong(0L)
+    private val ignoredEnd = AtomicLong(0L)
+    private val ignoredError = AtomicLong(0L)
+    private val ignoredCancel = AtomicLong(0L)
+
+    @Volatile private var lastEventNs: Long = 0L
+    @Volatile private var lastEventKind: String? = null
+    @Volatile private var lastEventSessionId: Long = 0L
+
+    @Volatile private var lastCancelSessionId: Long = 0L
+    @Volatile private var lastCancelMessage: String? = null
+
+    /**
+     * Immutable snapshot of bridge-level stats.
+     *
+     * Notes:
+     * - PII-safe by design.
+     * - Useful to render in DebugPanel or to dump to logs.
+     */
+    data class StreamStats(
+        val activeSessionId: Long,
+        val nextSessionId: Long,
+        val emittedBegin: Long,
+        val emittedDelta: Long,
+        val emittedEnd: Long,
+        val emittedError: Long,
+        val droppedEvents: Long,
+        val ignoredDelta: Long,
+        val ignoredEnd: Long,
+        val ignoredError: Long,
+        val ignoredCancel: Long,
+        val lastEventKind: String?,
+        val lastEventSessionId: Long,
+        val lastEventAgeMs: Long,
+        val lastCancelSessionId: Long,
+        val lastCancelMessage: String?
+    )
+
+    private val _stats = MutableStateFlow(statsSnapshot())
+    /** Reactive stats stream for debug UI (PII-safe). */
+    val stats: StateFlow<StreamStats> = _stats.asStateFlow()
+
+    /**
+     * Returns a PII-safe snapshot of the current bridge stats.
+     */
+    fun statsSnapshot(): StreamStats {
+        val now = System.nanoTime()
+        val ageMs = if (lastEventNs <= 0L) Long.MAX_VALUE else ((now - lastEventNs) / 1_000_000L)
+
+        return StreamStats(
+            activeSessionId = activeSessionId.get(),
+            nextSessionId = nextSessionId.get(),
+            emittedBegin = emittedBegin.get(),
+            emittedDelta = emittedDelta.get(),
+            emittedEnd = emittedEnd.get(),
+            emittedError = emittedError.get(),
+            droppedEvents = droppedEvents.get(),
+            ignoredDelta = ignoredDelta.get(),
+            ignoredEnd = ignoredEnd.get(),
+            ignoredError = ignoredError.get(),
+            ignoredCancel = ignoredCancel.get(),
+            lastEventKind = lastEventKind,
+            lastEventSessionId = lastEventSessionId,
+            lastEventAgeMs = ageMs,
+            lastCancelSessionId = lastCancelSessionId,
+            lastCancelMessage = lastCancelMessage
+        )
+    }
+
+    /**
+     * Publishes stats to [stats].
+     *
+     * Notes:
+     * - Delta/ignoredDelta can be very frequent; we throttle those updates.
+     * - Control events (Begin/End/Error/Cancel) publish immediately.
+     */
+    private fun publishStats(force: Boolean) {
+        if (force) {
+            _stats.value = statsSnapshot()
+            return
+        }
+
+        // Throttle: publish every 64 deltas (good enough for debug UI).
+        val d = emittedDelta.get()
+        if ((d and 0x3FL) == 0L) {
+            _stats.value = statsSnapshot()
+        }
+    }
+
+    private fun emitEvent(ev: ChatStreamEvent, kind: String, sessionId: Long) {
+        val ok = _events.tryEmit(ev)
+
+        lastEventNs = System.nanoTime()
+        lastEventKind = kind
+        lastEventSessionId = sessionId
+
+        if (!ok) {
+            droppedEvents.incrementAndGet()
+            logger?.invoke("ChatStreamBridge: event dropped kind=$kind session=$sessionId")
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Producer API
+    // ---------------------------------------------------------------------
+
     /**
      * Begin a new streaming session.
      *
      * Returns:
-     * - A unique session id. Consumers can use it to ignore stale events.
+     * - A unique session id.
+     *
+     * Replacement:
+     * - If a previous session is still active, it is ended first (End event) to avoid UI leaks.
+     * - Critical: activeSessionId is cleared BEFORE emitting End(prev) so late deltas for prev are ignored.
      */
-    fun begin(): Long {
-        val id = activeSession.incrementAndGet()
-        _events.tryEmit(ChatStreamEvent.Begin(id))
-        return id
+    fun begin(): Long = synchronized(lock) {
+        val prev = activeSessionId.get()
+        if (prev > 0L) {
+            // Critical ordering:
+            // - Clear active first so any concurrent emitChunk(prev, ...) becomes ignored.
+            activeSessionId.set(0L)
+
+            emittedEnd.incrementAndGet()
+            emitEvent(ChatStreamEvent.End(prev), kind = "End(replaced)", sessionId = prev)
+        }
+
+        val id = nextSessionId.incrementAndGet()
+        activeSessionId.set(id)
+
+        emittedBegin.incrementAndGet()
+        emitEvent(ChatStreamEvent.Begin(id), kind = "Begin", sessionId = id)
+
+        logger?.invoke("ChatStreamBridge: begin session=$id (prev=$prev)")
+        publishStats(force = true)
+        id
     }
 
     /**
@@ -74,33 +238,68 @@ class ChatStreamBridge {
      *
      * Notes:
      * - If [sessionId] does not match the currently active session, the event is ignored.
-     * - This prevents "late" chunks from a previous request corrupting the current UI.
+     * - This prevents late chunks from a previous request corrupting the current UI.
      */
     fun emitChunk(sessionId: Long, chunk: String) {
         if (chunk.isEmpty()) return
         if (sessionId <= 0L) return
-        if (activeSession.get() != sessionId) return
-        _events.tryEmit(ChatStreamEvent.Delta(sessionId, chunk))
+
+        val active = activeSessionId.get()
+        if (active != sessionId) {
+            ignoredDelta.incrementAndGet()
+            publishStats(force = false)
+            return
+        }
+
+        emittedDelta.incrementAndGet()
+        emitEvent(ChatStreamEvent.Delta(sessionId, chunk), kind = "Delta", sessionId = sessionId)
+        publishStats(force = false)
     }
 
     /**
      * End the given session normally.
      */
-    fun end(sessionId: Long) {
+    fun end(sessionId: Long): Unit = synchronized(lock) {
         if (sessionId <= 0L) return
-        if (activeSession.get() != sessionId) return
-        _events.tryEmit(ChatStreamEvent.End(sessionId))
-        activeSession.set(0L)
+
+        val active = activeSessionId.get()
+        if (active != sessionId) {
+            ignoredEnd.incrementAndGet()
+            publishStats(force = true)
+            return
+        }
+
+        // Clear active first so late emitChunk/end/error are ignored.
+        activeSessionId.set(0L)
+
+        emittedEnd.incrementAndGet()
+        emitEvent(ChatStreamEvent.End(sessionId), kind = "End", sessionId = sessionId)
+
+        logger?.invoke("ChatStreamBridge: end session=$sessionId")
+        publishStats(force = true)
     }
 
     /**
      * End the given session with an error.
      */
-    fun error(sessionId: Long, message: String) {
+    fun error(sessionId: Long, message: String): Unit = synchronized(lock) {
         if (sessionId <= 0L) return
-        if (activeSession.get() != sessionId) return
-        _events.tryEmit(ChatStreamEvent.Error(sessionId, message))
-        activeSession.set(0L)
+
+        val active = activeSessionId.get()
+        if (active != sessionId) {
+            ignoredError.incrementAndGet()
+            publishStats(force = true)
+            return
+        }
+
+        // Clear active first so late emitChunk/end/error are ignored.
+        activeSessionId.set(0L)
+
+        emittedError.incrementAndGet()
+        emitEvent(ChatStreamEvent.Error(sessionId, message), kind = "Error", sessionId = sessionId)
+
+        logger?.invoke("ChatStreamBridge: error session=$sessionId msg=${message.trim().take(32)}")
+        publishStats(force = true)
     }
 
     /**
@@ -113,11 +312,31 @@ class ChatStreamBridge {
      * Returns:
      * - The cancelled session id (or 0 if nothing was cancelled).
      */
-    fun cancel(sessionId: Long, message: String = CANCELLED_MESSAGE): Long {
+    fun cancel(sessionId: Long, message: String = CANCELLED_MESSAGE): Long = synchronized(lock) {
         if (sessionId <= 0L) return 0L
-        if (activeSession.get() != sessionId) return 0L
-        error(sessionId, message)
-        return sessionId
+
+        val active = activeSessionId.get()
+        if (active != sessionId) {
+            ignoredCancel.incrementAndGet()
+            publishStats(force = true)
+            return 0L
+        }
+
+        activeSessionId.set(0L)
+
+        lastCancelSessionId = sessionId
+        lastCancelMessage = message
+
+        emittedError.incrementAndGet()
+        emitEvent(
+            ChatStreamEvent.Error(sessionId, message),
+            kind = "Error(cancel)",
+            sessionId = sessionId
+        )
+
+        logger?.invoke("ChatStreamBridge: cancel session=$sessionId")
+        publishStats(force = true)
+        sessionId
     }
 
     /**
@@ -130,11 +349,29 @@ class ChatStreamBridge {
      * Returns:
      * - The cancelled session id (or 0 if nothing was cancelled).
      */
-    fun cancelActive(message: String = CANCELLED_MESSAGE): Long {
-        val id = activeSession.get()
-        if (id <= 0L) return 0L
-        error(id, message)
-        return id
+    fun cancelActive(message: String = CANCELLED_MESSAGE): Long = synchronized(lock) {
+        val id = activeSessionId.get()
+        if (id <= 0L) {
+            ignoredCancel.incrementAndGet()
+            publishStats(force = true)
+            return 0L
+        }
+
+        activeSessionId.set(0L)
+
+        lastCancelSessionId = id
+        lastCancelMessage = message
+
+        emittedError.incrementAndGet()
+        emitEvent(
+            ChatStreamEvent.Error(id, message),
+            kind = "Error(cancelActive)",
+            sessionId = id
+        )
+
+        logger?.invoke("ChatStreamBridge: cancelActive session=$id")
+        publishStats(force = true)
+        id
     }
 
     private companion object {

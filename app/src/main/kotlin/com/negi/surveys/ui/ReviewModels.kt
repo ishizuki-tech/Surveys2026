@@ -56,3 +56,42 @@ data class ReviewQuestionLog(
     val completionPayload: String,
     val lines: List<ReviewChatLine>
 )
+
+/**
+ * Flattened, review-friendly timeline items.
+ *
+ * Why:
+ * - Review UI often wants a single list that shows *everything* in order.
+ * - Keeping this as a model avoids duplicating flattening logic across screens.
+ *
+ * Ordering:
+ * - The producer (e.g., Session VM) is responsible for stable ordering.
+ */
+@Immutable
+sealed interface ReviewTimelineItem {
+
+    /**
+     * Header marker for a question boundary.
+     *
+     * Notes:
+     * - Includes [completionPayload] so Timeline view can remain self-contained.
+     */
+    @Immutable
+    data class QuestionHeader(
+        val questionId: String,
+        val prompt: String,
+        val isSkipped: Boolean,
+        val completionPayload: String
+    ) : ReviewTimelineItem
+
+    /**
+     * A single chat line that belongs to a question.
+     */
+    @Immutable
+    data class Line(
+        val questionId: String,
+        val prompt: String,
+        val isSkipped: Boolean,
+        val line: ReviewChatLine
+    ) : ReviewTimelineItem
+}

@@ -373,20 +373,33 @@ $userPrompt
     private data class MarkerPair(val begin: String, val end: String)
 
     /**
-     * Extract a multi-line block between markers.
+     * Extract a multi-line block between markers (line-bounded).
      *
-     * Example:
-     *   MAIN_ANSWER_BEGIN
-     *   ...text...
-     *   MAIN_ANSWER_END
+     * Why line-bounded:
+     * - Prevent accidental matches if a user answer contains marker substrings.
+     * - Treat markers as standalone lines only.
      */
     private fun extractBlock(text: String, begin: String, end: String): String? {
-        val b = text.indexOf(begin)
-        if (b < 0) return null
-        val start = b + begin.length
-        val e = text.indexOf(end, startIndex = start)
-        if (e < 0) return null
-        return text.substring(start, e).trim()
+        var inside = false
+        val out = StringBuilder()
+
+        text.lineSequence().forEach { line ->
+            val t = line.trim()
+            if (!inside) {
+                if (t == begin) {
+                    inside = true
+                }
+                return@forEach
+            }
+
+            if (t == end) {
+                return out.toString().trim()
+            }
+
+            out.append(line).append('\n')
+        }
+
+        return null
     }
 
     /**
@@ -409,7 +422,7 @@ $userPrompt
     // ---------------------------------------------------------------------
 
     /**
-     * Parse follow-up answers from the history string produced by the VM.
+     * Parse follow-up answers from the history string produced by the VM/validator.
      *
      * Expected format examples:
      *   FOLLOW_UP_1_Q: ...
@@ -475,7 +488,6 @@ $userPrompt
      */
     private fun promptFingerprint(prompt: String): Int {
         var h = 17
-        // Sample a subset to keep it fast even for large prompts.
         val step = (prompt.length / 64).coerceAtLeast(1)
         var i = 0
         while (i < prompt.length) {
@@ -493,18 +505,33 @@ $userPrompt
      * JSON-string-escape and wrap with quotes.
      *
      * Notes:
-     * - Escapes control chars that commonly break JSON.
+     * - Escapes common control chars.
+     * - Escapes any other control character (< 0x20) as \\uXXXX.
      * - Keeps output safe for org.json parsing in the validator.
      */
     private fun String.jsonQuote(): String {
-        val s = this
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\b", "\\b")
-            .replace("\u000C", "\\f")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
-        return "\"$s\""
+        val sb = StringBuilder(this.length + 2)
+        sb.append('"')
+        for (ch in this) {
+            when (ch) {
+                '\\' -> sb.append("\\\\")
+                '"' -> sb.append("\\\"")
+                '\b' -> sb.append("\\b")
+                '\u000C' -> sb.append("\\f")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                else -> {
+                    if (ch.code < 0x20) {
+                        sb.append("\\u")
+                        sb.append(ch.code.toString(16).padStart(4, '0'))
+                    } else {
+                        sb.append(ch)
+                    }
+                }
+            }
+        }
+        sb.append('"')
+        return sb.toString()
     }
 }

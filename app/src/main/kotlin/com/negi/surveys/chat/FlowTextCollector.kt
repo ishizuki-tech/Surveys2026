@@ -174,6 +174,10 @@ suspend fun Flow<String>.collectToTextSafelyWithBudget(
  *
  * Implementation note:
  * - Throws [MaxCharsReached] to stop upstream collection early.
+ *
+ * Callback note:
+ * - Exceptions from [onChunk] must not break collection (to avoid losing model output).
+ * - CancellationException is rethrown to respect structured concurrency.
  */
 private suspend fun Flow<String>.collectInto(
     sb: StringBuilder,
@@ -189,7 +193,15 @@ private suspend fun Flow<String>.collectInto(
         val toAppend = if (chunk.length <= remain) chunk else chunk.substring(0, remain)
         sb.append(toAppend)
 
-        onChunk?.invoke(toAppend, sb.length)
+        if (onChunk != null) {
+            try {
+                onChunk.invoke(toAppend, sb.length)
+            } catch (ce: CancellationException) {
+                throw ce
+            } catch (_: Throwable) {
+                // Swallow onChunk exceptions to avoid losing the collected output.
+            }
+        }
 
         if (sb.length >= maxChars) throw MaxCharsReached()
     }
@@ -206,5 +218,9 @@ private fun sanitizeErrorToken(t: Throwable): String {
 
 /**
  * Internal signal used to stop collection when the output size cap is reached.
+ *
+ * This is intentionally thrown often in cap scenarios, so avoid stack trace cost.
  */
-private class MaxCharsReached : RuntimeException()
+private class MaxCharsReached : RuntimeException() {
+    override fun fillInStackTrace(): Throwable = this
+}

@@ -17,9 +17,12 @@ import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -60,9 +63,13 @@ fun HomeScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            // English comment:
-            // - safeDrawing avoids content being overlapped by system bars (status/navigation, cutouts).
-            .windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.safeDrawing)
+            /**
+             * App-level TopBar consumes TOP statusBars inset.
+             * Apply only Horizontal + Bottom safeDrawing here to avoid double insets.
+             */
+            .windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
+            )
             .padding(16.dp),
         verticalArrangement = Arrangement.Top
     ) {
