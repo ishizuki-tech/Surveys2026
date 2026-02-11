@@ -74,39 +74,21 @@ fun ReviewScreen(
     logs: List<ReviewQuestionLog> = emptyList(),
     timeline: List<ReviewTimelineItem>? = null,
     onExport: () -> Unit,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onUploadLogs: (() -> Unit)? = null,
+    uploadStatusLine: String? = null
 ) {
-    /**
-     * IMPORTANT:
-     * - Some callers may build logs/timeline from mutable sources.
-     * - Build content-based keys to force deterministic recomputation even if the list reference
-     *   stays the same but its contents are mutated.
-     */
     val logsKey: List<Int> = logs.map { logFingerprint(it) }
     val timelineKey: List<Int>? = timeline?.let { buildTimelineFingerprint(it) }
 
-    /**
-     * Natural ordering for question IDs (Q1..Q10) to keep UI + metrics deterministic.
-     */
     val sortedLogs: List<ReviewQuestionLog> = remember(logsKey) {
         sortLogsNaturally(logs)
     }
 
-    /**
-     * Timeline data:
-     * - Prefer caller-provided [timeline] when available.
-     * - Otherwise build from [sortedLogs].
-     *
-     * Notes:
-     * - Use content keys (timelineKey/logsKey) so recomposition is robust to mutable sources.
-     */
     val resolvedTimeline: List<ReviewTimelineItem> = remember(timelineKey, logsKey) {
         timeline ?: buildTimelineFromLogs(sortedLogs)
     }
 
-    /**
-     * Metrics should reflect what is actually displayed (resolvedTimeline), not only logs.
-     */
     val metrics = produceState(
         initialValue = ReviewMetrics.computing(),
         key1 = timelineKey ?: logsKey
@@ -130,24 +112,10 @@ fun ReviewScreen(
         }
     }
 
-    // NOTE:
-    // - Collapse/expand state for MODEL_RAW lines.
-    // - Key must be stable across "line insertions" to avoid expanding the wrong line.
     val rawExpanded = remember { mutableStateMapOf<String, Boolean>() }
 
-    /**
-     * View mode:
-     * - TIMELINE: one unified chat stream (default).
-     * - BY_QUESTION: legacy grouped cards.
-     */
     var mode by remember { mutableStateOf(ReviewViewMode.TIMELINE) }
 
-    /**
-     * Prune expand state when content changes to avoid unbounded growth.
-     *
-     * Notes:
-     * - Use resolvedTimeline so it matches what the screen is actually rendering.
-     */
     LaunchedEffect(timelineKey ?: logsKey) {
         val alive = HashSet<String>(256)
 
@@ -173,11 +141,6 @@ fun ReviewScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            /**
-             * IMPORTANT:
-             * - App-level TopBar consumes TOP statusBars inset.
-             * - Apply only Horizontal + Bottom safeDrawing here.
-             */
             .windowInsetsPadding(
                 WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
             )
@@ -203,6 +166,15 @@ fun ReviewScreen(
                 Text("Transcript lines: ${metrics.totalLines}")
                 Text("Total chars: ${metrics.totalChars}")
                 Text("SHA-256: ${if (metrics.sha256 == SHA_COMPUTING) "(computing...)" else metrics.sha256}")
+
+                if (!uploadStatusLine.isNullOrBlank()) {
+                    Spacer(Modifier.height(6.dp))
+                    Text(
+                        text = "Upload: $uploadStatusLine",
+                        style = MaterialTheme.typography.bodySmall
+                    )
+                }
+
                 Spacer(Modifier.height(6.dp))
                 Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
             }
@@ -224,16 +196,8 @@ fun ReviewScreen(
                             key = { idx, item -> timelineRowKey(idx, item) }
                         ) { _, item ->
                             when (item) {
-                                is ReviewTimelineItem.QuestionHeader -> {
-                                    TimelineQuestionHeaderCard(item)
-                                }
-
-                                is ReviewTimelineItem.Line -> {
-                                    TimelineLineBubble(
-                                        item = item,
-                                        rawExpanded = rawExpanded
-                                    )
-                                }
+                                is ReviewTimelineItem.QuestionHeader -> TimelineQuestionHeaderCard(item)
+                                is ReviewTimelineItem.Line -> TimelineLineBubble(item = item, rawExpanded = rawExpanded)
                             }
                         }
                     }
@@ -263,14 +227,25 @@ fun ReviewScreen(
                 onClick = {
                     Log.d(TAG, "ReviewScreen: back clicked")
                     onBack()
-                }
+                },
+                modifier = Modifier.weight(1f)
             ) { Text("Back") }
+
+            OutlinedButton(
+                onClick = {
+                    Log.d(TAG, "ReviewScreen: upload logs clicked")
+                    onUploadLogs?.invoke()
+                },
+                enabled = onUploadLogs != null,
+                modifier = Modifier.weight(1f)
+            ) { Text("Upload Logs") }
 
             Button(
                 onClick = {
                     Log.d(TAG, "ReviewScreen: export clicked")
                     onExport()
-                }
+                },
+                modifier = Modifier.weight(1f)
             ) { Text("Go to Export") }
         }
     }
@@ -342,18 +317,9 @@ private fun buildTimelineFromLogs(sortedLogs: List<ReviewQuestionLog>): List<Rev
     return out
 }
 
-/**
- * Builds a compact content fingerprint for a timeline.
- *
- * Notes:
- * - Useful when the caller mutates a list in-place without changing its reference.
- * - Each element becomes an Int fingerprint (not cryptographically strong, but deterministic).
- */
 private fun buildTimelineFingerprint(timeline: List<ReviewTimelineItem>): List<Int> {
     val out = ArrayList<Int>(timeline.size)
-    for (item in timeline) {
-        out.add(timelineItemFingerprint(item))
-    }
+    for (item in timeline) out.add(timelineItemFingerprint(item))
     return out
 }
 
@@ -410,21 +376,13 @@ private fun TimelineQuestionHeaderCard(header: ReviewTimelineItem.QuestionHeader
                     modifier = Modifier.weight(1f)
                 )
 
-                val badgeBg = if (header.isSkipped) {
-                    MaterialTheme.colorScheme.surfaceVariant
-                } else {
-                    MaterialTheme.colorScheme.primaryContainer
-                }
-                val badgeFg = if (header.isSkipped) {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                } else {
-                    MaterialTheme.colorScheme.onPrimaryContainer
-                }
+                val badgeBg = if (header.isSkipped) MaterialTheme.colorScheme.surfaceVariant
+                else MaterialTheme.colorScheme.primaryContainer
 
-                Surface(
-                    color = badgeBg,
-                    shape = RoundedCornerShape(999.dp)
-                ) {
+                val badgeFg = if (header.isSkipped) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.onPrimaryContainer
+
+                Surface(color = badgeBg, shape = RoundedCornerShape(999.dp)) {
                     Text(
                         text = if (header.isSkipped) "SKIPPED" else "OK",
                         style = MaterialTheme.typography.labelMedium,
@@ -443,10 +401,7 @@ private fun TimelineQuestionHeaderCard(header: ReviewTimelineItem.QuestionHeader
                 fontWeight = FontWeight.SemiBold
             )
             SelectionContainer {
-                Text(
-                    text = header.prompt,
-                    style = MaterialTheme.typography.bodyMedium
-                )
+                Text(text = header.prompt, style = MaterialTheme.typography.bodyMedium)
             }
 
             Spacer(Modifier.height(10.dp))
@@ -457,10 +412,7 @@ private fun TimelineQuestionHeaderCard(header: ReviewTimelineItem.QuestionHeader
                 fontWeight = FontWeight.SemiBold
             )
             SelectionContainer {
-                Text(
-                    text = header.completionPayload,
-                    style = MaterialTheme.typography.bodySmall
-                )
+                Text(text = header.completionPayload, style = MaterialTheme.typography.bodySmall)
             }
 
             Spacer(Modifier.height(10.dp))
@@ -506,11 +458,8 @@ private fun TimelineLineBubble(
     val bodyText = if (!isRaw) {
         line.text
     } else {
-        if (expanded) {
-            line.text
-        } else {
-            line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
-        }
+        if (expanded) line.text
+        else line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
     }
 
     val clickMod = if (canToggle && key != null) {
@@ -560,12 +509,6 @@ private fun TimelineLineBubble(
     }
 }
 
-/**
- * Renders one question section including:
- * - Prompt
- * - Payload (completionPayload)
- * - Full transcript lines
- */
 @Composable
 private fun QuestionTranscriptCard(
     log: ReviewQuestionLog,
@@ -591,21 +534,13 @@ private fun QuestionTranscriptCard(
                     modifier = Modifier.weight(1f)
                 )
 
-                val badgeBg = if (log.isSkipped) {
-                    MaterialTheme.colorScheme.surfaceVariant
-                } else {
-                    MaterialTheme.colorScheme.primaryContainer
-                }
-                val badgeFg = if (log.isSkipped) {
-                    MaterialTheme.colorScheme.onSurfaceVariant
-                } else {
-                    MaterialTheme.colorScheme.onPrimaryContainer
-                }
+                val badgeBg = if (log.isSkipped) MaterialTheme.colorScheme.surfaceVariant
+                else MaterialTheme.colorScheme.primaryContainer
 
-                Surface(
-                    color = badgeBg,
-                    shape = RoundedCornerShape(999.dp)
-                ) {
+                val badgeFg = if (log.isSkipped) MaterialTheme.colorScheme.onSurfaceVariant
+                else MaterialTheme.colorScheme.onPrimaryContainer
+
+                Surface(color = badgeBg, shape = RoundedCornerShape(999.dp)) {
                     Text(
                         text = if (log.isSkipped) "SKIPPED" else "OK",
                         style = MaterialTheme.typography.labelMedium,
@@ -618,41 +553,19 @@ private fun QuestionTranscriptCard(
 
             Spacer(Modifier.height(8.dp))
 
-            Text(
-                text = "Prompt",
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold
-            )
-            SelectionContainer {
-                Text(
-                    text = log.prompt,
-                    style = MaterialTheme.typography.bodyMedium
-                )
-            }
+            Text(text = "Prompt", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            SelectionContainer { Text(text = log.prompt, style = MaterialTheme.typography.bodyMedium) }
 
             Spacer(Modifier.height(10.dp))
 
-            Text(
-                text = "Payload",
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold
-            )
-            SelectionContainer {
-                Text(
-                    text = log.completionPayload,
-                    style = MaterialTheme.typography.bodySmall
-                )
-            }
+            Text(text = "Payload", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
+            SelectionContainer { Text(text = log.completionPayload, style = MaterialTheme.typography.bodySmall) }
 
             Spacer(Modifier.height(10.dp))
             Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
             Spacer(Modifier.height(10.dp))
 
-            Text(
-                text = "Transcript",
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.SemiBold
-            )
+            Text(text = "Transcript", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
             Spacer(Modifier.height(6.dp))
 
             if (log.lines.isEmpty()) {
@@ -691,11 +604,8 @@ private fun QuestionTranscriptCard(
                 val bodyText = if (!isRaw) {
                     line.text
                 } else {
-                    if (expanded) {
-                        line.text
-                    } else {
-                        line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
-                    }
+                    if (expanded) line.text
+                    else line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
                 }
 
                 val canToggle = isRaw && line.text.length > 260
@@ -756,24 +666,10 @@ private data class ReviewMetrics(
     val sha256: String
 ) {
     companion object {
-        fun computing(): ReviewMetrics = ReviewMetrics(
-            questionCount = 0,
-            totalLines = 0,
-            totalChars = 0,
-            sha256 = SHA_COMPUTING
-        )
+        fun computing(): ReviewMetrics = ReviewMetrics(0, 0, 0, SHA_COMPUTING)
     }
 }
 
-/**
- * Computes metrics from the resolved timeline.
- *
- * Notes:
- * - Questions: unique questionId count.
- * - Lines: number of ReviewTimelineItem.Line entries.
- * - Chars: prompt/payload counted once per question (best-effort) + line texts.
- * - SHA: based on the exact displayed items (headers + lines).
- */
 private fun computeTimelineMetrics(timeline: List<ReviewTimelineItem>): ReviewMetrics {
     if (timeline.isEmpty()) {
         return ReviewMetrics(
@@ -784,7 +680,6 @@ private fun computeTimelineMetrics(timeline: List<ReviewTimelineItem>): ReviewMe
         )
     }
 
-    // Best-effort header capture (first seen wins).
     data class Header(val prompt: String, val payload: String, val skipped: Boolean)
 
     val headers = LinkedHashMap<String, Header>(16)
@@ -802,11 +697,7 @@ private fun computeTimelineMetrics(timeline: List<ReviewTimelineItem>): ReviewMe
                 sb.append("X=").append(item.completionPayload).append('\n')
 
                 if (!headers.containsKey(item.questionId)) {
-                    headers[item.questionId] = Header(
-                        prompt = item.prompt,
-                        payload = item.completionPayload,
-                        skipped = item.isSkipped
-                    )
+                    headers[item.questionId] = Header(item.prompt, item.completionPayload, item.isSkipped)
                     totalChars += item.prompt.length
                     totalChars += item.completionPayload.length
                 }
@@ -840,26 +731,30 @@ private fun computeTimelineMetrics(timeline: List<ReviewTimelineItem>): ReviewMe
     )
 }
 
+private val HEX_CHARS: CharArray = charArrayOf(
+    '0', '1', '2', '3', '4', '5', '6', '7',
+    '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
+)
+
 /**
  * Returns a fixed-length (64 chars) lowercase hex SHA-256.
+ *
+ * This implementation avoids String indexing pitfalls and never throws on hex conversion.
  */
 private fun sha256Hex(text: String): String {
     val bytes = text.toByteArray(StandardCharsets.UTF_8)
     val digest = MessageDigest.getInstance("SHA-256").digest(bytes)
 
-    val hex = "0123456789abcdef"
-    val sb = StringBuilder(digest.size * 2)
+    val out = CharArray(digest.size * 2)
+    var i = 0
     for (b in digest) {
         val v = b.toInt() and 0xFF
-        sb.append(hex[v ushr 4])
-        sb.append(hex[v and 0x0F])
+        out[i++] = HEX_CHARS[v ushr 4]
+        out[i++] = HEX_CHARS[v and 0x0F]
     }
-    return sb.toString()
+    return String(out)
 }
 
-/**
- * Produces a compact content fingerprint for recomposition keys.
- */
 private fun logFingerprint(log: ReviewQuestionLog): Int {
     var h = log.questionId.hashCode()
     h = (h * 31) + log.prompt.hashCode()
@@ -872,20 +767,9 @@ private fun logFingerprint(log: ReviewQuestionLog): Int {
     return h
 }
 
-/**
- * Stable key for a MODEL_RAW line.
- *
- * Notes:
- * - Avoid index-based keys so the expanded state won't drift when lines are inserted.
- * - Include length to reduce collisions further.
- */
 private fun rawLineKey(questionId: String, rawText: String): String {
     return "$questionId:raw:${rawText.length}:${rawText.hashCode()}"
 }
-
-// ---------------------------------------------------------------------
-// Natural ordering for question IDs (Q1..Q10)
-// ---------------------------------------------------------------------
 
 private fun sortLogsNaturally(logs: List<ReviewQuestionLog>): List<ReviewQuestionLog> {
     return logs

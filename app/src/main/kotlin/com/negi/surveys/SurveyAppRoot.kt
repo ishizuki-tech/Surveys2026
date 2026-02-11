@@ -13,6 +13,7 @@ package com.negi.surveys
 
 import android.os.Build
 import android.util.Log
+import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -41,9 +42,13 @@ import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -56,6 +61,9 @@ import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import com.negi.surveys.BuildConfig as AppBuildConfig
 import com.negi.surveys.chat.ChatStreamBridge
+import com.negi.surveys.logging.AppLog
+import com.negi.surveys.logging.GitHubLogUploadManager
+import com.negi.surveys.logging.LogUploadManager
 import com.negi.surveys.nav.AppNavigator
 import com.negi.surveys.nav.Export
 import com.negi.surveys.nav.Home
@@ -70,6 +78,9 @@ import com.negi.surveys.ui.HomeScreen
 import com.negi.surveys.ui.LocalChatStreamBridge
 import com.negi.surveys.ui.ReviewScreen
 import com.negi.surveys.ui.SurveyStartScreen
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -77,19 +88,8 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     val backStack: NavBackStack<NavKey> = rememberNavBackStack(Home)
     val nav = remember(backStack) { AppNavigator(backStack) }
 
-    /**
-     * Session-lifetime state holder.
-     *
-     * Notes:
-     * - Owns Review/Export logs across navigation.
-     * - Single source of truth for transcript snapshots and export JSON.
-     */
     val sessionVm: SurveySessionViewModel = viewModel()
 
-    /**
-     * IMPORTANT:
-     * - Drive UI (TopBar / BackHandler) directly from backStack so Compose can recompose reliably.
-     */
     val currentKey: NavKey by remember(backStack) {
         derivedStateOf { backStack.lastOrNull() ?: Home }
     }
@@ -98,20 +98,10 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     }
 
     BackHandler(enabled = canPop) {
-        Log.d(
-            TAG,
-            "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}"
-        )
+        Log.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
         nav.pop()
     }
 
-    /**
-     * Stable prompts map for the current prototype.
-     *
-     * Notes:
-     * - Keep stable across recompositions.
-     * - Replace with a real config loader later.
-     */
     val prompts: Map<String, String> = remember {
         linkedMapOf(
             "Q1" to "Question prompt for Q1 (placeholder)",
@@ -125,45 +115,17 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     val exportTextState = sessionVm.exportJson.collectAsStateWithLifecycle()
     val exportText = exportTextState.value
 
-    /**
-     * Session-shared stream bridge (created ONCE here).
-     *
-     * Notes:
-     * - Do NOT create this per-screen.
-     * - This instance survives navigation within SurveyAppRoot lifetime.
-     */
     val streamBridge: ChatStreamBridge = remember {
         ChatStreamBridge(logger = { Log.d("StreamBridge", it) })
     }
 
-    /**
-     * Stream stats as Compose state.
-     *
-     * Notes:
-     * - Uses a PII-safe StateFlow exposed by ChatStreamBridge.
-     * - Avoids ad-hoc polling loops that would waste battery/CPU.
-     */
     val streamStats: ChatStreamBridge.StreamStats by streamBridge.stats.collectAsStateWithLifecycle()
 
-    /**
-     * Lightweight nav/session diagnostics.
-     *
-     * Notes:
-     * - Do not log full payloads or user inputs. Only metadata.
-     */
-    LaunchedEffect(
-        currentKey,
-        canPop,
-        logs.size,
-        exportText.length,
-        streamStats.activeSessionId,
-        streamStats.droppedEvents
-    ) {
+    LaunchedEffect(currentKey, canPop, logs.size, exportText.length, streamStats.activeSessionId, streamStats.droppedEvents) {
         Log.d(
             TAG,
             "NavState: size=${backStack.size} canPop=$canPop current=${currentKey.javaClass.simpleName} " +
-                    "logs=${logs.size} exportLen=${exportText.length} " +
-                    "streamActive=${streamStats.activeSessionId} dropped=${streamStats.droppedEvents}"
+                    "logs=${logs.size} exportLen=${exportText.length} streamActive=${streamStats.activeSessionId} dropped=${streamStats.droppedEvents}"
         )
     }
 
@@ -182,10 +144,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         streamStats.ignoredError,
         streamStats.ignoredCancel
     ) {
-        val ignoredTotal = streamStats.ignoredDelta +
-                streamStats.ignoredEnd +
-                streamStats.ignoredError +
-                streamStats.ignoredCancel
+        val ignoredTotal = streamStats.ignoredDelta + streamStats.ignoredEnd + streamStats.ignoredError + streamStats.ignoredCancel
 
         DebugInfo(
             currentRoute = titleFor(currentKey),
@@ -206,37 +165,53 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         )
     }
 
-    /**
-     * IMPORTANT:
-     * - Include debugInfo in remember keys so Home/SurveyStart reflect updated DebugInfo.
-     * - Otherwise, entryProvider may capture an old DebugInfo instance.
-     */
-    val entries: (NavKey) -> NavEntry<NavKey> = remember(nav, prompts, sessionVm, debugInfo) {
+    val appContext = LocalContext.current.applicationContext
+    val scope = rememberCoroutineScope()
+    var uploadStatus by remember { mutableStateOf<String?>(null) }
+
+    fun startManualUpload(from: String) {
+        scope.launch(Dispatchers.IO) {
+            val reason = "manual:$from"
+            val gh = runCatching {
+                if (GitHubLogUploadManager.isConfigured()) {
+                    GitHubLogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
+                } else null
+            }.getOrNull()
+
+            val sb = runCatching {
+                if (LogUploadManager.isConfigured()) {
+                    LogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
+                } else null
+            }.getOrNull()
+
+            val summary = buildString {
+                append("gh=").append(gh ?: "fail").append(" sb=").append(sb ?: "fail")
+            }
+
+            AppLog.i(TAG, "manual upload: $summary")
+            Log.d(TAG, "manual upload: $summary")
+
+            withContext(Dispatchers.Main) {
+                uploadStatus = summary
+                Toast.makeText(appContext, "Upload: $summary", Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    val entries: (NavKey) -> NavEntry<NavKey> = remember(nav, prompts, sessionVm, debugInfo, uploadStatus) {
         entryProvider {
             entry<Home> {
                 HomeScreen(
-                    onStartSurvey = {
-                        Log.d(TAG, "Home: startSurvey()")
-                        nav.startSurvey()
-                    },
-                    onExport = {
-                        Log.d(TAG, "Home: goExport()")
-                        nav.goExport()
-                    },
+                    onStartSurvey = { nav.startSurvey() },
+                    onExport = { nav.goExport() },
                     debugInfo = debugInfo
                 )
             }
 
             entry<SurveyStart> {
                 SurveyStartScreen(
-                    onBegin = {
-                        Log.d(TAG, "SurveyStart: beginQuestions(Q1)")
-                        nav.beginQuestions("Q1")
-                    },
-                    onBack = {
-                        Log.d(TAG, "SurveyStart: pop()")
-                        nav.pop()
-                    },
+                    onBegin = { nav.beginQuestions("Q1") },
+                    onBack = { nav.pop() },
                     debugInfo = debugInfo
                 )
             }
@@ -249,34 +224,13 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                     prompt = prompt,
                     onNext = { log ->
                         sessionVm.upsertLog(log)
-
-                        Log.d(
-                            TAG,
-                            "Saved ReviewLog -> sessionVm. qid=${log.questionId} keyId=${key.id} " +
-                                    "skipped=${log.isSkipped} lines=${log.lines.size}"
-                        )
-
                         when (key.id) {
-                            "Q1" -> {
-                                Log.d(TAG, "Nav: Q1 -> Q2")
-                                nav.goQuestion("Q2")
-                            }
-
-                            "Q2" -> {
-                                Log.d(TAG, "Nav: Q2 -> Review")
-                                nav.goReview()
-                            }
-
-                            else -> {
-                                Log.d(TAG, "Nav: ${key.id} -> Review (default)")
-                                nav.goReview()
-                            }
+                            "Q1" -> nav.goQuestion("Q2")
+                            "Q2" -> nav.goReview()
+                            else -> nav.goReview()
                         }
                     },
-                    onBack = {
-                        Log.d(TAG, "Question(${key.id}): pop()")
-                        nav.pop()
-                    }
+                    onBack = { nav.pop() }
                 )
             }
 
@@ -284,23 +238,12 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 val reviewLogsState = sessionVm.logs.collectAsStateWithLifecycle()
                 val reviewLogs = reviewLogsState.value
 
-                LaunchedEffect(reviewLogs.size) {
-                    Log.d(
-                        TAG,
-                        "Review: render logs.size=${reviewLogs.size} keys=${reviewLogs.joinToString { it.questionId }}"
-                    )
-                }
-
                 ReviewScreen(
                     logs = reviewLogs,
-                    onExport = {
-                        Log.d(TAG, "Review: goExport()")
-                        nav.goExport()
-                    },
-                    onBack = {
-                        Log.d(TAG, "Review: pop()")
-                        nav.pop()
-                    }
+                    onExport = { nav.goExport() },
+                    onBack = { nav.pop() },
+                    onUploadLogs = { startManualUpload("review") },
+                    uploadStatusLine = uploadStatus
                 )
             }
 
@@ -308,16 +251,9 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 val exportState = sessionVm.exportJson.collectAsStateWithLifecycle()
                 val payload = exportState.value
 
-                LaunchedEffect(payload.length) {
-                    Log.d(TAG, "Export: payload len=${payload.length}")
-                }
-
                 ExportScreen(
                     exportText = payload,
-                    onBack = {
-                        Log.d(TAG, "Export: pop()")
-                        nav.pop()
-                    }
+                    onBack = { nav.pop() }
                 )
             }
         }
@@ -330,10 +266,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
             CompactTopBar(
                 title = titleFor(currentKey),
                 canPop = canPop,
-                onBack = {
-                    Log.d(TAG, "TopBar: back clicked")
-                    nav.pop()
-                }
+                onBack = { nav.pop() }
             )
         }
     ) { innerPadding ->
@@ -342,7 +275,6 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 .fillMaxSize()
                 .padding(innerPadding)
         ) {
-            // Provide ONE session-shared instance to all screens.
             CompositionLocalProvider(LocalChatStreamBridge provides streamBridge) {
                 NavDisplay(
                     backStack = backStack,
@@ -354,13 +286,6 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     }
 }
 
-/**
- * A compact, deterministic top bar.
- *
- * Notes:
- * - Consumes statusBars inset.
- * - Screens should not add TOP safeDrawing again.
- */
 @Composable
 private fun CompactTopBar(
     title: String,
@@ -386,10 +311,7 @@ private fun CompactTopBar(
                 horizontalArrangement = Arrangement.Start
             ) {
                 if (canPop) {
-                    IconButton(
-                        onClick = onBack,
-                        modifier = Modifier.size(40.dp)
-                    ) {
+                    IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
                         Icon(
                             imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                             contentDescription = "Back"
@@ -424,13 +346,6 @@ private fun titleFor(key: NavKey): String {
     }
 }
 
-/**
- * Best-effort build label for debug UI.
- *
- * Notes:
- * - Use the app module BuildConfig (namespace-based).
- * - Keep output short and deterministic.
- */
 private fun buildLabelSafe(): String {
     return runCatching {
         val name = AppBuildConfig.VERSION_NAME
@@ -438,9 +353,7 @@ private fun buildLabelSafe(): String {
         val type = AppBuildConfig.BUILD_TYPE
         val dbg = AppBuildConfig.DEBUG
         "v$name ($code) $type dbg=$dbg"
-    }.getOrElse {
-        "debug"
-    }
+    }.getOrElse { "debug" }
 }
 
 private const val TAG = "SurveyAppRoot"

@@ -56,11 +56,7 @@ object LogFiles {
 
     private const val ZIP_BUFFER_BYTES = 8 * 1024
 
-    /**
-     * Thread-safe UTC timestamp formatter.
-     *
-     * Note: SimpleDateFormat is not thread-safe, so we isolate per-thread.
-     */
+    /** Thread-local UTC timestamp formatter (SimpleDateFormat is not thread-safe). */
     private val utcCompact: ThreadLocal<SimpleDateFormat> = ThreadLocal.withInitial {
         SimpleDateFormat("yyyyMMdd-HHmmssSSS", Locale.US).apply {
             timeZone = TimeZone.getTimeZone("UTC")
@@ -68,7 +64,14 @@ object LogFiles {
     }
 
     /** Returns current UTC time in compact format. */
-    fun utcCompactNow(): String = utcCompact.get().format(Date())
+    fun utcCompactNow(): String {
+        // ThreadLocal#get is seen as nullable in Kotlin; guard and self-heal deterministically.
+        val fmt = utcCompact.get() ?: SimpleDateFormat("yyyyMMdd-HHmmssSSS", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.also { utcCompact.set(it) }
+
+        return fmt.format(Date())
+    }
 
     /** Root logs directory: filesDir/logs/ */
     fun rootDir(context: Context): File =
@@ -85,6 +88,33 @@ object LogFiles {
     /** Crash uploaded directory: filesDir/logs/crash/uploaded/ */
     fun crashUploadedDir(context: Context): File =
         File(File(rootDir(context), SUBDIR_CRASH), SUBDIR_UPLOADED).apply { mkdirs() }
+
+    /**
+     * Canonical app log file path (created by AppLog).
+     *
+     * Notes:
+     * - This is a convenience for callers that want to ensure existence.
+     */
+    fun appLogFile(context: Context): File =
+        File(appLogDir(context), "app.log")
+
+    /**
+     * Ensures the canonical app log file exists.
+     *
+     * Why:
+     * - Some flows check "is there any log file" before the first AppLog write happens.
+     * - Creating an empty file is safe and removes ambiguity ("no file" vs "empty file").
+     */
+    fun ensureAppLogFile(context: Context): File {
+        val f = appLogFile(context)
+        if (!f.exists()) {
+            runCatching {
+                f.parentFile?.mkdirs()
+                FileOutputStream(f, true).use { /* touch */ }
+            }
+        }
+        return f
+    }
 
     /**
      * Stable install ID.
@@ -124,15 +154,20 @@ object LogFiles {
         maxCrashLogs: Int = DEFAULT_MAX_CRASH_LOGS,
         maxTotalBytes: Long = DEFAULT_MAX_TOTAL_BYTES
     ): File {
+        val appContext = context.applicationContext
+
         val safeMaxApp = maxAppLogs.coerceAtLeast(0)
         val safeMaxCrash = maxCrashLogs.coerceAtLeast(0)
         val safeMaxBytes = maxTotalBytes.coerceAtLeast(0L)
 
-        val cache = context.applicationContext.cacheDir
+        // Ensure a canonical file exists so callers don't get "no log file found" due to timing.
+        ensureAppLogFile(appContext)
+
+        val cache = appContext.cacheDir
         val zipName = "${kind.prefix}-${utcCompactNow()}-${Process.myPid()}.zip"
         val zipFile = File(cache, zipName)
 
-        val appCandidates = listAppLogs(context)
+        val appCandidates = listAppLogs(appContext)
         val crashCandidates = includeCrashFiles
             .filter { it.exists() && it.isFile }
             .sortedByDescending { it.lastModified() }
@@ -146,7 +181,7 @@ object LogFiles {
         )
 
         val metaJson = buildMetaJson(
-            context = context,
+            context = appContext,
             kind = kind,
             reason = reason,
             appFiles = selected.appFiles,
@@ -154,11 +189,21 @@ object LogFiles {
             maxTotalBytes = safeMaxBytes
         )
 
+        // If nothing is selected, include a small notice file to make debugging self-contained.
+        val needNotice = selected.appFiles.isEmpty() && selected.crashFiles.isEmpty()
+        val noticeText = if (needNotice) buildNoticeText(appContext, kind, reason) else null
+
         runCatching {
             ZipOutputStream(FileOutputStream(zipFile)).use { zos ->
                 zos.putNextEntry(ZipEntry("meta.json"))
                 zos.write(metaJson.toByteArray(Charsets.UTF_8))
                 zos.closeEntry()
+
+                if (noticeText != null) {
+                    zos.putNextEntry(ZipEntry("notice.txt"))
+                    zos.write(noticeText.toByteArray(Charsets.UTF_8))
+                    zos.closeEntry()
+                }
 
                 for (f in selected.appFiles.sortedBy { it.name }) {
                     zipAddFile(zos, f, entryName = "app/${f.name}")
@@ -289,6 +334,8 @@ object LogFiles {
 
         val abis = runCatching { Build.SUPPORTED_ABIS?.joinToString(",") ?: "" }.getOrDefault("")
 
+        val fingerprintShort = (Build.FINGERPRINT ?: "").take(200)
+
         return buildString(2048) {
             append("{")
             append("\"kind\":\"").append(escapeJson(kind.prefix)).append("\",")
@@ -299,9 +346,8 @@ object LogFiles {
             append("\"pid\":").append(Process.myPid()).append(",")
             append("\"sdk\":").append(Build.VERSION.SDK_INT).append(",")
             append("\"release\":\"").append(escapeJson(Build.VERSION.RELEASE ?: "")).append("\",")
-            append("\"device\":\"").append(escapeJson("${Build.MANUFACTURER}/${Build.MODEL}"))
-                .append("\",")
-            append("\"fingerprint\":\"").append(escapeJson(Build.FINGERPRINT ?: "")).append("\",")
+            append("\"device\":\"").append(escapeJson("${Build.MANUFACTURER}/${Build.MODEL}")).append("\",")
+            append("\"fingerprint\":\"").append(escapeJson(fingerprintShort)).append("\",")
             append("\"abis\":\"").append(escapeJson(abis)).append("\",")
 
             append("\"limits\":{")
@@ -321,12 +367,42 @@ object LogFiles {
 
             append("\"reason\":\"").append(escapeJson(safeReason)).append("\",")
 
+            append("\"paths\":{")
+            append("\"appDir\":\"").append(escapeJson(appLogDir(context).absolutePath)).append("\",")
+            append("\"crashPendingDir\":\"").append(escapeJson(crashPendingDir(context).absolutePath)).append("\"")
+            append("},")
+
             append("\"files\":{")
             append("\"app\":").append(filesArrayJson(appFiles)).append(",")
             append("\"crash\":").append(filesArrayJson(crashFiles))
             append("}")
 
             append("}")
+        }
+    }
+
+    private fun buildNoticeText(context: Context, kind: UploadKind, reason: String?): String {
+        val r = (reason ?: "").take(256)
+        val appDir = appLogDir(context).absolutePath
+        val crashDir = crashPendingDir(context).absolutePath
+        val appLog = appLogFile(context).absolutePath
+        val build = buildLabelSafe()
+        return buildString {
+            appendLine("No log files were selected for this bundle.")
+            appendLine("kind=${kind.prefix} reason=$r")
+            appendLine("build=$build")
+            appendLine()
+            appendLine("Checked directories:")
+            appendLine("- appDir=$appDir")
+            appendLine("- crashPendingDir=$crashDir")
+            appendLine()
+            appendLine("Canonical app log file:")
+            appendLine("- appLog=$appLog")
+            appendLine()
+            appendLine("Likely causes:")
+            appendLine("- AppLog.init(context) was never called on startup.")
+            appendLine("- Most logs use android.util.Log.* instead of AppLog.* (file logger only records AppLog calls).")
+            appendLine("- No crash logs exist in pending/ (expected unless a crash happened).")
         }
     }
 
