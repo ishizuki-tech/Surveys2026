@@ -113,16 +113,38 @@ fun ChatQuestionScreen(
 ) {
     val onNextLatest by rememberUpdatedState(onNext)
 
-    val streamBridge = remember(questionId) { ChatStreamBridge() }
+    /**
+     * IMPORTANT:
+     * - Do NOT create ChatStreamBridge per screen.
+     * - Use the session-shared instance provided by SurveyAppRoot via CompositionLocalProvider.
+     */
+    val streamBridge: ChatStreamBridge = LocalChatStreamBridge.current
 
+    /**
+     * Shared draft store for the whole process (in-memory prototype).
+     *
+     * Notes:
+     * - This is fine to be a singleton while prototyping.
+     * - Replace with persistent store later if needed.
+     */
     val draftStore: ChatDraftStore = remember { ChatDraftStoreHolder.store }
 
     val draftKey = remember(questionId, prompt) {
         DraftKey(questionId = questionId, promptHash = prompt.hashCode())
     }
 
-    val repo: Repository = repository ?: remember(questionId, prompt) { FakeSlmRepository() }
+    /**
+     * Repository selection:
+     * - Keep call order stable by always using remember() exactly once.
+     */
+    val repo: Repository = remember(repository) {
+        repository ?: FakeSlmRepository()
+    }
 
+    /**
+     * Validator:
+     * - Uses the session-shared streamBridge so streaming state does not reset per screen instance.
+     */
     val validator: AnswerValidator = remember(questionId, prompt, repo, streamBridge) {
         SlmAnswerValidator(
             repository = repo,
@@ -171,6 +193,11 @@ fun ChatQuestionScreen(
         Log.d(TAG, "Next latch reset. qid=$questionId vmKey=$vmKey")
     }
 
+    LaunchedEffect(vmKey) {
+        // PII-safe bridge identity trace (helps confirm it is NOT recreated per screen).
+        Log.d(TAG, "Using shared streamBridge identity=${System.identityHashCode(streamBridge)} qid=$questionId")
+    }
+
     LaunchedEffect(vmKey, bottomBarPx) {
         snapshotFlow {
             val last = messages.lastOrNull()
@@ -206,6 +233,7 @@ fun ChatQuestionScreen(
 
     DisposableEffect(vm) {
         onDispose {
+            // Respect structured concurrency & ensure any in-flight streaming is stopped.
             vm.cancelValidation("screen_dispose")
         }
     }
@@ -217,6 +245,7 @@ fun ChatQuestionScreen(
     }
 
     val allowFollowUpUi = true
+    val hasCompletion = completionPayload != null
 
     Surface(
         modifier = Modifier
@@ -235,7 +264,7 @@ fun ChatQuestionScreen(
                 questionId = questionId,
                 statusLabel = statusLabel,
                 isBusy = isBusy,
-                hasCompletion = completionPayload != null
+                hasCompletion = hasCompletion
             )
 
             Spacer(Modifier.height(10.dp))
@@ -276,7 +305,7 @@ fun ChatQuestionScreen(
             BottomComposerCard(
                 input = input,
                 isBusy = isBusy,
-                hasCompletion = completionPayload != null,
+                hasCompletion = hasCompletion,
                 canSubmit = canSubmit,
                 nextInFlight = nextInFlight,
                 onInputChange = { vm.setInput(it) },
@@ -295,19 +324,35 @@ fun ChatQuestionScreen(
                         return@BottomComposerCard
                     }
 
+                    // Prevent snapshot/export from missing assistant follow-up lines.
+                    // If we navigate away while a validation stream is still running,
+                    // the Review log can be captured before the ASSISTANT outcome exists.
+                    if (isBusy) {
+                        Log.w(TAG, "Next clicked while busy=true (ignored). qid=$questionId")
+                        return@BottomComposerCard
+                    }
+
                     nextInFlight = true
                     try {
                         vm.cancelValidation("next_click")
 
-                        val skipped = (completionPayload == null)
-                        val payload = completionPayload ?: buildSkippedPayload(questionId, prompt)
+                        // IMPORTANT:
+                        // - Do NOT rely on Compose-collected snapshots here.
+                        // - The user can tap Next faster than recomposition, so `messages` / `completionPayload`
+                        //   may be stale and miss the latest assistant follow-up.
+                        // - Read the VM StateFlow values directly for a consistent snapshot.
+                        val payloadNow = vm.completionPayload.value
+                        val skipped = (payloadNow == null)
+                        val payload = payloadNow ?: buildSkippedPayload(questionId, prompt)
+
+                        val messagesNow = vm.messages.value
 
                         val log = buildReviewQuestionLog(
                             questionId = questionId,
                             prompt = prompt,
                             isSkipped = skipped,
                             completionPayload = payload,
-                            messagesSnapshot = messages
+                            messagesSnapshot = messagesNow
                         )
 
                         Log.d(
@@ -468,7 +513,7 @@ private fun BottomComposerCard(
                 Button(
                     onClick = onNext,
                     modifier = Modifier.weight(1f),
-                    enabled = !nextInFlight,
+                    enabled = !nextInFlight && !isBusy,
                     colors = ButtonDefaults.buttonColors(
                         containerColor = MaterialTheme.colorScheme.primary
                     )
@@ -478,10 +523,10 @@ private fun BottomComposerCard(
             Spacer(Modifier.height(6.dp))
 
             Text(
-                text = if (hasCompletion) {
-                    "Next will use the accepted answer."
-                } else {
-                    "You can press Next to skip for now and answer later."
+                text = when {
+                    isBusy -> "Validation is running. Please wait before navigating."
+                    hasCompletion -> "Next will use the accepted answer."
+                    else -> "You can press Next to skip for now and answer later."
                 },
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
@@ -794,14 +839,6 @@ private fun ChatBubbleStructured(
                             }
                         }
                     }
-
-                    else -> {
-                        Text(
-                            text = msg.text,
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = textColor
-                        )
-                    }
                 }
             }
         }
@@ -822,9 +859,10 @@ private fun buildSkippedPayload(questionId: String, prompt: String): String {
  * Converts the current chat messages into a Review snapshot.
  *
  * Updated policy:
- * - If skipped: export USER lines, plus FOLLOW_UP lines that happen after at least one USER line.
+ * - If skipped: export USER lines, plus assistant lines / follow-up lines that happen after at least one USER line.
  * - Seed prompt message is excluded (prompt is already shown in the card header).
- * - MODEL_RAW is excluded when skipped.
+ * - MODEL_RAW is included even when skipped, but only after at least one USER line.
+ * - MODEL_RAW duplicates (same as immediately previous MODEL_RAW) are suppressed.
  */
 private fun buildReviewQuestionLog(
     questionId: String,
@@ -837,6 +875,14 @@ private fun buildReviewQuestionLog(
 
     val promptTrimmed = prompt.trim()
     var seenUser = false
+
+    fun appendModelRawOnce(raw: String) {
+        val t = raw.trim()
+        if (t.isEmpty()) return
+        val last = lines.lastOrNull()
+        if (last != null && last.kind == ReviewChatKind.MODEL_RAW && last.text == t) return
+        lines += ReviewChatLine(kind = ReviewChatKind.MODEL_RAW, text = t)
+    }
 
     for (m in messagesSnapshot) {
         when (m.role) {
@@ -853,7 +899,6 @@ private fun buildReviewQuestionLog(
                 val fallback = m.text.trim()
                 val q = normalizeFollowUp(m.followUpQuestion)
 
-                // Detect the seeded "Question: Qx + prompt" entry (exclude from Review transcript).
                 val isSeedPrompt =
                     !seenUser &&
                             a == "Question: $questionId" &&
@@ -862,25 +907,26 @@ private fun buildReviewQuestionLog(
                 if (isSeedPrompt) continue
 
                 if (isSkipped) {
-                    // Skipped: keep assistant context only after the user has interacted.
                     if (!seenUser) continue
 
-                    // Keep AI message if it exists (helps understand why the follow-up was asked).
                     if (a.isNotEmpty()) {
                         lines += ReviewChatLine(kind = ReviewChatKind.AI, text = a)
                     } else if (fallback.isNotEmpty()) {
                         lines += ReviewChatLine(kind = ReviewChatKind.AI, text = fallback)
                     }
 
-                    // Keep follow-up question if it is meaningful and not identical to the prompt.
                     val q2 = q?.trim()
                     if (!q2.isNullOrBlank() && q2 != promptTrimmed) {
                         lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = q2)
                     }
+
+                    val raw = m.streamText?.trim().orEmpty()
+                    if (raw.isNotEmpty() && m.streamState != ChatStreamState.NONE) {
+                        appendModelRawOnce(raw)
+                    }
                     continue
                 }
 
-                // Not skipped: keep full assistant transcript.
                 if (a.isNotEmpty()) {
                     lines += ReviewChatLine(kind = ReviewChatKind.AI, text = a)
                 } else if (fallback.isNotEmpty()) {
@@ -890,25 +936,19 @@ private fun buildReviewQuestionLog(
                 val q2 = q?.trim()
                 if (!q2.isNullOrBlank() && q2 != promptTrimmed) {
                     lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = q2)
-                } else {
-                    val rawQ = m.followUpQuestion
-                    if (!rawQ.isNullOrBlank()) {
-                        Log.d(TAG, "FOLLOW_UP suppressed: qid=$questionId raw='${rawQ.take(120)}'")
-                    }
                 }
 
                 val raw = m.streamText?.trim().orEmpty()
                 if (raw.isNotEmpty() && m.streamState != ChatStreamState.NONE) {
-                    lines += ReviewChatLine(kind = ReviewChatKind.MODEL_RAW, text = raw)
+                    appendModelRawOnce(raw)
                 }
             }
 
             ChatRole.MODEL -> {
-                if (isSkipped) continue
-
+                if (isSkipped && !seenUser) continue
                 val raw = (m.streamText?.takeIf { it.isNotBlank() } ?: m.text).trim()
                 if (raw.isNotEmpty()) {
-                    lines += ReviewChatLine(kind = ReviewChatKind.MODEL_RAW, text = raw)
+                    appendModelRawOnce(raw)
                 }
             }
         }

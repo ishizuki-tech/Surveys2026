@@ -174,8 +174,7 @@ class ChatQuestionViewModel(
 
         suppressNextCancelledError.set(true)
 
-        // Root fix:
-        // - Cancel active stream without requiring the VM to know the session id yet.
+        // Cancel active stream without requiring the VM to know the session id yet.
         val cancelledId = streamBridge.cancelActive(CANCELLED_MESSAGE)
         if (cancelledId > 0L) {
             lastCancelledStreamSessionId = cancelledId
@@ -304,18 +303,17 @@ class ChatQuestionViewModel(
      * Builds a follow-up context string intended to be consumed by repository-backed validators.
      *
      * Important:
-     * - Wrap with FOLLOW_UP_HISTORY_BEGIN/END so FakeSlmRepository can reliably extract and parse
-     *   the follow-up history from the overall prompt text.
+     * - Return ONLY the history lines here (FOLLOW_UP_1_Q/A...).
+     * - The validator layer is responsible for wrapping with BEGIN/END markers.
+     *   This avoids double-wrapping and makes extraction deterministic.
      */
     private fun buildFollowUpContext(turns: List<FollowUpTurn>): String {
-        if (turns.isEmpty()) return "(none)"
+        if (turns.isEmpty()) return ""
         return buildString {
-            append("FOLLOW_UP_HISTORY_BEGIN\n")
             turns.forEachIndexed { idx, t ->
                 append("FOLLOW_UP_${idx + 1}_Q: ").append(t.question.trim()).append('\n')
                 append("FOLLOW_UP_${idx + 1}_A: ").append(t.answer.trim()).append('\n')
             }
-            append("FOLLOW_UP_HISTORY_END")
         }.trim()
     }
 
@@ -433,7 +431,7 @@ class ChatQuestionViewModel(
         val canAttachNow = targetId != null && containsMessage(targetId)
 
         if (canAttachNow) {
-            updateMessage(targetId!!) { m ->
+            updateMessage(targetId) { m ->
                 m.copy(
                     streamText = raw,
                     streamState = state,
@@ -545,6 +543,18 @@ class ChatQuestionViewModel(
                 streamBridge.events.collect { ev ->
                     when (ev) {
                         is ChatStreamEvent.Begin -> {
+                            val cancelledId = lastCancelledStreamSessionId
+                            if (cancelledId > 0L && ev.sessionId == cancelledId) {
+                                // Ignore late Begin for a cancelled session to prevent UI flicker.
+                                return@collect
+                            }
+
+                            // Defensive: ignore unexpected overlapping sessions.
+                            if (localActiveSession != 0L && ev.sessionId != localActiveSession) {
+                                Log.d(TAG, "Stream Begin ignored (overlap). local=$localActiveSession new=${ev.sessionId}")
+                                return@collect
+                            }
+
                             beginSession(ev.sessionId)
                         }
 
@@ -586,6 +596,7 @@ class ChatQuestionViewModel(
                                 resetLocalStreamState()
                                 activeStreamSessionId = 0L
                                 activeStreamMsgId = null
+                                lastCancelledStreamSessionId = 0L
                                 safePersistDraft("stream.end_ignored_cancelled")
                                 return@collect
                             }
@@ -607,9 +618,13 @@ class ChatQuestionViewModel(
                                 (msg == "cancelled" || msg == "canceled") &&
                                         suppressNextCancelledError.getAndSet(false)
 
-                            if (suppressed) {
+                            val cancelledId = lastCancelledStreamSessionId
+                            val isCancelledSession = cancelledId > 0L && ev.sessionId == cancelledId
+
+                            if (suppressed || isCancelledSession) {
                                 localStreamMsgId?.let { removeMessage(it) }
                                 clearPendingModelEmbed("stream.error_suppressed")
+                                lastCancelledStreamSessionId = 0L
                             } else {
                                 maybeUpdateUi(force = true)
                                 finalizeAndRemoveModelBubble(

@@ -18,6 +18,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.negi.surveys.ui.ReviewChatLine
 import com.negi.surveys.ui.ReviewQuestionLog
+import com.negi.surveys.ui.ReviewTimelineItem
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -64,6 +65,18 @@ class SurveySessionViewModel : ViewModel() {
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /**
+     * Flattened timeline for Review UI.
+     *
+     * Ordering:
+     * - Question order is derived from [logs] (natural questionId ordering).
+     * - Within a question, line order is preserved as-is.
+     */
+    val timeline: StateFlow<List<ReviewTimelineItem>> =
+        logs
+            .map { buildTimelineV1(it) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /**
      * Deterministic JSON for export (v1).
      *
      * Notes:
@@ -73,25 +86,49 @@ class SurveySessionViewModel : ViewModel() {
     val exportJson: StateFlow<String> =
         logs
             .map { buildExportJsonV1(it) }
-            .stateIn(viewModelScope, SharingStarted.Eagerly, buildExportJsonV1(emptyList()))
+            .stateIn(viewModelScope, SharingStarted.Eagerly, EXPORT_JSON_EMPTY)
 
     /**
      * Upsert a question log (called from ChatQuestionScreen when pressing Next).
      *
-     * Notes:
-     * - Uses StateFlow.update to avoid lost updates under concurrent calls.
+     * Root fix:
+     * - Avoid "late stale updates" overwriting newer state.
+     * - When concurrent producers exist (streaming, navigation, recomposition),
+     *   a smaller/older log might arrive later.
+     *
+     * Rule:
+     * - Prefer logs that look "more complete" (more lines / longer payload / longer prompt).
+     * - Always allow changes in isSkipped (explicit user action).
      */
     fun upsertLog(log: ReviewQuestionLog) {
+        var accepted = true
+
         _logsMap.update { prev ->
             val next = prev.toMutableMap()
-            next[log.questionId] = log
+            val existing = next[log.questionId]
+            if (existing == null) {
+                next[log.questionId] = log
+            } else {
+                val should = shouldAcceptUpdate(existing, log)
+                accepted = should
+                if (should) {
+                    next[log.questionId] = log
+                }
+            }
             next.toMap()
         }
 
-        Log.d(
-            TAG,
-            "upsertLog: qid=${log.questionId} skipped=${log.isSkipped} lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
-        )
+        if (accepted) {
+            Log.d(
+                TAG,
+                "upsertLog: accepted qid=${log.questionId} skipped=${log.isSkipped} lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
+            )
+        } else {
+            Log.w(
+                TAG,
+                "upsertLog: dropped(stale) qid=${log.questionId} skipped=${log.isSkipped} lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
+            )
+        }
     }
 
     /**
@@ -104,23 +141,6 @@ class SurveySessionViewModel : ViewModel() {
 
     /**
      * Export schema v1.
-     *
-     * Output shape:
-     * {
-     *   "version": 1,
-     *   "questions": [
-     *     {
-     *       "questionId": "...",
-     *       "prompt": "...",
-     *       "isSkipped": true/false,
-     *       "payload": "...",
-     *       "transcript": [
-     *         {"kind":"USER","text":"..."},
-     *         {"kind":"AI","text":"..."}
-     *       ]
-     *     }
-     *   ]
-     * }
      */
     private fun buildExportJsonV1(sortedLogs: List<ReviewQuestionLog>): String {
         val sb = StringBuilder(4096)
@@ -135,9 +155,6 @@ class SurveySessionViewModel : ViewModel() {
             sb.append("\"questionId\":\"").append(jsonEscape(q.questionId)).append("\",")
             sb.append("\"prompt\":\"").append(jsonEscape(q.prompt)).append("\",")
             sb.append("\"isSkipped\":").append(q.isSkipped).append(',')
-            // NOTE:
-            // - Canonical name is completionPayload in the model.
-            // - JSON key stays "payload" for export schema compatibility.
             sb.append("\"payload\":\"").append(jsonEscape(q.completionPayload)).append("\",")
 
             sb.append("\"transcript\":[")
@@ -161,11 +178,61 @@ class SurveySessionViewModel : ViewModel() {
     }
 
     /**
+     * Build timeline v1:
+     * - Emits a header per question, followed by its transcript lines.
+     */
+    private fun buildTimelineV1(sortedLogs: List<ReviewQuestionLog>): List<ReviewTimelineItem> {
+        if (sortedLogs.isEmpty()) return emptyList()
+
+        val totalLines = sortedLogs.sumOf { it.lines.size }
+        val out = ArrayList<ReviewTimelineItem>(sortedLogs.size + totalLines)
+
+        for (q in sortedLogs) {
+            out.add(
+                ReviewTimelineItem.QuestionHeader(
+                    questionId = q.questionId,
+                    prompt = q.prompt,
+                    isSkipped = q.isSkipped,
+                    completionPayload = q.completionPayload
+                )
+            )
+            for (line in q.lines) {
+                out.add(
+                    ReviewTimelineItem.Line(
+                        questionId = q.questionId,
+                        prompt = q.prompt,
+                        isSkipped = q.isSkipped,
+                        line = line
+                    )
+                )
+            }
+        }
+        return out
+    }
+
+    /**
+     * Decide whether to accept an incoming update for the same questionId.
+     */
+    private fun shouldAcceptUpdate(existing: ReviewQuestionLog, incoming: ReviewQuestionLog): Boolean {
+        if (existing.isSkipped != incoming.isSkipped) return true
+
+        val existingLines = existing.lines.size
+        val incomingLines = incoming.lines.size
+        if (incomingLines != existingLines) return incomingLines > existingLines
+
+        val existingPayload = existing.completionPayload.length
+        val incomingPayload = incoming.completionPayload.length
+        if (incomingPayload != existingPayload) return incomingPayload > existingPayload
+
+        val existingPrompt = existing.prompt.length
+        val incomingPrompt = incoming.prompt.length
+        if (incomingPrompt != existingPrompt) return incomingPrompt > existingPrompt
+
+        return true
+    }
+
+    /**
      * Minimal JSON string escaping with control-char handling.
-     *
-     * Notes:
-     * - Escapes common control characters that break JSON.
-     * - Escapes other ASCII control chars defensively via \\uXXXX.
      */
     private fun jsonEscape(s: String): String {
         if (s.isEmpty()) return ""
@@ -194,15 +261,6 @@ class SurveySessionViewModel : ViewModel() {
 
     /**
      * Natural ordering key for question IDs like "Q1", "Q10", "A2".
-     *
-     * Rules:
-     * - prefix: leading letters (e.g., "Q")
-     * - number: trailing digits as Int (e.g., 1, 10)
-     * - raw: original string (tie-breaker)
-     *
-     * If the ID doesn't match the pattern, we fall back to:
-     * - prefix = id
-     * - number = Int.MAX_VALUE
      */
     private fun questionIdKey(id: String): QuestionIdKey {
         val raw = id.trim()
@@ -224,5 +282,6 @@ class SurveySessionViewModel : ViewModel() {
     private companion object {
         private const val TAG = "SurveySessionVM"
         private val ID_PATTERN = Regex("^([A-Za-z]+)(\\d+)$")
+        private const val EXPORT_JSON_EMPTY = "{\"version\":1,\"questions\":[]}"
     }
 }

@@ -212,9 +212,11 @@ $followUpBlock
                 FlowTextStopReason.MAX_CHARS -> {
                     streamBridge.end(sessionId)
                 }
+
                 FlowTextStopReason.TIMEOUT -> {
                     streamBridge.error(sessionId, "timeout")
                 }
+
                 FlowTextStopReason.ERROR -> {
                     streamBridge.error(sessionId, result.errorToken ?: "error")
                 }
@@ -240,8 +242,11 @@ $followUpBlock
         raw: String,
         fallbackFollowUp: String
     ): ValidationOutcome {
-        val cleaned = raw.trim()
-        val jsonStr = extractFirstJsonObject(cleaned)
+        val cleaned = raw
+            .replace("\u0000", "")
+            .trim()
+
+        val jsonStr = extractValidationJsonObject(cleaned)
 
         if (jsonStr == null) {
             log("parseOutcome: qid=${questionId.trim()} JSON not found -> fallback NEED_FOLLOW_UP")
@@ -254,11 +259,13 @@ $followUpBlock
 
         return try {
             val obj = JSONObject(jsonStr)
-            val statusStr = obj.optString("status", "").trim()
-            val assistantMessage = obj.optString("assistantMessage", "").trim().ifEmpty { "Thanks." }
 
-            val followUpQuestionRaw = obj.optString("followUpQuestion", "").trim()
-            val followUpQuestion: String? = followUpQuestionRaw.takeIf { it.isNotEmpty() }
+            val statusStr = obj.optString("status", "").trim()
+            val assistantMessage = obj
+                .optString("assistantMessage", "")
+                .replace("\u0000", "")
+                .trim()
+                .ifEmpty { "Thanks." }
 
             val status = when (statusStr) {
                 "ACCEPTED" -> ValidationStatus.ACCEPTED
@@ -266,17 +273,19 @@ $followUpBlock
                 else -> ValidationStatus.NEED_FOLLOW_UP
             }
 
-            if (status == ValidationStatus.NEED_FOLLOW_UP && followUpQuestion.isNullOrEmpty()) {
+            val followUpNormalized = normalizeFollowUpQuestion(obj.optString("followUpQuestion", ""))
+
+            if (status == ValidationStatus.ACCEPTED) {
                 ValidationOutcome(
-                    status = ValidationStatus.NEED_FOLLOW_UP,
+                    status = ValidationStatus.ACCEPTED,
                     assistantMessage = assistantMessage,
-                    followUpQuestion = fallbackFollowUp
+                    followUpQuestion = null
                 )
             } else {
                 ValidationOutcome(
-                    status = status,
+                    status = ValidationStatus.NEED_FOLLOW_UP,
                     assistantMessage = assistantMessage,
-                    followUpQuestion = followUpQuestion
+                    followUpQuestion = followUpNormalized ?: fallbackFollowUp
                 )
             }
         } catch (t: Throwable) {
@@ -290,16 +299,58 @@ $followUpBlock
     }
 
     /**
-     * Extract the first JSON object from a text blob.
+     * Extracts a JSON object intended for validation results.
      *
-     * Robust-ish implementation:
-     * - Finds the first '{'
-     * - Scans until matching '}' with brace depth
-     * - Skips braces inside JSON strings
+     * Policy:
+     * - Scan for candidate '{...}' substrings.
+     * - Prefer the first substring that parses as JSONObject and contains a non-empty "status".
+     *
+     * Rationale:
+     * - Some models prepend non-JSON text or include braces in explanations.
+     * - This reduces false positives compared to "first '{' wins".
      */
-    private fun extractFirstJsonObject(text: String): String? {
-        val start = text.indexOf('{')
-        if (start < 0) return null
+    private fun extractValidationJsonObject(text: String): String? {
+        if (text.isBlank()) return null
+
+        var cursor = 0
+        while (cursor < text.length) {
+            val start = text.indexOf('{', cursor)
+            if (start < 0) return null
+
+            val candidate = extractJsonObjectAt(text, start)
+            if (candidate == null) {
+                cursor = start + 1
+                continue
+            }
+
+            // Fast filter to avoid parsing every brace block.
+            if (!candidate.contains("\"status\"")) {
+                cursor = start + 1
+                continue
+            }
+
+            val ok = runCatching {
+                val obj = JSONObject(candidate)
+                obj.optString("status", "").trim().isNotEmpty()
+            }.getOrDefault(false)
+
+            if (ok) return candidate
+
+            cursor = start + 1
+        }
+
+        return null
+    }
+
+    /**
+     * Extract a JSON object substring beginning at [start] using brace depth scanning.
+     *
+     * Notes:
+     * - Skips braces inside JSON strings.
+     * - Returns the shortest balanced "{...}" starting at [start], or null if not balanced.
+     */
+    private fun extractJsonObjectAt(text: String, start: Int): String? {
+        if (start < 0 || start >= text.length || text[start] != '{') return null
 
         var i = start
         var depth = 0
@@ -332,6 +383,48 @@ $followUpBlock
             i++
         }
         return null
+    }
+
+    /**
+     * Normalizes a follow-up question and removes garbage values.
+     *
+     * Examples removed:
+     * - "none", "null", "n/a", "-", "0"
+     * Examples stripped prefixes:
+     * - "follow-up:", "follow up:", "question:", "next question:"
+     */
+    private fun normalizeFollowUpQuestion(text: String?): String? {
+        val raw = text ?: return null
+        var t = raw.replace("\u0000", "").trim()
+        if (t.isBlank()) return null
+
+        val prefixPatterns = listOf(
+            "follow-up question:",
+            "follow up question:",
+            "follow-up:",
+            "follow up:",
+            "followup:",
+            "question:",
+            "next question:"
+        )
+        val lower = t.lowercase()
+        for (p in prefixPatterns) {
+            if (lower.startsWith(p)) {
+                t = t.drop(p.length).trim()
+                break
+            }
+        }
+
+        val l2 = t.lowercase()
+        val garbage = setOf(
+            "none", "(none)", "n/a", "na", "null", "nil",
+            "no", "nope", "no follow up", "no follow-up",
+            "skip", "0", "-"
+        )
+        if (l2 in garbage) return null
+        if (t.length < 3) return null
+
+        return t
     }
 
     /**

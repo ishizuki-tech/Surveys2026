@@ -19,8 +19,11 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -58,19 +61,21 @@ fun SurveyStartScreen(
     onBack: () -> Unit,
     debugInfo: DebugInfo? = null
 ) {
-    // English comment:
-    // - Guard flag to prevent duplicate navigations caused by rapid multiple taps.
-    // - rememberSaveable keeps behavior stable across recompositions/rotations.
-    // - We add an automatic unlock timeout as a safety valve in case navigation fails.
+    /**
+     * Guard flag to prevent duplicate navigations caused by rapid multiple taps.
+     * rememberSaveable keeps behavior stable across recompositions/rotations.
+     * An automatic unlock timeout acts as a safety valve in case navigation fails.
+     */
     var beginLocked by rememberSaveable { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         Log.d(TAG, "SurveyStartScreen: composed")
     }
 
-    // English comment:
-    // - Auto-unlock if we stay on this screen for too long after "Begin".
-    // - If navigation succeeds, this composable will typically leave composition, so this effect cancels.
+    /**
+     * Auto-unlock if we stay on this screen for too long after "Begin".
+     * If navigation succeeds, this composable will typically leave composition, so this effect cancels.
+     */
     LaunchedEffect(beginLocked) {
         if (!beginLocked) return@LaunchedEffect
         delay(BEGIN_LOCK_TIMEOUT_MS)
@@ -82,9 +87,14 @@ fun SurveyStartScreen(
 
     Column(
         modifier = Modifier
-            // English comment:
-            // - safeDrawing avoids content being overlapped by system bars (status/navigation, cutouts).
-            .windowInsetsPadding(WindowInsets.safeDrawing)
+            .fillMaxSize()
+            /**
+             * App-level TopBar consumes TOP statusBars inset.
+             * Apply only Horizontal + Bottom safeDrawing here to avoid double insets.
+             */
+            .windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
+            )
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {

@@ -22,7 +22,6 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.Immutable
-import androidx.compose.runtime.remember
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
@@ -59,7 +58,7 @@ data class DebugRow(
  *
  * Notes:
  * - This UI intentionally avoids fancy styling to remain robust and readable.
- * - You can later replace this with a proper diagnostics screen.
+ * - Debug UI prioritizes correctness and freshness over micro-optimizations.
  */
 @Composable
 fun DebugPanel(
@@ -67,31 +66,30 @@ fun DebugPanel(
     modifier: Modifier = Modifier,
     maxCharsPerValue: Int = 96
 ) {
-    val route = remember(debugInfo.currentRoute, maxCharsPerValue) {
-        debugInfo.currentRoute
-            .trim()
-            .ifBlank { "(none)" }
-            .ellipsize(maxChars = maxCharsPerValue)
-    }
+    /**
+     * Clamp values defensively so debug rendering never breaks on odd inputs.
+     */
+    val maxValueChars = maxCharsPerValue.coerceAtLeast(0)
 
-    val build = remember(debugInfo.buildLabel, maxCharsPerValue) {
-        debugInfo.buildLabel
-            ?.trim()
-            ?.takeIf { it.isNotEmpty() }
-            ?.ellipsize(maxChars = maxCharsPerValue)
-    }
+    val route = debugInfo.currentRoute
+        .trim()
+        .ifBlank { "(none)" }
+        .ellipsize(maxChars = maxValueChars)
 
-    val extras = remember(debugInfo.extras, maxCharsPerValue) {
-        debugInfo.extras
-            .asSequence()
-            .map { row ->
-                DebugRow(
-                    label = row.label.trim().ifBlank { "(key)" }.ellipsize(32),
-                    value = row.value.trim().ifBlank { "(none)" }.ellipsize(maxCharsPerValue)
-                )
-            }
-            .toList()
-    }
+    val build = debugInfo.buildLabel
+        ?.trim()
+        ?.takeIf { it.isNotEmpty() }
+        ?.ellipsize(maxChars = maxValueChars)
+
+    val extras = debugInfo.extras
+        .asSequence()
+        .map { row ->
+            DebugRow(
+                label = row.label.trim().ifBlank { "(key)" }.ellipsize(32),
+                value = row.value.trim().ifBlank { "(none)" }.ellipsize(maxValueChars)
+            )
+        }
+        .toList()
 
     Column(
         modifier = modifier

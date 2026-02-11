@@ -18,10 +18,13 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.windowInsetsPadding
@@ -71,13 +74,15 @@ fun QuestionScreen(
     /** Navigate back. */
     onBack: () -> Unit
 ) {
-    // English comment:
-    // - rememberSaveable keeps draft text across rotation and process recreation.
-    // - Keyed by questionId so each question has its own draft slot.
+    /**
+     * rememberSaveable keeps draft text across rotation and process recreation.
+     * Keyed by questionId so each question has its own draft slot.
+     */
     var answer by rememberSaveable(questionId) { mutableStateOf("") }
 
-    // English comment:
-    // - Apply initialAnswer only if the user hasn't typed yet, to avoid overwriting input.
+    /**
+     * Apply initialAnswer only if the user hasn't typed yet, to avoid overwriting input.
+     */
     LaunchedEffect(questionId, initialAnswer) {
         if (answer.isBlank() && initialAnswer.isNotBlank()) {
             answer = initialAnswer
@@ -104,9 +109,10 @@ fun QuestionScreen(
             Log.d(TAG, "QuestionScreen: submit blocked (invalid) qid=$questionId len=$answerLen")
             return
         }
-        // English comment:
-        // - Avoid logging full answer (potentially sensitive user input).
-        // - Log only length + short SHA-256 prefix.
+        /**
+         * Avoid logging full answer (potentially sensitive user input).
+         * Log only length + short SHA-256 prefix.
+         */
         val sha8 = sha256Hex(trimmed).take(8)
         Log.d(TAG, "QuestionScreen: next qid=$questionId len=${trimmed.length} sha8=$sha8")
         onNext(trimmed)
@@ -115,11 +121,16 @@ fun QuestionScreen(
     Column(
         modifier = Modifier
             .fillMaxSize()
-            // English comment:
-            // - safeDrawing avoids content being overlapped by system bars (status/navigation, cutouts).
-            .windowInsetsPadding(androidx.compose.foundation.layout.WindowInsets.safeDrawing)
-            // English comment:
-            // - imePadding keeps the buttons visible above the on-screen keyboard.
+            /**
+             * App-level TopBar consumes TOP statusBars inset.
+             * Apply only Horizontal + Bottom safeDrawing here to avoid double insets.
+             */
+            .windowInsetsPadding(
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
+            )
+            /**
+             * Keep the buttons visible above the on-screen keyboard.
+             */
             .imePadding()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
@@ -142,8 +153,9 @@ fun QuestionScreen(
                 onDone = { submitIfValid() }
             ),
             supportingText = {
-                // English comment:
-                // - Show debug-friendly metadata without exposing the answer itself.
+                /**
+                 * Show debug-friendly metadata without exposing the answer itself.
+                 */
                 Text("Length: $answerLen")
             }
         )
@@ -181,7 +193,7 @@ fun QuestionScreen(
  * Computes SHA-256 hex for debug purposes.
  *
  * Notes:
- * - This is used ONLY for non-PII logging (short prefix).
+ * - Used ONLY for non-PII logging (short prefix).
  * - Do not log full input values.
  */
 private fun sha256Hex(text: String): String {
