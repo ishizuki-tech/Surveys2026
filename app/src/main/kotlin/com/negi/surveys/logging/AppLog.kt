@@ -30,6 +30,7 @@ import java.util.concurrent.atomic.AtomicBoolean
  * - Mirrors android.util.Log.* so migration is easy.
  * - Writes are synchronous to survive crashes.
  * - This does NOT dump system logcat; it only records what the app chooses to log.
+ * - Provides helper APIs so upload code can ALWAYS obtain a log file path.
  */
 object AppLog {
     private const val INTERNAL_TAG = "AppLog"
@@ -56,14 +57,101 @@ object AppLog {
 
     /**
      * Initializes the logger. Call early (e.g., Activity.onCreate).
+     *
+     * Notes:
+     * - Safe to call multiple times; only first call "installs".
+     * - Uses applicationContext to avoid leaking Activity.
      */
     fun init(context: Context) {
         if (!installed.compareAndSet(false, true)) return
-        val dir = LogFiles.appLogDir(context)
+        val appCtx = context.applicationContext
+        val dir = LogFiles.appLogDir(appCtx)
         logDir = dir
         currentFile = File(dir, "app.log")
+        ensureFileExistsLocked()
         rotateIfNeededLocked()
-        i(INTERNAL_TAG, "init: dir=${dir.absolutePath} build=${LogFiles.buildLabelSafe()} installId=${LogFiles.installId(context)}")
+        i(
+            INTERNAL_TAG,
+            "init: dir=${dir.absolutePath} build=${LogFiles.buildLabelSafe()} installId=${LogFiles.installId(appCtx)}"
+        )
+    }
+
+    /**
+     * Ensures the logger is ready for file operations.
+     *
+     * Notes:
+     * - This is intended for upload/debug tooling, not for normal logging call sites.
+     * - If init() wasn't called, this will call init() and create app.log.
+     */
+    fun ensureReady(context: Context) {
+        if (!installed.get()) {
+            init(context)
+            return
+        }
+
+        if (logDir != null && currentFile != null) return
+
+        val appCtx = context.applicationContext
+        synchronized(lock) {
+            val dir = logDir ?: LogFiles.appLogDir(appCtx).also { logDir = it }
+            val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
+            ensureFileExistsLocked()
+            rotateIfNeededLocked()
+        }
+    }
+
+    /**
+     * Returns the current log file (app.log), creating it if needed.
+     *
+     * Notes:
+     * - Always returns a File that exists (best-effort).
+     * - Does NOT expose secret values; it may write a minimal marker line.
+     */
+    fun getOrCreateCurrentLogFile(context: Context): File {
+        ensureReady(context)
+        synchronized(lock) {
+            ensureFileExistsLocked()
+            rotateIfNeededLocked()
+            val dir = logDir ?: LogFiles.appLogDir(context.applicationContext).also { logDir = it }
+            val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
+            ensureFileExistsLocked()
+            return file
+        }
+    }
+
+    /**
+     * Lists log files suitable for upload.
+     *
+     * Ordering:
+     * - Most recent first
+     * - Includes "app.log" and rotated "app-*.log"
+     *
+     * Notes:
+     * - If init() wasn't called, this will call ensureReady() and create app.log.
+     */
+    fun getLogFilesForUpload(context: Context): List<File> {
+        ensureReady(context)
+
+        val dir = logDir ?: return listOf(getOrCreateCurrentLogFile(context))
+        val files = dir.listFiles()
+            ?.filter { it.isFile && (it.name == "app.log" || (it.name.startsWith("app-") && it.name.endsWith(".log"))) }
+            ?.sortedByDescending { it.lastModified() }
+            .orEmpty()
+
+        if (files.isNotEmpty()) return files
+        return listOf(getOrCreateCurrentLogFile(context))
+    }
+
+    /**
+     * Writes a lightweight marker line that is safe for upload/debug.
+     *
+     * Notes:
+     * - Useful to ensure the log file is non-empty right before uploading.
+     * - Message is sanitized and length-limited.
+     */
+    fun mark(context: Context, tag: String, msg: String) {
+        ensureReady(context)
+        i(tag, "MARK: ${msg.take(1024)}")
     }
 
     fun d(tag: String, msg: String): Int = log(Log.DEBUG, tag, msg, null)
@@ -93,6 +181,7 @@ object AppLog {
     private fun writeLine(level: Int, tag: String, msg: String, t: Throwable?) {
         val dir = logDir ?: return
         synchronized(lock) {
+            ensureFileExistsLocked()
             rotateIfNeededLocked()
 
             val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
@@ -119,6 +208,16 @@ object AppLog {
                 out.write(line.toByteArray(Charsets.UTF_8))
                 out.flush()
             }
+        }
+    }
+
+    private fun ensureFileExistsLocked() {
+        val dir = logDir ?: return
+        if (!dir.exists()) runCatching { dir.mkdirs() }
+
+        val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
+        if (!file.exists()) {
+            runCatching { FileOutputStream(file, true).use { } }
         }
     }
 

@@ -1,0 +1,364 @@
+/*
+ * =====================================================================
+ *  IshizukiTech LLC — SurveyApp
+ *  ---------------------------------------------------------------------
+ *  File: DebugLogUploader.kt
+ *  Author: Shu Ishizuki
+ *  License: MIT License
+ *  © 2026 IshizukiTech LLC. All rights reserved.
+ * =====================================================================
+ */
+
+@file:Suppress("unused")
+
+package com.negi.surveys.debug
+
+import android.content.Context
+import android.os.Build
+import android.os.Process
+import android.util.Base64
+import android.util.Log
+import com.negi.surveys.BuildConfig
+import java.io.BufferedInputStream
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.HttpURLConnection
+import java.net.URL
+import java.time.Instant
+import java.util.Locale
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
+
+/**
+ * Collects a debug log file on-device and uploads it (Supabase preferred, GitHub fallback).
+ *
+ * Notes:
+ * - Never prints secret values.
+ * - Always produces a file (even if logcat collection fails).
+ * - Debug builds only are recommended (tokens may be embedded in BuildConfig on debug).
+ */
+object DebugLogUploader {
+
+    private const val TAG = "DebugLogUploader"
+
+    data class UploadResult(
+        val ok: Boolean,
+        val destination: String,
+        val message: String
+    )
+
+    /**
+     * Collects a log file and uploads it.
+     *
+     * Behavior:
+     * 1) Collect logcat for this process (best-effort).
+     * 2) Write to filesDir/logs/...
+     * 3) Upload to Supabase if configured; otherwise GitHub; otherwise return local path.
+     */
+    suspend fun collectAndUpload(context: Context): UploadResult = withContext(Dispatchers.IO) {
+        val file = runCatching { collectLogFile(context) }
+            .getOrElse { e ->
+                Log.w(TAG, "collectLogFile failed: ${e.message}")
+                // Always produce *some* file to avoid "No log file found".
+                writeFallbackFile(context, "collectLogFile failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+
+        // Prefer Supabase when configured.
+        val supabase = runCatching { uploadToSupabaseIfConfigured(file) }.getOrNull()
+        if (supabase != null && supabase.ok) return@withContext supabase
+
+        // Fallback to GitHub.
+        val github = runCatching { uploadToGithubIfConfigured(file) }.getOrNull()
+        if (github != null && github.ok) return@withContext github
+
+        UploadResult(
+            ok = false,
+            destination = "local",
+            message = "Saved locally: ${file.absolutePath} (upload not configured or failed)"
+        )
+    }
+
+    /**
+     * Collects logcat output and writes it to a file.
+     *
+     * Notes:
+     * - Uses `logcat -d --pid=<pid>` when possible.
+     * - Hard-limits captured bytes to avoid giant uploads.
+     * - Prunes old log files to keep storage bounded.
+     */
+    private fun collectLogFile(context: Context): File {
+        val dir = File(context.filesDir, "logs").apply { mkdirs() }
+
+        pruneOldLogs(dir, keep = 20)
+
+        val ts = Instant.now().toString().replace(":", "-")
+        val file = File(dir, "debug-log-$ts.txt")
+
+        val header = buildHeader(context)
+        val logcat = collectLogcatBestEffort(maxBytes = 900_000)
+
+        val body = StringBuilder(header.length + logcat.length + 256)
+            .append(header)
+            .append("\n\n---- LOGCAT (best-effort) ----\n")
+            .append(logcat)
+            .append("\n\n---- END ----\n")
+            .toString()
+
+        file.writeText(body)
+        Log.d(TAG, "Collected debug log file: ${file.absolutePath} (len=${file.length()})")
+        return file
+    }
+
+    private fun buildHeader(context: Context): String {
+        val now = Instant.now().toString()
+        val pkg = context.packageName
+        val pid = Process.myPid()
+
+        // IMPORTANT: Never include token strings in logs.
+        val hasGhToken = BuildConfig.GH_TOKEN.isNotBlank() || BuildConfig.GITHUB_TOKEN.isNotBlank()
+        val hasSb = BuildConfig.SUPABASE_URL.isNotBlank() && BuildConfig.SUPABASE_ANON_KEY.isNotBlank()
+
+        return """
+            # SurveyApp Debug Log
+            timeUtc=$now
+            package=$pkg
+            pid=$pid
+
+            # Build
+            debug=${BuildConfig.DEBUG}
+            versionName=${BuildConfig.VERSION_NAME}
+            versionCode=${BuildConfig.VERSION_CODE}
+            gitSha=${BuildConfig.GIT_SHA}
+            gitDirty=${BuildConfig.GIT_DIRTY}
+            buildTimeUtc=${BuildConfig.BUILD_TIME_UTC}
+
+            # Device
+            sdkInt=${Build.VERSION.SDK_INT}
+            release=${Build.VERSION.RELEASE}
+            manufacturer=${Build.MANUFACTURER}
+            model=${Build.MODEL}
+            abi=${Build.SUPPORTED_ABIS.joinToString(",")}
+
+            # Integrations present (no secrets)
+            supabaseConfigured=$hasSb
+            githubTokenPresent=$hasGhToken
+        """.trimIndent()
+    }
+
+    /**
+     * Attempts to collect logcat output.
+     *
+     * Notes:
+     * - Some devices may restrict logcat access. We still return useful info.
+     */
+    private fun collectLogcatBestEffort(maxBytes: Int): String {
+        val pid = Process.myPid()
+
+        // Primary: only this process.
+        val candidates: List<List<String>> = listOf(
+            listOf("logcat", "-d", "--pid=$pid", "-v", "threadtime"),
+            // Fallback: no pid filter.
+            listOf("logcat", "-d", "-v", "threadtime")
+        )
+
+        for (cmd in candidates) {
+            val out = runCatching { runCommandLimited(cmd, maxBytes) }.getOrNull()
+            if (!out.isNullOrBlank()) {
+                return out
+            }
+        }
+
+        return "(logcat unavailable on this device / build; collected header only)"
+    }
+
+    private fun runCommandLimited(cmd: List<String>, maxBytes: Int): String {
+        val pb = ProcessBuilder(cmd)
+        pb.redirectErrorStream(true)
+        val p = pb.start()
+
+        BufferedInputStream(p.inputStream).use { input ->
+            val buf = ByteArray(8 * 1024)
+            var total = 0
+            val baos = ByteArrayOutputStream()
+
+            while (true) {
+                val read = input.read(buf)
+                if (read <= 0) break
+                val canWrite = (maxBytes - total).coerceAtLeast(0)
+                if (canWrite <= 0) break
+                val n = minOf(read, canWrite)
+                baos.write(buf, 0, n)
+                total += n
+                if (total >= maxBytes) break
+            }
+
+            runCatching { p.destroy() }
+            return baos.toString(Charsets.UTF_8.name())
+        }
+    }
+
+    private fun pruneOldLogs(dir: File, keep: Int) {
+        val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: return
+        if (files.size <= keep) return
+        for (f in files.drop(keep)) {
+            runCatching { f.delete() }
+        }
+    }
+
+    private fun writeFallbackFile(context: Context, reason: String): File {
+        val dir = File(context.filesDir, "logs").apply { mkdirs() }
+        val ts = Instant.now().toString().replace(":", "-")
+        val file = File(dir, "debug-fallback-$ts.txt")
+
+        val body = buildString {
+            append(buildHeader(context))
+            append("\n\n---- FALLBACK ----\n")
+            append(reason)
+            append("\n---- END ----\n")
+        }
+
+        file.writeText(body)
+        Log.w(TAG, "Wrote fallback log file: ${file.absolutePath}")
+        return file
+    }
+
+    /**
+     * Upload to Supabase Storage when configured.
+     *
+     * Implementation:
+     * POST {SUPABASE_URL}/storage/v1/object/{bucket}/{prefix}/{filename}
+     * Headers:
+     * - apikey: <anonKey>
+     * - Authorization: Bearer <anonKey>
+     * - x-upsert: true
+     */
+    private fun uploadToSupabaseIfConfigured(file: File): UploadResult? {
+        val baseUrl = BuildConfig.SUPABASE_URL.trim().trimEnd('/')
+        val anonKey = BuildConfig.SUPABASE_ANON_KEY.trim()
+        val bucket = BuildConfig.SUPABASE_LOG_BUCKET.trim().ifBlank { "logs" }
+        val prefix = BuildConfig.SUPABASE_LOG_PREFIX.trim().ifBlank { "surveyapp" }
+
+        if (baseUrl.isBlank() || anonKey.isBlank()) return null
+
+        val safePrefix = prefix.trim('/').ifBlank { "surveyapp" }
+        val path = "$safePrefix/${file.name}"
+
+        val endpoint = "$baseUrl/storage/v1/object/$bucket/$path"
+        val url = URL(endpoint)
+        val conn = (url.openConnection() as HttpURLConnection)
+
+        conn.requestMethod = "POST"
+        conn.doOutput = true
+        conn.connectTimeout = 15_000
+        conn.readTimeout = 30_000
+
+        conn.setRequestProperty("apikey", anonKey)
+        conn.setRequestProperty("Authorization", "Bearer $anonKey")
+        conn.setRequestProperty("x-upsert", "true")
+        conn.setRequestProperty("Content-Type", "text/plain; charset=utf-8")
+
+        file.inputStream().use { input ->
+            conn.outputStream.use { out ->
+                input.copyTo(out)
+            }
+        }
+
+        val code = conn.responseCode
+        val ok = code in 200..299
+        val msg = readHttpMessage(conn)
+
+        return if (ok) {
+            UploadResult(
+                ok = true,
+                destination = "supabase",
+                message = "Uploaded to Supabase: bucket=$bucket path=$path (HTTP $code)"
+            )
+        } else {
+            Log.w(TAG, "Supabase upload failed: HTTP $code msg=$msg endpoint=$endpoint")
+            UploadResult(
+                ok = false,
+                destination = "supabase",
+                message = "Supabase upload failed: HTTP $code ($msg)"
+            )
+        }
+    }
+
+    /**
+     * Upload to GitHub Contents API when configured.
+     *
+     * PUT https://api.github.com/repos/{owner}/{repo}/contents/{path}
+     * JSON body: { message, content(base64), branch }
+     */
+    private fun uploadToGithubIfConfigured(file: File): UploadResult? {
+        val owner = BuildConfig.GH_OWNER.trim()
+        val repo = BuildConfig.GH_REPO.trim()
+        val branch = BuildConfig.GH_BRANCH.trim().ifBlank { "main" }
+        val prefix = BuildConfig.GH_PATH_PREFIX.trim()
+        val token = (BuildConfig.GH_TOKEN.ifBlank { BuildConfig.GITHUB_TOKEN }).trim()
+
+        if (owner.isBlank() || repo.isBlank() || token.isBlank()) return null
+
+        val safePrefix = prefix.trim('/').let { if (it.isBlank()) "" else "$it/" }
+        val path = "${safePrefix}logs/${file.name}"
+
+        val endpoint = "https://api.github.com/repos/$owner/$repo/contents/$path"
+        val url = URL(endpoint)
+        val conn = (url.openConnection() as HttpURLConnection)
+
+        conn.requestMethod = "PUT"
+        conn.doOutput = true
+        conn.connectTimeout = 15_000
+        conn.readTimeout = 30_000
+
+        conn.setRequestProperty("Accept", "application/vnd.github+json")
+        conn.setRequestProperty("Authorization", "Bearer $token")
+        conn.setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+        conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+
+        val bytes = file.readBytes()
+        val b64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+
+        val body = JSONObject().apply {
+            put("message", "Upload debug log ${file.name}")
+            put("content", b64)
+            put("branch", branch)
+        }.toString()
+
+        conn.outputStream.use { it.write(body.toByteArray(Charsets.UTF_8)) }
+
+        val code = conn.responseCode
+        val ok = code in 200..299
+        val msg = readHttpMessage(conn)
+
+        return if (ok) {
+            val webUrl = "https://github.com/$owner/$repo/blob/$branch/$path"
+            UploadResult(
+                ok = true,
+                destination = "github",
+                message = "Uploaded to GitHub: $webUrl (HTTP $code)"
+            )
+        } else {
+            Log.w(TAG, "GitHub upload failed: HTTP $code msg=$msg endpoint=$endpoint")
+            UploadResult(
+                ok = false,
+                destination = "github",
+                message = "GitHub upload failed: HTTP $code ($msg)"
+            )
+        }
+    }
+
+    private fun readHttpMessage(conn: HttpURLConnection): String {
+        val stream = runCatching {
+            if (conn.responseCode in 200..299) conn.inputStream else conn.errorStream
+        }.getOrNull() ?: return ""
+
+        return runCatching {
+            stream.bufferedReader().use { it.readText() }
+        }.getOrDefault("")
+            .take(800)
+            .replace("\\s+".toRegex(), " ")
+            .trim()
+            .lowercase(Locale.ROOT)
+    }
+}

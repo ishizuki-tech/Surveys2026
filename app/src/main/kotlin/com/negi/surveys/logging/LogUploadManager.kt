@@ -22,41 +22,29 @@ import java.net.URL
 /**
  * Uploads log bundles to Supabase Storage using plain HttpURLConnection.
  *
- * Regular path:
- * - Called manually from UI (e.g., HomeScreen) to upload a "regular" bundle.
- *
- * Crash path:
- * - Crash files are persisted to logs/crash/pending/ by [CrashCapture].
- * - On next cold start, call [tryUploadPendingCrashesBlocking] to upload them.
- *
  * Security notes:
- * - NEVER embed a Supabase service_role key in the app.
+ * - Never embed a Supabase service_role key in the app.
  * - For production, prefer Signed Upload URLs or an Edge Function.
- * - This client uses the anon key (or user JWT) and requires appropriate Storage policies.
+ * - This client uses anon key (or a user JWT) and requires appropriate Storage policies.
  */
 object LogUploadManager {
     private const val TAG = "LogUpload"
 
-    /**
-     * Returns true if the BuildConfig contains non-blank Supabase settings.
-     */
     fun isConfigured(): Boolean {
-//        return BuildConfig.SUPABASE_URL.isNotBlank() &&
-//                BuildConfig.SUPABASE_ANON_KEY.isNotBlank() &&
-//                BuildConfig.SUPABASE_LOG_BUCKET.isNotBlank()
-        return false
+        return BuildConfig.SUPABASE_URL.isNotBlank() &&
+                BuildConfig.SUPABASE_ANON_KEY.isNotBlank() &&
+                BuildConfig.SUPABASE_LOG_BUCKET.isNotBlank()
     }
 
-    /**
-     * Uploads a "regular" log bundle (blocking).
-     *
-     * Call this on a background thread.
-     *
-     * @return Result.success(remoteObjectPath) on success
-     */
-    fun uploadRegularBlocking(context: android.content.Context, reason: String? = null): Result<String> {
+    fun uploadRegularBlocking(
+        context: android.content.Context,
+        reason: String? = null,
+        userJwt: String? = null
+    ): Result<String> {
         if (!isConfigured()) {
-            return Result.failure(IllegalStateException("Supabase is not configured (SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_LOG_BUCKET)."))
+            return Result.failure(
+                IllegalStateException("Supabase is not configured (SUPABASE_URL / SUPABASE_ANON_KEY / SUPABASE_LOG_BUCKET).")
+            )
         }
 
         val install = LogFiles.installId(context)
@@ -67,29 +55,29 @@ object LogUploadManager {
             reason = reason
         )
 
-        val objectPath = buildObjectPath(kind = LogFiles.UploadKind.REGULAR, installId = install, fileName = zip.name)
+        val objectPath = buildObjectPath(
+            kind = LogFiles.UploadKind.REGULAR,
+            installId = install,
+            fileName = zip.name
+        )
 
-        AppLog.i(TAG, "uploadRegular: start objectPath=$objectPath size=${zip.length()}")
-        val result = uploadZipToSupabase(zip, objectPath)
-        zip.delete()
+        AppLog.i(TAG, "uploadRegular: start objectPath=$objectPath size=${zip.length()} file=${zip.name}")
+
+        val result = uploadZipToSupabase(zip, objectPath, userJwt)
 
         return result.onSuccess {
+            runCatching { zip.delete() }
             AppLog.i(TAG, "uploadRegular: ok objectPath=$it")
         }.onFailure { t ->
-            AppLog.e(TAG, "uploadRegular: failed", t)
+            AppLog.e(TAG, "uploadRegular: failed (zip kept) file=${zip.absolutePath}", t)
         }
     }
 
-    /**
-     * Uploads all pending crash logs as a single bundle (blocking).
-     *
-     * Call this on a background thread. Intended to be invoked at app start.
-     *
-     * @return Result.success(uploadedCrashCount) on success
-     */
-    fun tryUploadPendingCrashesBlocking(context: android.content.Context): Result<Int> {
+    fun tryUploadPendingCrashesBlocking(
+        context: android.content.Context,
+        userJwt: String? = null
+    ): Result<Int> {
         if (!isConfigured()) {
-            // If not configured, do not treat as fatal.
             AppLog.w(TAG, "tryUploadPendingCrashes: Supabase not configured; skip")
             return Result.success(0)
         }
@@ -105,26 +93,23 @@ object LogUploadManager {
             reason = "auto:pending_crash"
         )
 
-        val objectPath = buildObjectPath(kind = LogFiles.UploadKind.CRASH, installId = install, fileName = zip.name)
+        val objectPath = buildObjectPath(
+            kind = LogFiles.UploadKind.CRASH,
+            installId = install,
+            fileName = zip.name
+        )
 
-        AppLog.i(TAG, "uploadCrash: start objectPath=$objectPath crashes=${pending.size} size=${zip.length()}")
-        val result = uploadZipToSupabase(zip, objectPath)
-        zip.delete()
+        AppLog.i(TAG, "uploadCrash: start objectPath=$objectPath crashes=${pending.size} size=${zip.length()} file=${zip.name}")
+
+        val result = uploadZipToSupabase(zip, objectPath, userJwt)
 
         return result.map {
-            // Move crash files to uploaded/ only if upload succeeded.
-            val uploadedDir = LogFiles.crashUploadedDir(context)
-            var moved = 0
-            for (f in pending) {
-                val dst = File(uploadedDir, f.name)
-                if (f.exists()) {
-                    if (runCatching { f.renameTo(dst) }.getOrDefault(false)) moved++
-                }
-            }
-            AppLog.i(TAG, "uploadCrash: ok objectPath=$it moved=$moved")
+            val uploaded = LogFiles.moveCrashFilesToUploaded(context, pending)
+            AppLog.i(TAG, "uploadCrash: ok objectPath=$it moved=${uploaded.size}")
+            runCatching { zip.delete() }
             pending.size
         }.onFailure { t ->
-            AppLog.e(TAG, "uploadCrash: failed", t)
+            AppLog.e(TAG, "uploadCrash: failed (zip kept) file=${zip.absolutePath}", t)
         }
     }
 
@@ -133,31 +118,29 @@ object LogUploadManager {
         return "$prefix/${kind.prefix}/$installId/$fileName"
     }
 
-    private fun uploadZipToSupabase(zipFile: File, objectPath: String): Result<String> {
+    private fun uploadZipToSupabase(zipFile: File, objectPath: String, userJwt: String?): Result<String> {
         val urlBase = BuildConfig.SUPABASE_URL.trim().trimEnd('/')
         val bucket = BuildConfig.SUPABASE_LOG_BUCKET.trim().trim('/')
 
         val uploadUrl = "$urlBase/storage/v1/object/$bucket/$objectPath"
-        val bytes = runCatching { zipFile.readBytes() }
-            .getOrElse { return Result.failure(it) }
+        val bytes = runCatching { zipFile.readBytes() }.getOrElse { return Result.failure(it) }
+
+        val anonKey = BuildConfig.SUPABASE_ANON_KEY.trim()
+        val authBearer = userJwt?.trim().takeUnless { it.isNullOrBlank() } ?: anonKey
 
         return httpUpload(
             url = uploadUrl,
-            anonKey = BuildConfig.SUPABASE_ANON_KEY.trim(),
+            apikey = anonKey,
+            authorizationBearer = authBearer,
             contentType = "application/zip",
             body = bytes
         ).map { objectPath }
     }
 
-    /**
-     * Performs a standard upload to Supabase Storage via HTTP.
-     *
-     * Docs:
-     * - Standard uploads and overwrite options (x-upsert). See Supabase docs.
-     */
     private fun httpUpload(
         url: String,
-        anonKey: String,
+        apikey: String,
+        authorizationBearer: String,
         contentType: String,
         body: ByteArray
     ): Result<Unit> {
@@ -167,8 +150,8 @@ object LogUploadManager {
                 doOutput = true
                 connectTimeout = 20_000
                 readTimeout = 30_000
-                setRequestProperty("Authorization", "Bearer $anonKey")
-                setRequestProperty("apikey", anonKey)
+                setRequestProperty("Authorization", "Bearer $authorizationBearer")
+                setRequestProperty("apikey", apikey)
                 setRequestProperty("Content-Type", contentType)
                 setRequestProperty("x-upsert", "true")
             }
@@ -186,7 +169,7 @@ object LogUploadManager {
             }.getOrDefault("")
 
             if (!ok) {
-                throw IOException("HTTP $code: ${resp.take(512)}")
+                throw IOException("HTTP $code: ${resp.take(900)} endpoint=$url")
             }
         }
     }
