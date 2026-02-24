@@ -21,6 +21,7 @@ import java.io.BufferedInputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -50,9 +51,15 @@ object LogFiles {
     private const val PREFS = "survey_logs"
     private const val KEY_INSTALL_ID = "install_id"
 
-    private const val DEFAULT_MAX_APP_LOGS = 40
-    private const val DEFAULT_MAX_CRASH_LOGS = 20
-    private const val DEFAULT_MAX_TOTAL_BYTES: Long = 25L * 1024L * 1024L // 25MB
+    /**
+     * Defaults tuned for GitHub Contents API + Base64-in-JSON stability.
+     *
+     * Notes:
+     * - Zipped output may be smaller than raw, but we still keep conservative defaults.
+     */
+    private const val DEFAULT_MAX_APP_LOGS = 12
+    private const val DEFAULT_MAX_CRASH_LOGS = 12
+    private const val DEFAULT_MAX_TOTAL_BYTES: Long = 12L * 1024L * 1024L // 12 MiB
 
     private const val ZIP_BUFFER_BYTES = 8 * 1024
 
@@ -131,6 +138,14 @@ object LogFiles {
         return newId
     }
 
+    /** Short, human-friendly install ID marker (non-secret). */
+    fun installIdShort(context: Context): String =
+        installId(context).replace("-", "").take(8).ifBlank { "unknown" }
+
+    /** Hashed install ID for PII-safe diagnostics correlation. */
+    fun installIdHash(context: Context): String =
+        sha256Hex(installId(context)).take(16).ifBlank { "unknown" }
+
     /** Lists app logs (*.log) in newest-first order. */
     fun listAppLogs(context: Context): List<File> =
         appLogDir(context).listFiles()
@@ -167,6 +182,7 @@ object LogFiles {
         val zipName = "${kind.prefix}-${utcCompactNow()}-${Process.myPid()}.zip"
         val zipFile = File(cache, zipName)
 
+        // Candidates (newest-first).
         val appCandidates = listAppLogs(appContext)
         val crashCandidates = includeCrashFiles
             .filter { it.exists() && it.isFile }
@@ -205,6 +221,7 @@ object LogFiles {
                     zos.closeEntry()
                 }
 
+                // Keep deterministic ordering inside zip.
                 for (f in selected.appFiles.sortedBy { it.name }) {
                     zipAddFile(zos, f, entryName = "app/${f.name}")
                 }
@@ -287,7 +304,6 @@ object LogFiles {
         val safeEntry = sanitizeZipEntryName(entryName)
         val entry = ZipEntry(safeEntry).apply {
             time = file.lastModified()
-            size = file.length().coerceAtLeast(0L)
         }
 
         zos.putNextEntry(entry)
@@ -325,7 +341,8 @@ object LogFiles {
             .replace("\r", " ")
             .take(256)
 
-        val install = installId(context)
+        val installShort = installIdShort(context)
+        val installHash = installIdHash(context)
         val build = buildLabelSafe()
 
         val appBytes = appFiles.sumOf { it.length().coerceAtLeast(0L) }
@@ -333,21 +350,24 @@ object LogFiles {
         val totalBytes = appBytes + crashBytes
 
         val abis = runCatching { Build.SUPPORTED_ABIS?.joinToString(",") ?: "" }.getOrDefault("")
-
-        val fingerprintShort = (Build.FINGERPRINT ?: "").take(200)
+        val fingerprintHash = sha256Hex(Build.FINGERPRINT ?: "").take(16)
 
         return buildString(2048) {
             append("{")
             append("\"kind\":\"").append(escapeJson(kind.prefix)).append("\",")
             append("\"createdUtc\":\"").append(utcCompactNow()).append("\",")
-            append("\"installId\":\"").append(escapeJson(install)).append("\",")
+
+            // PII-safe install identifiers (avoid full installId in the bundle).
+            append("\"installIdShort\":\"").append(escapeJson(installShort)).append("\",")
+            append("\"installIdHash\":\"").append(escapeJson(installHash)).append("\",")
+
             append("\"appId\":\"").append(escapeJson(BuildConfig.APPLICATION_ID)).append("\",")
             append("\"build\":\"").append(escapeJson(build)).append("\",")
             append("\"pid\":").append(Process.myPid()).append(",")
             append("\"sdk\":").append(Build.VERSION.SDK_INT).append(",")
             append("\"release\":\"").append(escapeJson(Build.VERSION.RELEASE ?: "")).append("\",")
             append("\"device\":\"").append(escapeJson("${Build.MANUFACTURER}/${Build.MODEL}")).append("\",")
-            append("\"fingerprint\":\"").append(escapeJson(fingerprintShort)).append("\",")
+            append("\"fingerprintHash\":\"").append(escapeJson(fingerprintHash)).append("\",")
             append("\"abis\":\"").append(escapeJson(abis)).append("\",")
 
             append("\"limits\":{")
@@ -415,7 +435,7 @@ object LogFiles {
     /**
      * Selects files within total byte budget with basic prioritization:
      * - Prefer newer files.
-     * - Include crash files too, but keep bounded.
+     * - Prefer crash files first.
      */
     private fun selectFilesWithinBudget(
         appFiles: List<File>,
@@ -474,6 +494,8 @@ object LogFiles {
         var s = name.replace('\\', '/')
         while (s.startsWith("/")) s = s.removePrefix("/")
         while (s.contains("../")) s = s.replace("../", "")
+        // Additional guard: collapse "//"
+        while (s.contains("//")) s = s.replace("//", "/")
         return s.ifBlank { "file" }
     }
 
@@ -521,6 +543,22 @@ object LogFiles {
                 else -> null
             }
         }.getOrNull()
+    }
+
+    private val HEX = "0123456789abcdef".toCharArray()
+
+    /** SHA-256 hex (lowercase). */
+    private fun sha256Hex(s: String): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val digest = md.digest(s.toByteArray(Charsets.UTF_8))
+        val out = CharArray(digest.size * 2)
+        var i = 0
+        for (b in digest) {
+            val v = b.toInt() and 0xFF
+            out[i++] = HEX[v ushr 4]
+            out[i++] = HEX[v and 0x0F]
+        }
+        return String(out)
     }
 
     /** Upload bundle kind. */

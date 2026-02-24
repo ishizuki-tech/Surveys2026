@@ -37,7 +37,7 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Divider
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
@@ -56,6 +56,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import com.negi.surveys.BuildConfig
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
@@ -87,6 +88,25 @@ fun ReviewScreen(
 
     val resolvedTimeline: List<ReviewTimelineItem> = remember(timelineKey, logsKey) {
         timeline ?: buildTimelineFromLogs(sortedLogs)
+    }
+
+    // English comments only.
+    /** Debug: detect duplicate timeline keys early (should be impossible after index-based keys). */
+    LaunchedEffect(timelineKey ?: logsKey) {
+        if (!BuildConfig.DEBUG) return@LaunchedEffect
+
+        val seen = HashSet<String>(resolvedTimeline.size * 2)
+        val dupes = ArrayList<String>()
+        resolvedTimeline.forEachIndexed { idx, item ->
+            val k = timelineRowKey(idx, item)
+            if (!seen.add(k)) dupes.add(k)
+        }
+
+        if (dupes.isNotEmpty()) {
+            Log.e(TAG, "Timeline LazyColumn keys DUPLICATED. count=${dupes.size} sample=${dupes.take(5)}")
+        } else {
+            Log.d(TAG, "Timeline LazyColumn keys OK. size=${resolvedTimeline.size}")
+        }
     }
 
     val metrics = produceState(
@@ -161,6 +181,23 @@ fun ReviewScreen(
                 )
             }
 
+            /**
+             * Debug-only crash trigger.
+             *
+             * Why:
+             * - Provides a deterministic way to validate CrashCapture + "upload on next launch".
+             * - Only visible in DEBUG builds so production UX is unaffected.
+             */
+            if (BuildConfig.DEBUG) {
+                item {
+                    DebugCrashCard(
+                        onCrash = {
+                            triggerTestCrash("ReviewScreen debug button")
+                        }
+                    )
+                }
+            }
+
             item {
                 Text("Questions: ${metrics.questionCount}")
                 Text("Transcript lines: ${metrics.totalLines}")
@@ -176,7 +213,7 @@ fun ReviewScreen(
                 }
 
                 Spacer(Modifier.height(6.dp))
-                Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+                HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
             }
 
             item {
@@ -193,6 +230,8 @@ fun ReviewScreen(
                     ReviewViewMode.TIMELINE -> {
                         itemsIndexed(
                             items = resolvedTimeline,
+                            // English comments only.
+                            // Keys MUST be unique among siblings. Never use content-based keys for MODEL_RAW.
                             key = { idx, item -> timelineRowKey(idx, item) }
                         ) { _, item ->
                             when (item) {
@@ -205,7 +244,9 @@ fun ReviewScreen(
                     ReviewViewMode.BY_QUESTION -> {
                         itemsIndexed(
                             items = sortedLogs,
-                            key = { _, item -> item.questionId }
+                            // English comments only.
+                            // Be robust even if questionId duplicates by mistake.
+                            key = { idx, item -> "${item.questionId}:$idx" }
                         ) { _, log ->
                             QuestionTranscriptCard(
                                 log = log,
@@ -249,6 +290,53 @@ fun ReviewScreen(
             ) { Text("Go to Export") }
         }
     }
+}
+
+@Composable
+private fun DebugCrashCard(
+    onCrash: () -> Unit
+) {
+    val shape = RoundedCornerShape(16.dp)
+    Card(
+        shape = shape,
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.errorContainer),
+        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        modifier = Modifier.fillMaxWidth()
+    ) {
+        Column(modifier = Modifier.padding(12.dp)) {
+            Text(
+                text = "Debug Tools",
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
+            Spacer(Modifier.height(6.dp))
+            Text(
+                text = "CrashCapture logging test: press the button to force a crash.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onErrorContainer
+            )
+            Spacer(Modifier.height(10.dp))
+            Button(
+                onClick = onCrash,
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Crash (Test)")
+            }
+        }
+    }
+}
+
+/**
+ * Triggers a deterministic crash for logging validation.
+ *
+ * Notes:
+ * - This should only be reachable in DEBUG builds (guarded by UI).
+ * - The goal is to test crash capture + pending upload flow on next launch.
+ */
+private fun triggerTestCrash(reason: String): Nothing {
+    Log.e(TAG, "TEST_CRASH triggered: $reason")
+    throw RuntimeException("TEST_CRASH: $reason")
 }
 
 private enum class ReviewViewMode {
@@ -344,13 +432,11 @@ private fun timelineItemFingerprint(item: ReviewTimelineItem): Int {
 }
 
 private fun timelineRowKey(index: Int, item: ReviewTimelineItem): String {
+    // English comments only.
+    // Compose requires unique keys among sibling items. Use index-based keys to guarantee uniqueness.
     return when (item) {
-        is ReviewTimelineItem.QuestionHeader -> "H:${item.questionId}"
-        is ReviewTimelineItem.Line -> {
-            val l = item.line
-            val rawKey = if (l.kind == ReviewChatKind.MODEL_RAW) rawLineKey(item.questionId, l.text) else null
-            rawKey ?: "L:${item.questionId}:${l.kind.name}:${l.text.length}:${l.text.hashCode()}:$index"
-        }
+        is ReviewTimelineItem.QuestionHeader -> "H:${item.questionId}:$index"
+        is ReviewTimelineItem.Line -> "L:${item.questionId}:${item.line.kind.name}:$index"
     }
 }
 
@@ -416,7 +502,7 @@ private fun TimelineQuestionHeaderCard(header: ReviewTimelineItem.QuestionHeader
             }
 
             Spacer(Modifier.height(10.dp))
-            Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
         }
     }
 }
@@ -562,7 +648,7 @@ private fun QuestionTranscriptCard(
             SelectionContainer { Text(text = log.completionPayload, style = MaterialTheme.typography.bodySmall) }
 
             Spacer(Modifier.height(10.dp))
-            Divider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
+            HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.6f))
             Spacer(Modifier.height(10.dp))
 
             Text(text = "Transcript", style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold)
@@ -768,6 +854,8 @@ private fun logFingerprint(log: ReviewQuestionLog): Int {
 }
 
 private fun rawLineKey(questionId: String, rawText: String): String {
+    // English comments only.
+    // This key is ONLY for expansion-state tracking (not for LazyColumn item keys).
     return "$questionId:raw:${rawText.length}:${rawText.hashCode()}"
 }
 

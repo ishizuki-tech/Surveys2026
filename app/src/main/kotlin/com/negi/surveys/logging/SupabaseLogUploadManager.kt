@@ -2,7 +2,7 @@
  * =====================================================================
  *  IshizukiTech LLC — Survey App (Nav3 Frame)
  *  ---------------------------------------------------------------------
- *  File: LogUploadManager.kt
+ *  File: SupabaseLogUploadManager.kt
  *  Author: Shu Ishizuki
  *  License: MIT License
  *  © 2026 IshizukiTech LLC. All rights reserved.
@@ -19,16 +19,8 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 
-/**
- * Uploads log bundles to Supabase Storage using plain HttpURLConnection.
- *
- * Security notes:
- * - Never embed a Supabase service_role key in the app.
- * - For production, prefer Signed Upload URLs or an Edge Function.
- * - This client uses anon key (or a user JWT) and requires appropriate Storage policies.
- */
-object LogUploadManager {
-    private const val TAG = "LogUpload"
+object SupabaseLogUploadManager {
+    private const val TAG = "SupabaseLogUpload"
 
     fun isConfigured(): Boolean {
         return BuildConfig.SUPABASE_URL.isNotBlank() &&
@@ -75,7 +67,8 @@ object LogUploadManager {
 
     fun tryUploadPendingCrashesBlocking(
         context: android.content.Context,
-        userJwt: String? = null
+        userJwt: String? = null,
+        moveOnSuccess: Boolean = true
     ): Result<Int> {
         if (!isConfigured()) {
             AppLog.w(TAG, "tryUploadPendingCrashes: Supabase not configured; skip")
@@ -99,13 +92,22 @@ object LogUploadManager {
             fileName = zip.name
         )
 
-        AppLog.i(TAG, "uploadCrash: start objectPath=$objectPath crashes=${pending.size} size=${zip.length()} file=${zip.name}")
+        AppLog.i(
+            TAG,
+            "uploadCrash: start objectPath=$objectPath crashes=${pending.size} size=${zip.length()} file=${zip.name} moveOnSuccess=$moveOnSuccess"
+        )
 
         val result = uploadZipToSupabase(zip, objectPath, userJwt)
 
         return result.map {
-            val uploaded = LogFiles.moveCrashFilesToUploaded(context, pending)
-            AppLog.i(TAG, "uploadCrash: ok objectPath=$it moved=${uploaded.size}")
+            val movedCount = if (moveOnSuccess) {
+                val uploaded = LogFiles.moveCrashFilesToUploaded(context, pending)
+                uploaded.size
+            } else {
+                0
+            }
+
+            AppLog.i(TAG, "uploadCrash: ok objectPath=$it moved=$movedCount")
             runCatching { zip.delete() }
             pending.size
         }.onFailure { t ->
@@ -128,7 +130,7 @@ object LogUploadManager {
         val anonKey = BuildConfig.SUPABASE_ANON_KEY.trim()
         val authBearer = userJwt?.trim().takeUnless { it.isNullOrBlank() } ?: anonKey
 
-        return httpUpload(
+        return httpUploadWithFallback(
             url = uploadUrl,
             apikey = anonKey,
             authorizationBearer = authBearer,
@@ -137,7 +139,47 @@ object LogUploadManager {
         ).map { objectPath }
     }
 
-    private fun httpUpload(
+    /**
+     * Tries POST first, and retries with PUT only when the server explicitly rejects the method (405).
+     *
+     * Why:
+     * - Supabase Storage is typically POST-friendly, but some deployments / proxies may require PUT.
+     * - We keep the retry narrow to avoid unintended double uploads on other errors.
+     */
+    private fun httpUploadWithFallback(
+        url: String,
+        apikey: String,
+        authorizationBearer: String,
+        contentType: String,
+        body: ByteArray
+    ): Result<Unit> {
+        val first = httpUploadOnce(
+            method = "POST",
+            url = url,
+            apikey = apikey,
+            authorizationBearer = authorizationBearer,
+            contentType = contentType,
+            body = body
+        )
+
+        val ex = first.exceptionOrNull()
+        if (ex is HttpStatusException && ex.code == 405) {
+            AppLog.w(TAG, "httpUpload: POST rejected (405); retrying with PUT")
+            return httpUploadOnce(
+                method = "PUT",
+                url = url,
+                apikey = apikey,
+                authorizationBearer = authorizationBearer,
+                contentType = contentType,
+                body = body
+            )
+        }
+
+        return first
+    }
+
+    private fun httpUploadOnce(
+        method: String,
         url: String,
         apikey: String,
         authorizationBearer: String,
@@ -145,31 +187,61 @@ object LogUploadManager {
         body: ByteArray
     ): Result<Unit> {
         return runCatching {
-            val conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "POST"
-                doOutput = true
-                connectTimeout = 20_000
-                readTimeout = 30_000
-                setRequestProperty("Authorization", "Bearer $authorizationBearer")
-                setRequestProperty("apikey", apikey)
-                setRequestProperty("Content-Type", contentType)
-                setRequestProperty("x-upsert", "true")
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(url).openConnection() as HttpURLConnection).apply {
+                    requestMethod = method
+                    doOutput = true
+                    connectTimeout = 20_000
+                    readTimeout = 30_000
+                    setRequestProperty("Authorization", "Bearer $authorizationBearer")
+                    setRequestProperty("apikey", apikey)
+                    setRequestProperty("Content-Type", contentType)
+                    setRequestProperty("x-upsert", "true")
+                }
+
+                conn.outputStream.use { os ->
+                    os.write(body)
+                    os.flush()
+                }
+
+                val code = conn.responseCode
+                val ok = code in 200..299
+                val resp = runCatching {
+                    val stream = if (ok) conn.inputStream else conn.errorStream
+                    stream?.readBytes()?.toString(Charsets.UTF_8) ?: ""
+                }.getOrDefault("")
+
+                if (!ok) {
+                    throw HttpStatusException(
+                        code = code,
+                        method = method,
+                        endpoint = url,
+                        bodySnippet = resp.take(900)
+                    )
+                }
+            } finally {
+                runCatching { conn?.disconnect() }
             }
+        }
+    }
 
-            conn.outputStream.use { os ->
-                os.write(body)
-                os.flush()
-            }
-
-            val code = conn.responseCode
-            val ok = code in 200..299
-            val resp = runCatching {
-                val stream = if (ok) conn.inputStream else conn.errorStream
-                stream?.readBytes()?.toString(Charsets.UTF_8) ?: ""
-            }.getOrDefault("")
-
-            if (!ok) {
-                throw IOException("HTTP $code: ${resp.take(900)} endpoint=$url")
+    /**
+     * HTTP failure with status code and a short response body snippet.
+     *
+     * This makes Logcat/AppLog actionable for policy issues (401/403), routing (404),
+     * or method mismatch (405).
+     */
+    private class HttpStatusException(
+        val code: Int,
+        val method: String,
+        val endpoint: String,
+        val bodySnippet: String
+    ) : IOException(buildMessage(code, method, endpoint, bodySnippet)) {
+        companion object {
+            private fun buildMessage(code: Int, method: String, endpoint: String, body: String): String {
+                val b = body.replace('\n', ' ').replace('\r', ' ')
+                return "HTTP $code ($method): ${b.take(900)} endpoint=$endpoint"
             }
         }
     }

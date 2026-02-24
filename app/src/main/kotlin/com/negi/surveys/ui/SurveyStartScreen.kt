@@ -34,10 +34,13 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.negi.surveys.BuildConfig
+import com.negi.surveys.logging.AppLog
 import kotlinx.coroutines.delay
 
 private const val TAG = "SurveyStartScreen"
@@ -61,15 +64,23 @@ fun SurveyStartScreen(
     onBack: () -> Unit,
     debugInfo: DebugInfo? = null
 ) {
+    val latestOnBegin by rememberUpdatedState(onBegin)
+    val latestOnBack by rememberUpdatedState(onBack)
+
     /**
      * Guard flag to prevent duplicate navigations caused by rapid multiple taps.
-     * rememberSaveable keeps behavior stable across recompositions/rotations.
-     * An automatic unlock timeout acts as a safety valve in case navigation fails.
+     *
+     * Note:
+     * - This is a transient UI lock; we intentionally do NOT save it across rotations.
+     * - An automatic unlock timeout acts as a safety valve in case navigation fails.
      */
-    var beginLocked by rememberSaveable { mutableStateOf(false) }
+    var beginLocked by remember { mutableStateOf(false) }
 
-    LaunchedEffect(Unit) {
-        Log.d(TAG, "SurveyStartScreen: composed")
+    if (BuildConfig.DEBUG) {
+        LaunchedEffect(Unit) {
+            AppLog.d(TAG, "composed")
+            Log.d(TAG, "composed")
+        }
     }
 
     /**
@@ -81,7 +92,8 @@ fun SurveyStartScreen(
         delay(BEGIN_LOCK_TIMEOUT_MS)
         if (beginLocked) {
             beginLocked = false
-            Log.d(TAG, "SurveyStartScreen: begin auto-unlocked after timeout")
+            AppLog.w(TAG, "begin auto-unlocked after timeout")
+            Log.d(TAG, "begin auto-unlocked after timeout")
         }
     }
 
@@ -115,8 +127,9 @@ fun SurveyStartScreen(
         ) {
             OutlinedButton(
                 onClick = {
-                    Log.d(TAG, "SurveyStartScreen: back clicked")
-                    onBack()
+                    AppLog.d(TAG, "click: back")
+                    Log.d(TAG, "click: back")
+                    latestOnBack()
                 },
                 enabled = !beginLocked
             ) {
@@ -126,12 +139,14 @@ fun SurveyStartScreen(
             Button(
                 onClick = {
                     if (beginLocked) {
-                        Log.d(TAG, "SurveyStartScreen: begin ignored (locked)")
+                        AppLog.w(TAG, "begin ignored (locked)")
+                        Log.d(TAG, "begin ignored (locked)")
                         return@Button
                     }
                     beginLocked = true
-                    Log.d(TAG, "SurveyStartScreen: begin clicked")
-                    onBegin()
+                    AppLog.i(TAG, "click: begin")
+                    Log.d(TAG, "click: begin")
+                    latestOnBegin()
                 },
                 enabled = !beginLocked
             ) {

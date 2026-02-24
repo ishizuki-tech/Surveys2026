@@ -13,9 +13,9 @@
 
 package com.negi.surveys
 
-import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.negi.surveys.logging.AppLog
 import com.negi.surveys.ui.ReviewChatLine
 import com.negi.surveys.ui.ReviewQuestionLog
 import com.negi.surveys.ui.ReviewTimelineItem
@@ -24,7 +24,7 @@ import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
-import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.flow.updateAndGet
 
 /**
  * Session-lifetime state holder for the Nav3 prototype.
@@ -99,34 +99,37 @@ class SurveySessionViewModel : ViewModel() {
      * Rule:
      * - Prefer logs that look "more complete" (more lines / longer payload / longer prompt).
      * - Always allow changes in isSkipped (explicit user action).
+     *
+     * Concurrency note:
+     * - StateFlow.update() may retry the lambda under contention.
+     * - Do NOT mutate outer variables inside the update lambda. Determine acceptance from final state.
      */
     fun upsertLog(log: ReviewQuestionLog) {
-        var accepted = true
+        val qid = log.questionId
 
-        _logsMap.update { prev ->
+        val after = _logsMap.updateAndGet { prev ->
+            val existing = prev[qid]
+            val should = existing == null || shouldAcceptUpdate(existing, log)
+            if (!should) return@updateAndGet prev
+
             val next = prev.toMutableMap()
-            val existing = next[log.questionId]
-            if (existing == null) {
-                next[log.questionId] = log
-            } else {
-                val should = shouldAcceptUpdate(existing, log)
-                accepted = should
-                if (should) {
-                    next[log.questionId] = log
-                }
-            }
+            next[qid] = log
             next.toMap()
         }
 
+        val accepted = after[qid] === log
+
         if (accepted) {
-            Log.d(
+            AppLog.d(
                 TAG,
-                "upsertLog: accepted qid=${log.questionId} skipped=${log.isSkipped} lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
+                "upsertLog: accepted qid=$qid skipped=${log.isSkipped} " +
+                        "lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
             )
         } else {
-            Log.w(
+            AppLog.w(
                 TAG,
-                "upsertLog: dropped(stale) qid=${log.questionId} skipped=${log.isSkipped} lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
+                "upsertLog: dropped(stale) qid=$qid skipped=${log.isSkipped} " +
+                        "lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
             )
         }
     }
@@ -136,7 +139,7 @@ class SurveySessionViewModel : ViewModel() {
      */
     fun clear() {
         _logsMap.value = emptyMap()
-        Log.d(TAG, "clear: session cleared")
+        AppLog.i(TAG, "clear: session cleared")
     }
 
     /**
@@ -228,6 +231,7 @@ class SurveySessionViewModel : ViewModel() {
         val incomingPrompt = incoming.prompt.length
         if (incomingPrompt != existingPrompt) return incomingPrompt > existingPrompt
 
+        // If all heuristics are tied, accept the incoming update to allow minor edits.
         return true
     }
 

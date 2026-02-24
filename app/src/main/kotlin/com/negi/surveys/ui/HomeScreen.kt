@@ -13,7 +13,6 @@
 
 package com.negi.surveys.ui
 
-import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -32,8 +31,13 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import com.negi.surveys.BuildConfig
+import com.negi.surveys.logging.AppLog
 
 private const val TAG = "HomeScreen"
 
@@ -56,8 +60,14 @@ fun HomeScreen(
     onExport: () -> Unit,
     debugInfo: DebugInfo? = null
 ) {
-    LaunchedEffect(Unit) {
-        Log.d(TAG, "HomeScreen: composed")
+    // Always call the latest callbacks, even if the lambdas change across recompositions.
+    val latestOnStartSurvey by rememberUpdatedState(onStartSurvey)
+    val latestOnExport by rememberUpdatedState(onExport)
+
+    if (BuildConfig.DEBUG) {
+        LaunchedEffect(Unit) {
+            AppLog.d(TAG, "composed")
+        }
     }
 
     Column(
@@ -70,7 +80,8 @@ fun HomeScreen(
             .windowInsetsPadding(
                 WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
             )
-            .padding(16.dp),
+            .padding(16.dp)
+            .testTag("home_root"),
         verticalArrangement = Arrangement.Top
     ) {
         Text(
@@ -87,10 +98,12 @@ fun HomeScreen(
 
         Button(
             onClick = {
-                Log.d(TAG, "HomeScreen: onStartSurvey clicked")
-                onStartSurvey()
+                AppLog.i(TAG, "click: startSurvey")
+                latestOnStartSurvey()
             },
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("home_start_survey")
         ) {
             Text("Start Survey")
         }
@@ -99,10 +112,12 @@ fun HomeScreen(
 
         OutlinedButton(
             onClick = {
-                Log.d(TAG, "HomeScreen: onExport clicked")
-                onExport()
+                AppLog.i(TAG, "click: export")
+                latestOnExport()
             },
-            modifier = Modifier.fillMaxWidth()
+            modifier = Modifier
+                .fillMaxWidth()
+                .testTag("home_export")
         ) {
             Text("Export")
         }

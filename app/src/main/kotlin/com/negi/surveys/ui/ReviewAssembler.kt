@@ -17,6 +17,7 @@ import com.negi.surveys.chat.ChatDraftStore
 import com.negi.surveys.chat.ChatMessage
 import com.negi.surveys.chat.ChatRole
 import com.negi.surveys.chat.DraftKey
+import java.security.MessageDigest
 
 /**
  * Review assembly helpers.
@@ -93,41 +94,76 @@ object ReviewAssembler {
      * - ASSISTANT -> split into AI + FOLLOW_UP (+ optional MODEL_RAW if model output exists)
      * - MODEL (streaming bubble) -> MODEL_RAW
      *
-     * Important:
-     * - This assumes ChatMessage exposes the fields used by your VM:
-     *   role/text/assistantMessage/followUpQuestion/streamText.
-     * - If your ChatMessage names differ, adjust only this adapter.
+     * De-dup policy (important for Compose Lazy* keys safety):
+     * - If ANY ASSISTANT message contains an embedded model output (streamText),
+     *   then MODEL-role messages are treated as transient and are ignored.
+     * - MODEL_RAW lines are de-duplicated by content hash to avoid double counting
+     *   (e.g., when both embedded output and leftover MODEL bubble exist).
      */
     private fun List<ChatMessage>.toReviewLines(): List<ReviewChatLine> {
         if (isEmpty()) return emptyList()
 
+        // English comments only.
+        /** Prefer embedded model output on ASSISTANT messages over transient MODEL bubbles. */
+        val hasEmbeddedModelOutput = any { it.role == ChatRole.ASSISTANT && !it.streamText.isNullOrBlank() }
+
         val out = ArrayList<ReviewChatLine>(size * 2)
+
+        // English comments only.
+        /** De-duplicate MODEL_RAW lines by content to prevent identical keys in UI. */
+        val seenModelRaw = HashSet<String>(8)
+
+        fun addLine(kind: ReviewChatKind, text: String) {
+            val t = text.trim()
+            if (t.isEmpty()) return
+
+            if (kind == ReviewChatKind.MODEL_RAW) {
+                val sig = sha256Hex(t)
+                if (!seenModelRaw.add(sig)) return
+            }
+
+            out += ReviewChatLine(kind, t)
+        }
 
         for (m in this) {
             when (m.role) {
                 ChatRole.USER -> {
-                    val t = m.text.orEmpty().trim()
-                    if (t.isNotEmpty()) out += ReviewChatLine(ReviewChatKind.USER, t)
+                    addLine(ReviewChatKind.USER, m.text.orEmpty())
                 }
 
                 ChatRole.ASSISTANT -> {
-                    val ai = m.assistantMessage.orEmpty().trim()
-                    val fu = m.followUpQuestion.orEmpty().trim()
-
-                    if (ai.isNotEmpty()) out += ReviewChatLine(ReviewChatKind.AI, ai)
-                    if (fu.isNotEmpty()) out += ReviewChatLine(ReviewChatKind.FOLLOW_UP, fu)
-
-                    val raw = m.streamText.orEmpty().trim()
-                    if (raw.isNotEmpty()) out += ReviewChatLine(ReviewChatKind.MODEL_RAW, raw)
+                    addLine(ReviewChatKind.AI, m.assistantMessage.orEmpty())
+                    addLine(ReviewChatKind.FOLLOW_UP, m.followUpQuestion.orEmpty())
+                    addLine(ReviewChatKind.MODEL_RAW, m.streamText.orEmpty())
                 }
 
                 ChatRole.MODEL -> {
-                    val raw = (m.streamText ?: m.text).orEmpty().trim()
-                    if (raw.isNotEmpty()) out += ReviewChatLine(ReviewChatKind.MODEL_RAW, raw)
+                    if (hasEmbeddedModelOutput) {
+                        // Skip transient streaming bubbles when the embedded result exists.
+                        continue
+                    }
+                    val raw = (m.streamText ?: m.text).orEmpty()
+                    addLine(ReviewChatKind.MODEL_RAW, raw)
                 }
             }
         }
 
         return out
+    }
+
+    // English comments only.
+    /** SHA-256 hex for content de-dup signatures (fast enough for review assembly). */
+    private fun sha256Hex(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = digest.digest(text.toByteArray(Charsets.UTF_8))
+
+        val hex = "0123456789abcdef"
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt() and 0xFF
+            sb.append(hex[(v ushr 4) and 0xF])
+            sb.append(hex[v and 0xF])
+        }
+        return sb.toString()
     }
 }
