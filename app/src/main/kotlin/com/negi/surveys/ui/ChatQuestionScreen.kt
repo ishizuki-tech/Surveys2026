@@ -88,6 +88,7 @@ import com.negi.surveys.chat.FakeSlmRepository
 import com.negi.surveys.chat.InMemoryChatDraftStore
 import com.negi.surveys.chat.Repository
 import com.negi.surveys.chat.SlmAnswerValidator
+import java.util.Locale
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
@@ -112,6 +113,7 @@ fun ChatQuestionScreen(
     onBack: () -> Unit
 ) {
     val onNextLatest by rememberUpdatedState(onNext)
+    val onBackLatest by rememberUpdatedState(onBack)
 
     /**
      * IMPORTANT:
@@ -129,8 +131,10 @@ fun ChatQuestionScreen(
      */
     val draftStore: ChatDraftStore = remember { ChatDraftStoreHolder.store }
 
-    val draftKey = remember(questionId, prompt) {
-        DraftKey(questionId = questionId, promptHash = prompt.hashCode())
+    val promptHash = remember(prompt) { prompt.hashCode() }
+
+    val draftKey = remember(questionId, promptHash) {
+        DraftKey(questionId = questionId, promptHash = promptHash)
     }
 
     /**
@@ -145,7 +149,7 @@ fun ChatQuestionScreen(
      * Validator:
      * - Uses the session-shared streamBridge so streaming state does not reset per screen instance.
      */
-    val validator: AnswerValidator = remember(questionId, prompt, repo, streamBridge) {
+    val validator: AnswerValidator = remember(questionId, promptHash, repo, streamBridge) {
         SlmAnswerValidator(
             repository = repo,
             streamBridge = streamBridge,
@@ -153,8 +157,8 @@ fun ChatQuestionScreen(
         )
     }
 
-    val vmKey = remember(questionId, prompt) {
-        "ChatQuestionViewModel:$questionId:${prompt.hashCode()}"
+    val vmKey = remember(questionId, promptHash) {
+        "ChatQuestionViewModel:$questionId:$promptHash"
     }
 
     val vm: ChatQuestionViewModel = viewModel(
@@ -312,7 +316,7 @@ fun ChatQuestionScreen(
                 onBack = {
                     Log.d(TAG, "Back clicked. qid=$questionId busy=$isBusy")
                     vm.cancelValidation("back_click")
-                    onBack()
+                    onBackLatest()
                 },
                 onSubmit = {
                     Log.d(TAG, "Submit clicked. qid=$questionId len=${input.length}")
@@ -982,9 +986,10 @@ private fun normalizeFollowUp(text: String?): String? {
         "question:",
         "next question:"
     )
-    val lower = t.lowercase()
+
+    val lower0 = t.lowercase(Locale.US)
     for (p in prefixPatterns) {
-        if (lower.startsWith(p)) {
+        if (lower0.startsWith(p)) {
             t = t.drop(p.length).trim()
             break
         }
@@ -992,7 +997,7 @@ private fun normalizeFollowUp(text: String?): String? {
 
     if (t.isBlank()) return null
 
-    val l2 = t.lowercase()
+    val l2 = t.lowercase(Locale.US)
     val garbage = setOf(
         "none", "(none)", "n/a", "na", "null", "nil",
         "no", "nope", "no follow up", "no follow-up",

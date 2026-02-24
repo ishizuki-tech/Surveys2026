@@ -18,6 +18,7 @@ import com.negi.surveys.chat.ChatMessage
 import com.negi.surveys.chat.ChatRole
 import com.negi.surveys.chat.DraftKey
 import java.security.MessageDigest
+import java.util.Locale
 
 /**
  * Review assembly helpers.
@@ -57,27 +58,52 @@ object ReviewAssembler {
         if (defs.isEmpty()) return emptyList()
 
         return defs.map { def ->
-            val key = keyForQuestion(def.questionId)
+            val qid = def.questionId.trim()
+            val pr = def.prompt
+
+            val key = keyForQuestion(qid)
             val draft = draftStore.load(key)
 
             if (draft == null) {
-                ReviewQuestionLog(
-                    questionId = def.questionId,
-                    prompt = def.prompt,
+                ReviewQuestionLog.of(
+                    questionId = qid,
+                    prompt = pr,
                     isSkipped = true,
-                    completionPayload = "(no draft)",
+                    completionPayload = buildMetaPayload(
+                        kind = PayloadKind.SKIPPED_NO_DRAFT,
+                        questionId = qid,
+                        promptHash = key.promptHash
+                    ),
                     lines = emptyList()
                 )
             } else {
-                val lines = draft.messages.toReviewLines()
-                val completion = draft.completionPayload?.trim().orEmpty().ifEmpty { "(no completionPayload)" }
+                val lines = draft.messages.toReviewLines(
+                    questionId = qid,
+                    prompt = pr
+                )
 
-                val isSkipped = lines.none { it.kind == ReviewChatKind.USER } &&
-                        completion == "(no completionPayload)"
+                val hasUser = lines.any { it.kind == ReviewChatKind.USER }
 
-                ReviewQuestionLog(
-                    questionId = def.questionId,
-                    prompt = def.prompt,
+                val completionRaw = draft.completionPayload?.trim().orEmpty()
+                val completion = when {
+                    completionRaw.isNotEmpty() -> completionRaw
+                    hasUser -> buildMetaPayload(
+                        kind = PayloadKind.DRAFT_NO_COMPLETION,
+                        questionId = qid,
+                        promptHash = key.promptHash
+                    )
+                    else -> buildMetaPayload(
+                        kind = PayloadKind.SKIPPED_NO_COMPLETION,
+                        questionId = qid,
+                        promptHash = key.promptHash
+                    )
+                }
+
+                val isSkipped = (!hasUser) && completionRaw.isBlank()
+
+                ReviewQuestionLog.of(
+                    questionId = qid,
+                    prompt = pr,
                     isSkipped = isSkipped,
                     completionPayload = completion,
                     lines = lines
@@ -85,6 +111,10 @@ object ReviewAssembler {
             }
         }
     }
+
+    // ---------------------------------------------------------------------
+    // Transcript conversion
+    // ---------------------------------------------------------------------
 
     /**
      * Convert chat draft messages into review transcript lines.
@@ -94,13 +124,19 @@ object ReviewAssembler {
      * - ASSISTANT -> split into AI + FOLLOW_UP (+ optional MODEL_RAW if model output exists)
      * - MODEL (streaming bubble) -> MODEL_RAW
      *
-     * De-dup policy (important for Compose Lazy* keys safety):
+     * De-dup policy:
      * - If ANY ASSISTANT message contains an embedded model output (streamText),
      *   then MODEL-role messages are treated as transient and are ignored.
-     * - MODEL_RAW lines are de-duplicated by content hash to avoid double counting
-     *   (e.g., when both embedded output and leftover MODEL bubble exist).
+     * - MODEL_RAW lines are de-duplicated by SHA-256(signature) to avoid double counting.
+     *
+     * Seed filtering:
+     * - Drop the initial "seed" message from ChatQuestionViewModel:
+     *   assistantMessage="Question: <qid>" + followUpQuestion="<prompt>" (before any USER line).
      */
-    private fun List<ChatMessage>.toReviewLines(): List<ReviewChatLine> {
+    private fun List<ChatMessage>.toReviewLines(
+        questionId: String,
+        prompt: String
+    ): List<ReviewChatLine> {
         if (isEmpty()) return emptyList()
 
         // English comments only.
@@ -110,8 +146,11 @@ object ReviewAssembler {
         val out = ArrayList<ReviewChatLine>(size * 2)
 
         // English comments only.
-        /** De-duplicate MODEL_RAW lines by content to prevent identical keys in UI. */
+        /** De-duplicate MODEL_RAW lines by content signature to reduce double-counting. */
         val seenModelRaw = HashSet<String>(8)
+
+        var seenUser = false
+        val promptTrimmed = prompt.trim()
 
         fun addLine(kind: ReviewChatKind, text: String) {
             val t = text.trim()
@@ -122,34 +161,145 @@ object ReviewAssembler {
                 if (!seenModelRaw.add(sig)) return
             }
 
-            out += ReviewChatLine(kind, t)
+            out += ReviewChatLine(kind = kind, text = t)
         }
 
         for (m in this) {
             when (m.role) {
                 ChatRole.USER -> {
-                    addLine(ReviewChatKind.USER, m.text.orEmpty())
+                    val t = m.text.trim()
+                    if (t.isNotEmpty()) {
+                        addLine(ReviewChatKind.USER, t)
+                        seenUser = true
+                    }
                 }
 
                 ChatRole.ASSISTANT -> {
-                    addLine(ReviewChatKind.AI, m.assistantMessage.orEmpty())
-                    addLine(ReviewChatKind.FOLLOW_UP, m.followUpQuestion.orEmpty())
-                    addLine(ReviewChatKind.MODEL_RAW, m.streamText.orEmpty())
+                    val a = m.assistantMessage?.trim().orEmpty()
+                    val q = normalizeFollowUp(m.followUpQuestion)
+
+                    // English comments only.
+                    /** Drop the initial seed prompt bubble to avoid duplication in Review. */
+                    val isSeedPrompt =
+                        !seenUser &&
+                                a == "Question: $questionId" &&
+                                (q?.trim().orEmpty() == promptTrimmed)
+
+                    if (isSeedPrompt) {
+                        continue
+                    }
+
+                    if (a.isNotEmpty()) addLine(ReviewChatKind.AI, a)
+                    if (!q.isNullOrBlank() && q.trim() != promptTrimmed) addLine(ReviewChatKind.FOLLOW_UP, q)
+
+                    val embedded = m.streamText?.trim().orEmpty()
+                    if (embedded.isNotEmpty()) addLine(ReviewChatKind.MODEL_RAW, embedded)
                 }
 
                 ChatRole.MODEL -> {
                     if (hasEmbeddedModelOutput) {
-                        // Skip transient streaming bubbles when the embedded result exists.
+                        // Skip transient streaming bubbles when an embedded result exists.
                         continue
                     }
-                    val raw = (m.streamText ?: m.text).orEmpty()
-                    addLine(ReviewChatKind.MODEL_RAW, raw)
+                    val raw = (m.streamText?.takeIf { it.isNotBlank() } ?: m.text).trim()
+                    if (raw.isNotEmpty()) addLine(ReviewChatKind.MODEL_RAW, raw)
                 }
             }
         }
 
         return out
     }
+
+    // ---------------------------------------------------------------------
+    // Follow-up normalization
+    // ---------------------------------------------------------------------
+
+    /**
+     * Normalizes a follow-up question and removes garbage values.
+     *
+     * Notes:
+     * - Avoid Locale pitfalls by using Locale.US for case normalization.
+     */
+    private fun normalizeFollowUp(text: String?): String? {
+        val raw = text ?: return null
+        var t = raw.replace("\u0000", "").trim()
+        if (t.isBlank()) return null
+
+        val prefixPatterns = listOf(
+            "follow-up question:",
+            "follow up question:",
+            "follow-up:",
+            "follow up:",
+            "followup:",
+            "question:",
+            "next question:"
+        )
+
+        val lower0 = t.lowercase(Locale.US)
+        for (p in prefixPatterns) {
+            if (lower0.startsWith(p)) {
+                t = t.drop(p.length).trim()
+                break
+            }
+        }
+
+        val l2 = t.lowercase(Locale.US)
+        val garbage = setOf(
+            "none", "(none)", "n/a", "na", "null", "nil",
+            "no", "nope", "no follow up", "no follow-up",
+            "skip", "0", "-"
+        )
+        if (t.isBlank()) return null
+        if (l2 in garbage) return null
+        if (t.length < 3) return null
+
+        return t
+    }
+
+    // ---------------------------------------------------------------------
+    // Payload helpers
+    // ---------------------------------------------------------------------
+
+    private enum class PayloadKind {
+        SKIPPED_NO_DRAFT,
+        SKIPPED_NO_COMPLETION,
+        DRAFT_NO_COMPLETION
+    }
+
+    /**
+     * Build a non-PII payload fallback.
+     *
+     * Notes:
+     * - This is safe to export/log.
+     * - Do NOT include user answers.
+     */
+    private fun buildMetaPayload(kind: PayloadKind, questionId: String, promptHash: Int): String {
+        return buildString {
+            append("[")
+            append(
+                when (kind) {
+                    PayloadKind.SKIPPED_NO_DRAFT -> "SKIPPED"
+                    PayloadKind.SKIPPED_NO_COMPLETION -> "SKIPPED"
+                    PayloadKind.DRAFT_NO_COMPLETION -> "DRAFT"
+                }
+            )
+            append("]\n")
+            append("QUESTION_ID: ").append(questionId).append('\n')
+            append("PROMPT_HASH: ").append(promptHash).append('\n')
+            append(
+                when (kind) {
+                    PayloadKind.SKIPPED_NO_DRAFT -> "REASON: no_draft\n"
+                    PayloadKind.SKIPPED_NO_COMPLETION -> "REASON: no_completion\n"
+                    PayloadKind.DRAFT_NO_COMPLETION -> "REASON: no_completion_yet\n"
+                }
+            )
+            append("ANSWER: (not included)\n")
+        }.trim()
+    }
+
+    // ---------------------------------------------------------------------
+    // Signatures
+    // ---------------------------------------------------------------------
 
     // English comments only.
     /** SHA-256 hex for content de-dup signatures (fast enough for review assembly). */

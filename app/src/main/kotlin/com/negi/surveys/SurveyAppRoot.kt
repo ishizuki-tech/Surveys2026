@@ -40,6 +40,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -99,8 +100,16 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     }
 
     BackHandler(enabled = canPop) {
-        Log.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
-        AppLog.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
+        if (AppBuildConfig.DEBUG) {
+            Log.d(
+                TAG,
+                "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}"
+            )
+        }
+        AppLog.d(
+            TAG,
+            "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}"
+        )
         nav.pop()
     }
 
@@ -111,17 +120,14 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         )
     }
 
-    val logsState = sessionVm.logs.collectAsStateWithLifecycle()
-    val logs = logsState.value
-
-    val exportTextState = sessionVm.exportJson.collectAsStateWithLifecycle()
-    val exportText = exportTextState.value
+    val logs by sessionVm.logs.collectAsStateWithLifecycle()
+    val exportText by sessionVm.exportJson.collectAsStateWithLifecycle()
 
     val streamBridge: ChatStreamBridge = remember {
         ChatStreamBridge(
-            logger = {
-                Log.d("StreamBridge", it)
-                AppLog.d("StreamBridge", it)
+            logger = { msg ->
+                if (AppBuildConfig.DEBUG) Log.d("StreamBridge", msg)
+                AppLog.d("StreamBridge", msg)
             }
         )
     }
@@ -183,12 +189,15 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         )
     }
 
-    val latestDebugInfo by rememberUpdatedState(debugInfo)
+    // English comments only.
+    /** Keep State wrappers stable so entryProvider can read the latest values without being rebuilt. */
+    val debugInfoState: State<DebugInfo> = rememberUpdatedState(debugInfo)
 
     val appContext = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
+
     var uploadStatus by remember { mutableStateOf<String?>(null) }
-    val latestUploadStatus by rememberUpdatedState(uploadStatus)
+    val uploadStatusState: State<String?> = rememberUpdatedState(uploadStatus)
 
     val startManualUpload: (String) -> Unit = remember(appContext, scope) {
         { from ->
@@ -212,7 +221,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 }
 
                 AppLog.i(TAG, "manual upload: $summary")
-                Log.d(TAG, "manual upload: $summary")
+                if (AppBuildConfig.DEBUG) Log.d(TAG, "manual upload: $summary")
 
                 withContext(Dispatchers.Main) {
                     uploadStatus = summary
@@ -222,13 +231,13 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         }
     }
 
-    val entries: (NavKey) -> NavEntry<NavKey> = remember(nav, prompts, sessionVm) {
+    val entries: (NavKey) -> NavEntry<NavKey> = remember(nav, prompts, sessionVm, startManualUpload) {
         entryProvider {
             entry<Home> {
                 HomeScreen(
                     onStartSurvey = { nav.startSurvey() },
                     onExport = { nav.goExport() },
-                    debugInfo = latestDebugInfo
+                    debugInfo = debugInfoState.value
                 )
             }
 
@@ -236,7 +245,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 SurveyStartScreen(
                     onBegin = { nav.beginQuestions("Q1") },
                     onBack = { nav.pop() },
-                    debugInfo = latestDebugInfo
+                    debugInfo = debugInfoState.value
                 )
             }
 
@@ -259,21 +268,19 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
             }
 
             entry<Review> {
-                val reviewLogsState = sessionVm.logs.collectAsStateWithLifecycle()
-                val reviewLogs = reviewLogsState.value
+                val reviewLogs by sessionVm.logs.collectAsStateWithLifecycle()
 
                 ReviewScreen(
                     logs = reviewLogs,
                     onExport = { nav.goExport() },
                     onBack = { nav.pop() },
                     onUploadLogs = { startManualUpload("review") },
-                    uploadStatusLine = latestUploadStatus
+                    uploadStatusLine = uploadStatusState.value
                 )
             }
 
             entry<Export> {
-                val exportState = sessionVm.exportJson.collectAsStateWithLifecycle()
-                val payload = exportState.value
+                val payload by sessionVm.exportJson.collectAsStateWithLifecycle()
 
                 ExportScreen(
                     exportText = payload,

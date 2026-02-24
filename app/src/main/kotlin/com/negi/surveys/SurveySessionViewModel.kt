@@ -19,9 +19,11 @@ import com.negi.surveys.logging.AppLog
 import com.negi.surveys.ui.ReviewChatLine
 import com.negi.surveys.ui.ReviewQuestionLog
 import com.negi.surveys.ui.ReviewTimelineItem
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.updateAndGet
@@ -35,7 +37,7 @@ import kotlinx.coroutines.flow.updateAndGet
  *
  * Notes:
  * - This is intentionally simple: no persistence yet (SavedStateHandle/file) in this step.
- * - We assume ReviewQuestionLog has a canonical "completionPayload" field.
+ * - Heavy transforms (sort/export/timeline) are moved off Main via flowOn(Dispatchers.Default).
  */
 class SurveySessionViewModel : ViewModel() {
 
@@ -62,6 +64,7 @@ class SurveySessionViewModel : ViewModel() {
                     )
                     .map { it.first }
             }
+            .flowOn(Dispatchers.Default)
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /**
@@ -74,6 +77,7 @@ class SurveySessionViewModel : ViewModel() {
     val timeline: StateFlow<List<ReviewTimelineItem>> =
         logs
             .map { buildTimelineV1(it) }
+            .flowOn(Dispatchers.Default)
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
 
     /**
@@ -86,6 +90,7 @@ class SurveySessionViewModel : ViewModel() {
     val exportJson: StateFlow<String> =
         logs
             .map { buildExportJsonV1(it) }
+            .flowOn(Dispatchers.Default)
             .stateIn(viewModelScope, SharingStarted.Eagerly, EXPORT_JSON_EMPTY)
 
     /**
@@ -101,35 +106,36 @@ class SurveySessionViewModel : ViewModel() {
      * - Always allow changes in isSkipped (explicit user action).
      *
      * Concurrency note:
-     * - StateFlow.update() may retry the lambda under contention.
+     * - StateFlow.updateAndGet() may retry the lambda under contention.
      * - Do NOT mutate outer variables inside the update lambda. Determine acceptance from final state.
      */
     fun upsertLog(log: ReviewQuestionLog) {
-        val qid = log.questionId
+        val qid = log.questionId.trim()
+        val normalized = if (qid == log.questionId) log else log.copy(questionId = qid)
 
         val after = _logsMap.updateAndGet { prev ->
             val existing = prev[qid]
-            val should = existing == null || shouldAcceptUpdate(existing, log)
+            val should = existing == null || shouldAcceptUpdate(existing, normalized)
             if (!should) return@updateAndGet prev
 
             val next = prev.toMutableMap()
-            next[qid] = log
+            next[qid] = normalized
             next.toMap()
         }
 
-        val accepted = after[qid] === log
+        val accepted = after[qid] === normalized
 
         if (accepted) {
             AppLog.d(
                 TAG,
-                "upsertLog: accepted qid=$qid skipped=${log.isSkipped} " +
-                        "lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
+                "upsertLog: accepted qid=$qid skipped=${normalized.isSkipped} " +
+                        "lines=${normalized.lines.size} payloadLen=${normalized.completionPayload.length}"
             )
         } else {
             AppLog.w(
                 TAG,
-                "upsertLog: dropped(stale) qid=$qid skipped=${log.isSkipped} " +
-                        "lines=${log.lines.size} payloadLen=${log.completionPayload.length}"
+                "upsertLog: dropped(stale) qid=$qid skipped=${normalized.isSkipped} " +
+                        "lines=${normalized.lines.size} payloadLen=${normalized.completionPayload.length}"
             )
         }
     }
@@ -144,6 +150,9 @@ class SurveySessionViewModel : ViewModel() {
 
     /**
      * Export schema v1.
+     *
+     * Important:
+     * - Use ReviewChatKind.wireName (stable) instead of enum.name (rename-unsafe).
      */
     private fun buildExportJsonV1(sortedLogs: List<ReviewQuestionLog>): String {
         val sb = StringBuilder(4096)
@@ -167,7 +176,7 @@ class SurveySessionViewModel : ViewModel() {
                 if (j > 0) sb.append(',')
 
                 sb.append('{')
-                sb.append("\"kind\":\"").append(jsonEscape(line.kind.name)).append("\",")
+                sb.append("\"kind\":\"").append(jsonEscape(line.kind.wireName)).append("\",")
                 sb.append("\"text\":\"").append(jsonEscape(line.text)).append('\"')
                 sb.append('}')
             }

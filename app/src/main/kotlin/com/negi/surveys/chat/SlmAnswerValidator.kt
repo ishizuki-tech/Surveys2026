@@ -13,6 +13,7 @@
 
 package com.negi.surveys.chat
 
+import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -49,7 +50,7 @@ class SlmAnswerValidator(
         )
         val modelPrompt = repository.buildPrompt(userPrompt, PromptPhase.VALIDATE_MAIN)
 
-        log("validateMain: qid=${questionId.trim()} (request start)")
+        log("validateMain: qid=${questionId.trim()} requestStart promptChars=${modelPrompt.length}")
 
         val raw = collectStreamingText(
             promptChars = modelPrompt.length,
@@ -58,7 +59,7 @@ class SlmAnswerValidator(
             maxChars = maxChars
         )
 
-        log("validateMain: qid=${questionId.trim()} (response received chars=${raw.length})")
+        log("validateMain: qid=${questionId.trim()} responseReceived chars=${raw.length}")
 
         return parseOutcomeOrFallback(
             questionId = questionId,
@@ -79,7 +80,7 @@ class SlmAnswerValidator(
         )
         val modelPrompt = repository.buildPrompt(userPrompt, PromptPhase.VALIDATE_FOLLOW_UP)
 
-        log("validateFollowUp: qid=${questionId.trim()} (request start)")
+        log("validateFollowUp: qid=${questionId.trim()} requestStart promptChars=${modelPrompt.length}")
 
         val raw = collectStreamingText(
             promptChars = modelPrompt.length,
@@ -88,7 +89,7 @@ class SlmAnswerValidator(
             maxChars = maxChars
         )
 
-        log("validateFollowUp: qid=${questionId.trim()} (response received chars=${raw.length})")
+        log("validateFollowUp: qid=${questionId.trim()} responseReceived chars=${raw.length}")
 
         return parseOutcomeOrFallback(
             questionId = questionId,
@@ -112,7 +113,7 @@ class SlmAnswerValidator(
         // - VM follow-up history format looks like:
         //   FOLLOW_UP_1_Q: ...
         //   FOLLOW_UP_1_A: ...
-        // - If it matches, wrap as HISTORY so FakeSlmRepository (and real models) can parse it cleanly.
+        // - If it matches, wrap as HISTORY so models can parse it cleanly.
         val treatAsHistory = hasFollowUp && looksLikeFollowUpHistory(fuRaw)
 
         val followUpBlock = if (!hasFollowUp) {
@@ -208,31 +209,27 @@ $followUpBlock
             }
 
             when (result.reason) {
-                FlowTextStopReason.COMPLETED,
+                FlowTextStopReason.COMPLETED -> streamBridge.end(sessionId)
                 FlowTextStopReason.MAX_CHARS -> {
+                    // Treat as "ended" but keep a clear stop reason in logs.
                     streamBridge.end(sessionId)
                 }
-
-                FlowTextStopReason.TIMEOUT -> {
-                    streamBridge.error(sessionId, "timeout")
-                }
-
-                FlowTextStopReason.ERROR -> {
-                    streamBridge.error(sessionId, result.errorToken ?: "error")
-                }
+                FlowTextStopReason.TIMEOUT -> streamBridge.error(sessionId, "timeout")
+                FlowTextStopReason.ERROR -> streamBridge.error(sessionId, result.errorToken ?: "error")
             }
 
             log("collectStreamingText: session=$sessionId stop=${result.reason} buffered=${result.text.length}")
             result.text
         } catch (ce: CancellationException) {
             // Respect structured concurrency: notify UI + rethrow.
-            streamBridge.error(sessionId, "cancelled")
+            runCatching { streamBridge.error(sessionId, "cancelled") }
             log("collectStreamingText: session=$sessionId cancelled")
             throw ce
         } catch (t: Throwable) {
-            // Best-effort: notify UI + return whatever we have (none here because exception escaped collector).
-            streamBridge.error(sessionId, t.javaClass.simpleName.ifBlank { "error" }.take(32))
-            log("collectStreamingText: session=$sessionId crashed err=${t.javaClass.simpleName}")
+            // Best-effort: notify UI + return empty (exception escaped collector).
+            val token = t.javaClass.simpleName.ifBlank { "error" }.take(32)
+            runCatching { streamBridge.error(sessionId, token) }
+            log("collectStreamingText: session=$sessionId crashed err=$token")
             ""
         }
     }
@@ -244,12 +241,13 @@ $followUpBlock
     ): ValidationOutcome {
         val cleaned = raw
             .replace("\u0000", "")
+            .replace("\uFEFF", "") // BOM
             .trim()
 
         val jsonStr = extractValidationJsonObject(cleaned)
 
         if (jsonStr == null) {
-            log("parseOutcome: qid=${questionId.trim()} JSON not found -> fallback NEED_FOLLOW_UP")
+            log("parseOutcome: qid=${questionId.trim()} jsonNotFound -> fallback NEED_FOLLOW_UP")
             return ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = "I couldn't reliably parse the validation result. One more detail would help.",
@@ -288,8 +286,8 @@ $followUpBlock
                     followUpQuestion = followUpNormalized ?: fallbackFollowUp
                 )
             }
-        } catch (t: Throwable) {
-            log("parseOutcome: qid=${questionId.trim()} JSON parse error -> fallback NEED_FOLLOW_UP")
+        } catch (_: Throwable) {
+            log("parseOutcome: qid=${questionId.trim()} jsonParseError -> fallback NEED_FOLLOW_UP")
             ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = "Validation output was malformed. Please add one more detail.",
@@ -377,6 +375,10 @@ $followUpBlock
                         if (depth == 0) {
                             return text.substring(start, i + 1).trim()
                         }
+                        if (depth < 0) {
+                            // Malformed braces; abort this candidate.
+                            return null
+                        }
                     }
                 }
             }
@@ -407,15 +409,16 @@ $followUpBlock
             "question:",
             "next question:"
         )
-        val lower = t.lowercase()
+
+        val lower0 = t.lowercase(Locale.US)
         for (p in prefixPatterns) {
-            if (lower.startsWith(p)) {
+            if (lower0.startsWith(p)) {
                 t = t.drop(p.length).trim()
                 break
             }
         }
 
-        val l2 = t.lowercase()
+        val l2 = t.lowercase(Locale.US)
         val garbage = setOf(
             "none", "(none)", "n/a", "na", "null", "nil",
             "no", "nope", "no follow up", "no follow-up",
@@ -435,9 +438,11 @@ $followUpBlock
      * - FOLLOW_UP_1_A: ...
      */
     private fun looksLikeFollowUpHistory(text: String): Boolean {
-        val t = text.trim()
-        if (t.isEmpty()) return false
-        return t.contains("FOLLOW_UP_1_A:") || t.lineSequence().any { it.trim().startsWith("FOLLOW_UP_") }
+        val raw = text.trim()
+        if (raw.isEmpty()) return false
+        // Strict, line-bounded detection for the history schema.
+        val re = Regex("""^FOLLOW_UP_\d+_[QA]:\s*.*$""")
+        return raw.lineSequence().any { line -> re.matches(line.trim()) }
     }
 
     private fun log(msg: String) {

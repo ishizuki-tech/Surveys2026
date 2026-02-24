@@ -13,6 +13,8 @@
 
 package com.negi.surveys.chat
 
+import java.util.Locale
+
 /**
  * Pluggable validator interface.
  *
@@ -33,7 +35,7 @@ interface AnswerValidator {
      *
      * Contract:
      * - [questionId] should be a stable identifier (e.g., "Q1") used for storage and logging.
-     * - [answer] is expected to be already normalized (typically `trim()`).
+     * - [answer] is expected to be already normalized.
      *
      * Implementation guidance:
      * - If you want strict behavior, you may treat blank inputs as invalid and return an
@@ -67,8 +69,8 @@ interface AnswerValidator {
      *
      * Use this at call sites unless you have a strong reason to normalize elsewhere.
      *
-     * @param questionId Survey question id (raw; will be normalized via `trim()`).
-     * @param answer User's main answer (raw; will be normalized via `trim()`).
+     * @param questionId Survey question id (raw; normalized deterministically).
+     * @param answer User's main answer (raw; normalized deterministically).
      */
     suspend fun validateMainRaw(questionId: String, answer: String): ValidationOutcome {
         return validateMain(
@@ -80,9 +82,9 @@ interface AnswerValidator {
     /**
      * Convenience wrapper that normalizes inputs before calling [validateFollowUp].
      *
-     * @param questionId Survey question id (raw; will be normalized via `trim()`).
-     * @param mainAnswer Main answer (raw; will be normalized via `trim()`).
-     * @param followUpAnswer Follow-up answer (raw; will be normalized via `trim()`).
+     * @param questionId Survey question id (raw; normalized deterministically).
+     * @param mainAnswer Main answer (raw; normalized deterministically).
+     * @param followUpAnswer Follow-up answer (raw; normalized deterministically).
      */
     suspend fun validateFollowUpRaw(
         questionId: String,
@@ -98,11 +100,51 @@ interface AnswerValidator {
 
     /**
      * Normalize an identifier-like value for stable comparisons and keys.
+     *
+     * Notes:
+     * - We trim whitespace and uppercase for consistency (e.g., "q1" -> "Q1").
+     * - If your app uses case-sensitive IDs, remove the uppercase step.
      */
-    private fun normalizeId(value: String): String = value.trim()
+    private fun normalizeId(value: String): String {
+        val t = value.trim()
+        return t.uppercase(Locale.US)
+    }
 
     /**
      * Normalize free-form user text for stable downstream validation behavior.
+     *
+     * Notes:
+     * - Trims leading/trailing whitespace.
+     * - Removes/normalizes "invisible" characters that often cause surprises:
+     *   - Zero-width spaces (ZWSP/ZWNJ/ZWJ/BOM) are dropped.
+     *   - Control chars (< 0x20) are dropped except newline/tab which are normalized to spaces.
+     * - Collapses consecutive whitespace to a single space.
      */
-    private fun normalizeText(value: String): String = value.trim()
+    private fun normalizeText(value: String): String {
+        if (value.isEmpty()) return ""
+
+        val out = StringBuilder(value.length)
+        for (ch in value) {
+            when (ch) {
+                '\u200B', // ZWSP
+                '\u200C', // ZWNJ
+                '\u200D', // ZWJ
+                '\uFEFF'  // BOM
+                    -> {
+                    // Drop.
+                }
+                '\n', '\r', '\t' -> out.append(' ')
+                else -> {
+                    if (ch.code < 0x20) {
+                        // Drop remaining control chars.
+                    } else {
+                        out.append(ch)
+                    }
+                }
+            }
+        }
+
+        // Trim and collapse whitespace.
+        return out.toString().trim().replace(Regex("\\s+"), " ")
+    }
 }

@@ -29,12 +29,27 @@ import com.negi.surveys.BuildConfig
  *
  * Notes:
  * - [wireName] is a stable string used for export (rename-safe).
+ * - Prefer using [wireName] for persisted/exported formats (avoid enum ordinal).
  */
 enum class ReviewChatKind(val wireName: String) {
     USER("user"),
     AI("ai"),
     FOLLOW_UP("follow_up"),
-    MODEL_RAW("model_raw")
+    MODEL_RAW("model_raw");
+
+    companion object {
+        /**
+         * Parse a persisted/exported wire name into an enum.
+         *
+         * Notes:
+         * - Returns null when unknown to avoid inventing semantics.
+         * - Call sites may fallback to MODEL_RAW or AI depending on their policy.
+         */
+        fun fromWireName(wireName: String?): ReviewChatKind? {
+            val w = wireName?.trim()?.lowercase() ?: return null
+            return entries.firstOrNull { it.wireName == w }
+        }
+    }
 }
 
 /**
@@ -53,7 +68,7 @@ data class ReviewChatLine(
          * Safe factory to normalize input.
          *
          * Notes:
-         * - Trims nothing by default (preserve content).
+         * - Preserves content as-is (no trim) to avoid surprising UI diffs.
          * - Guards against null-like accidents by converting to empty string.
          */
         fun of(kind: ReviewChatKind, text: String?): ReviewChatLine {
@@ -77,6 +92,14 @@ data class ReviewQuestionLog(
     val completionPayload: String,
     val lines: List<ReviewChatLine>
 ) {
+    /**
+     * Returns a defensively-copied version so external mutable lists cannot mutate stored logs.
+     *
+     * Notes:
+     * - Useful when you need to store a snapshot derived from a MutableList.
+     */
+    fun freeze(): ReviewQuestionLog = copy(lines = lines.toList())
+
     companion object {
         /**
          * Safe factory that creates a defensive snapshot.
@@ -87,6 +110,7 @@ data class ReviewQuestionLog(
          *
          * Notes:
          * - In debug builds, we validate invariants more strictly.
+         * - Does not trim prompt/payload to preserve export fidelity.
          */
         fun of(
             questionId: String,
@@ -96,24 +120,19 @@ data class ReviewQuestionLog(
             lines: List<ReviewChatLine>
         ): ReviewQuestionLog {
             val qid = questionId.trim()
-            val pr = prompt
-            val payload = completionPayload
 
             if (BuildConfig.DEBUG) {
                 require(qid.isNotBlank()) { "questionId must not be blank" }
-                require(pr.isNotBlank()) { "prompt must not be blank" }
-                require(payload.isNotBlank()) { "completionPayload must not be blank" }
+                require(prompt.isNotBlank()) { "prompt must not be blank" }
+                require(completionPayload.isNotBlank()) { "completionPayload must not be blank" }
             }
-
-            // Defensive snapshot: avoid later mutation via MutableList references.
-            val snapLines = lines.toList()
 
             return ReviewQuestionLog(
                 questionId = qid,
-                prompt = pr,
+                prompt = prompt,
                 isSkipped = isSkipped,
-                completionPayload = payload,
-                lines = snapLines
+                completionPayload = completionPayload,
+                lines = lines.toList()
             )
         }
     }
@@ -132,6 +151,9 @@ data class ReviewQuestionLog(
 @Immutable
 sealed interface ReviewTimelineItem {
 
+    /** Question id associated with this timeline item. */
+    val questionId: String
+
     /**
      * Header marker for a question boundary.
      *
@@ -140,7 +162,7 @@ sealed interface ReviewTimelineItem {
      */
     @Immutable
     data class QuestionHeader(
-        val questionId: String,
+        override val questionId: String,
         val prompt: String,
         val isSkipped: Boolean,
         val completionPayload: String
@@ -151,7 +173,7 @@ sealed interface ReviewTimelineItem {
      */
     @Immutable
     data class Line(
-        val questionId: String,
+        override val questionId: String,
         val prompt: String,
         val isSkipped: Boolean,
         val line: ReviewChatLine

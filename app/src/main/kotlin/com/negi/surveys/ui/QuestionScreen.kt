@@ -41,6 +41,7 @@ import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -75,6 +76,9 @@ fun QuestionScreen(
     /** Navigate back. */
     onBack: () -> Unit
 ) {
+    val latestOnNext by rememberUpdatedState(onNext)
+    val latestOnBack by rememberUpdatedState(onBack)
+
     /**
      * rememberSaveable keeps draft text across rotation and process recreation.
      * Keyed by questionId so each question has its own draft slot.
@@ -82,7 +86,7 @@ fun QuestionScreen(
     var answer by rememberSaveable(questionId) { mutableStateOf("") }
 
     /** Prevent double-submit from rapid taps / IME spam. */
-    var submitInFlight by remember(questionId) { mutableStateOf(false) }
+    var submitInFlight by rememberSaveable(questionId) { mutableStateOf(false) }
 
     /**
      * Apply initialAnswer only if the user hasn't typed yet, to avoid overwriting input.
@@ -90,6 +94,7 @@ fun QuestionScreen(
     LaunchedEffect(questionId, initialAnswer) {
         if (answer.isBlank() && initialAnswer.isNotBlank()) {
             answer = initialAnswer
+            submitInFlight = false
             AppLog.d(TAG, "applied initialAnswer qid=$questionId len=${initialAnswer.length}")
             Log.d(TAG, "applied initialAnswer qid=$questionId len=${initialAnswer.length}")
         }
@@ -117,7 +122,7 @@ fun QuestionScreen(
             return
         }
 
-        val text = answer.trim()
+        val text = trimmed
         if (text.isEmpty()) {
             AppLog.d(TAG, "submit blocked (invalid) qid=$questionId len=$answerLen")
             Log.d(TAG, "submit blocked (invalid) qid=$questionId len=$answerLen")
@@ -135,7 +140,7 @@ fun QuestionScreen(
         Log.d(TAG, "next qid=$questionId len=${text.length} sha8=$sha8")
 
         // Let the parent navigate; if it returns to this screen, state will be reset by questionId change.
-        onNext(text)
+        latestOnNext(text)
     }
 
     Column(
@@ -162,6 +167,7 @@ fun QuestionScreen(
             value = answer,
             onValueChange = { newValue ->
                 answer = newValue
+                // Any edit re-enables submitting.
                 if (submitInFlight) submitInFlight = false
             },
             modifier = Modifier.fillMaxWidth(),
@@ -191,7 +197,7 @@ fun QuestionScreen(
                 onClick = {
                     AppLog.d(TAG, "back clicked qid=$questionId")
                     Log.d(TAG, "back clicked qid=$questionId")
-                    onBack()
+                    latestOnBack()
                 },
                 enabled = !submitInFlight
             ) {

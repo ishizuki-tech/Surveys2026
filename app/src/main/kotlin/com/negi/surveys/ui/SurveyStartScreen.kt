@@ -38,6 +38,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.AppLog
@@ -93,7 +94,7 @@ fun SurveyStartScreen(
         if (beginLocked) {
             beginLocked = false
             AppLog.w(TAG, "begin auto-unlocked after timeout")
-            Log.d(TAG, "begin auto-unlocked after timeout")
+            if (BuildConfig.DEBUG) Log.d(TAG, "begin auto-unlocked after timeout")
         }
     }
 
@@ -107,7 +108,8 @@ fun SurveyStartScreen(
             .windowInsetsPadding(
                 WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
             )
-            .padding(16.dp),
+            .padding(16.dp)
+            .testTag("survey_start_root"),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
         Text("Survey Start")
@@ -128,10 +130,17 @@ fun SurveyStartScreen(
             OutlinedButton(
                 onClick = {
                     AppLog.d(TAG, "click: back")
-                    Log.d(TAG, "click: back")
-                    latestOnBack()
+                    if (BuildConfig.DEBUG) Log.d(TAG, "click: back")
+                    runCatching { latestOnBack() }
+                        .onFailure { t ->
+                            AppLog.w(TAG, "back callback failed (non-fatal): ${t.javaClass.simpleName}")
+                            if (BuildConfig.DEBUG) Log.w(TAG, "back callback failed (non-fatal)", t)
+                        }
                 },
-                enabled = !beginLocked
+                enabled = !beginLocked,
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("survey_start_back")
             ) {
                 Text("Back")
             }
@@ -140,15 +149,26 @@ fun SurveyStartScreen(
                 onClick = {
                     if (beginLocked) {
                         AppLog.w(TAG, "begin ignored (locked)")
-                        Log.d(TAG, "begin ignored (locked)")
+                        if (BuildConfig.DEBUG) Log.d(TAG, "begin ignored (locked)")
                         return@Button
                     }
+
                     beginLocked = true
                     AppLog.i(TAG, "click: begin")
-                    Log.d(TAG, "click: begin")
-                    latestOnBegin()
+                    if (BuildConfig.DEBUG) Log.d(TAG, "click: begin")
+
+                    runCatching { latestOnBegin() }
+                        .onFailure { t ->
+                            // If begin throws synchronously, unlock immediately to avoid trapping the UI.
+                            beginLocked = false
+                            AppLog.w(TAG, "begin callback failed (unlocked): ${t.javaClass.simpleName}")
+                            if (BuildConfig.DEBUG) Log.w(TAG, "begin callback failed (unlocked)", t)
+                        }
                 },
-                enabled = !beginLocked
+                enabled = !beginLocked,
+                modifier = Modifier
+                    .weight(1f)
+                    .testTag("survey_start_begin")
             ) {
                 Text("Begin (Q1)")
             }
