@@ -233,10 +233,10 @@ fun ReviewScreen(
                             // English comments only.
                             // Keys MUST be unique among siblings. Never use content-based keys for MODEL_RAW.
                             key = { idx, item -> timelineRowKey(idx, item) }
-                        ) { _, item ->
+                        ) { idx, item ->
                             when (item) {
                                 is ReviewTimelineItem.QuestionHeader -> TimelineQuestionHeaderCard(item)
-                                is ReviewTimelineItem.Line -> TimelineLineBubble(item = item, rawExpanded = rawExpanded)
+                                is ReviewTimelineItem.Line -> TimelineLineBubble(index = idx, item = item, rawExpanded = rawExpanded)
                             }
                         }
                     }
@@ -462,11 +462,13 @@ private fun TimelineQuestionHeaderCard(header: ReviewTimelineItem.QuestionHeader
                     modifier = Modifier.weight(1f)
                 )
 
-                val badgeBg = if (header.isSkipped) MaterialTheme.colorScheme.surfaceVariant
-                else MaterialTheme.colorScheme.primaryContainer
+                val badgeBg =
+                    if (header.isSkipped) MaterialTheme.colorScheme.surfaceVariant
+                    else MaterialTheme.colorScheme.primaryContainer
 
-                val badgeFg = if (header.isSkipped) MaterialTheme.colorScheme.onSurfaceVariant
-                else MaterialTheme.colorScheme.onPrimaryContainer
+                val badgeFg =
+                    if (header.isSkipped) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.onPrimaryContainer
 
                 Surface(color = badgeBg, shape = RoundedCornerShape(999.dp)) {
                     Text(
@@ -509,13 +511,17 @@ private fun TimelineQuestionHeaderCard(header: ReviewTimelineItem.QuestionHeader
 
 @Composable
 private fun TimelineLineBubble(
+    index: Int,
     item: ReviewTimelineItem.Line,
     rawExpanded: MutableMap<String, Boolean>
 ) {
     val line = item.line
     val isRaw = line.kind == ReviewChatKind.MODEL_RAW
     val canToggle = isRaw && line.text.length > 260
-    val key = if (isRaw) rawLineKey(item.questionId, line.text) else null
+
+    // English comments only.
+    // Stable expansion key: prefer per-row key so identical raw text does not cross-toggle.
+    val key = if (isRaw) rawLineKeyForRow(item.questionId, index, line.text) else null
     val expanded = if (key == null) false else (rawExpanded[key] ?: false)
 
     val header = when (line.kind) {
@@ -620,11 +626,13 @@ private fun QuestionTranscriptCard(
                     modifier = Modifier.weight(1f)
                 )
 
-                val badgeBg = if (log.isSkipped) MaterialTheme.colorScheme.surfaceVariant
-                else MaterialTheme.colorScheme.primaryContainer
+                val badgeBg =
+                    if (log.isSkipped) MaterialTheme.colorScheme.surfaceVariant
+                    else MaterialTheme.colorScheme.primaryContainer
 
-                val badgeFg = if (log.isSkipped) MaterialTheme.colorScheme.onSurfaceVariant
-                else MaterialTheme.colorScheme.onPrimaryContainer
+                val badgeFg =
+                    if (log.isSkipped) MaterialTheme.colorScheme.onSurfaceVariant
+                    else MaterialTheme.colorScheme.onPrimaryContainer
 
                 Surface(color = badgeBg, shape = RoundedCornerShape(999.dp)) {
                     Text(
@@ -663,7 +671,9 @@ private fun QuestionTranscriptCard(
 
             log.lines.forEachIndexed { index, line ->
                 val isRaw = line.kind == ReviewChatKind.MODEL_RAW
-                val key = if (isRaw) rawLineKey(log.questionId, line.text) else "${log.questionId}:$index"
+                // English comments only.
+                // Stable expansion key: keep per-row uniqueness to avoid cross-question collisions.
+                val key = if (isRaw) rawLineKeyForRow(log.questionId, index, line.text) else "${log.questionId}:$index"
                 val expanded = rawExpanded[key] ?: false
 
                 val header = when (line.kind) {
@@ -856,7 +866,14 @@ private fun logFingerprint(log: ReviewQuestionLog): Int {
 private fun rawLineKey(questionId: String, rawText: String): String {
     // English comments only.
     // This key is ONLY for expansion-state tracking (not for LazyColumn item keys).
+    // NOTE: This can collide across rows if text is identical. Prefer rawLineKeyForRow for per-row toggles.
     return "$questionId:raw:${rawText.length}:${rawText.hashCode()}"
+}
+
+private fun rawLineKeyForRow(questionId: String, index: Int, rawText: String): String {
+    // English comments only.
+    // Stable expansion key per row: avoids cross-toggle when identical raw text appears multiple times.
+    return "$questionId:rawRow:$index:${rawText.length}:${rawText.hashCode()}"
 }
 
 private fun sortLogsNaturally(logs: List<ReviewQuestionLog>): List<ReviewQuestionLog> {
@@ -879,13 +896,14 @@ private data class QuestionIdKey(
 )
 
 private fun questionIdKey(id: String): QuestionIdKey {
-    val m = ID_PATTERN.matchEntire(id)
+    val raw = id.trim()
+    val m = ID_PATTERN.matchEntire(raw)
     if (m != null) {
         val prefix = m.groupValues[1]
         val number = m.groupValues[2].toIntOrNull() ?: Int.MAX_VALUE
-        return QuestionIdKey(prefix = prefix, number = number, raw = id)
+        return QuestionIdKey(prefix = prefix, number = number, raw = raw)
     }
-    return QuestionIdKey(prefix = id, number = Int.MAX_VALUE, raw = id)
+    return QuestionIdKey(prefix = raw, number = Int.MAX_VALUE, raw = raw)
 }
 
 private const val TAG = "ReviewScreen"

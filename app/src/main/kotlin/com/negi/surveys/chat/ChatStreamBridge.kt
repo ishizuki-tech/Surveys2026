@@ -13,6 +13,7 @@
 
 package com.negi.surveys.chat
 
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -93,12 +94,26 @@ class ChatStreamBridge(
     private val emittedEnd = AtomicLong(0L)
     private val emittedError = AtomicLong(0L)
 
+    /**
+     * NOTE:
+     * - With DROP_OLDEST overflow policy, tryEmit(...) is typically "successful" by dropping old items.
+     * - Therefore droppedEvents counts only hard failures (rare), not overwritten items.
+     */
     private val droppedEvents = AtomicLong(0L)
 
     private val ignoredDelta = AtomicLong(0L)
     private val ignoredEnd = AtomicLong(0L)
     private val ignoredError = AtomicLong(0L)
     private val ignoredCancel = AtomicLong(0L)
+
+    /**
+     * Throttle tick for very frequent paths.
+     *
+     * Why:
+     * - Previously throttle used emittedDelta only, which failed to update UI when only ignoredDelta grew.
+     * - We increment this for BOTH emittedDelta and ignoredDelta paths so debug UI remains informative.
+     */
+    private val deltaTick = AtomicLong(0L)
 
     @Volatile private var lastEventNs: Long = 0L
     @Volatile private var lastEventKind: String? = null
@@ -177,9 +192,9 @@ class ChatStreamBridge(
             return
         }
 
-        // Throttle: publish every 64 deltas (good enough for debug UI).
-        val d = emittedDelta.get()
-        if ((d and 0x3FL) == 0L) {
+        // Throttle: publish every 64 delta-path operations (emitted OR ignored).
+        val t = deltaTick.get()
+        if ((t and 0x3FL) == 0L) {
             _stats.value = statsSnapshot()
         }
     }
@@ -247,11 +262,13 @@ class ChatStreamBridge(
         val active = activeSessionId.get()
         if (active != sessionId) {
             ignoredDelta.incrementAndGet()
+            deltaTick.incrementAndGet()
             publishStats(force = false)
             return
         }
 
         emittedDelta.incrementAndGet()
+        deltaTick.incrementAndGet()
         emitEvent(ChatStreamEvent.Delta(sessionId, chunk), kind = "Delta", sessionId = sessionId)
         publishStats(force = false)
     }
@@ -295,10 +312,11 @@ class ChatStreamBridge(
         // Clear active first so late emitChunk/end/error are ignored.
         activeSessionId.set(0L)
 
+        val msg = message.trim().take(256)
         emittedError.incrementAndGet()
-        emitEvent(ChatStreamEvent.Error(sessionId, message), kind = "Error", sessionId = sessionId)
+        emitEvent(ChatStreamEvent.Error(sessionId, msg), kind = "Error", sessionId = sessionId)
 
-        logger?.invoke("ChatStreamBridge: error session=$sessionId msg=${message.trim().take(32)}")
+        logger?.invoke("ChatStreamBridge: error session=$sessionId msg=${msg.take(32)}")
         publishStats(force = true)
     }
 
@@ -324,17 +342,18 @@ class ChatStreamBridge(
 
         activeSessionId.set(0L)
 
+        val msg = message.trim().ifBlank { CANCELLED_MESSAGE }
         lastCancelSessionId = sessionId
-        lastCancelMessage = message
+        lastCancelMessage = msg
 
         emittedError.incrementAndGet()
         emitEvent(
-            ChatStreamEvent.Error(sessionId, message),
+            ChatStreamEvent.Error(sessionId, msg),
             kind = "Error(cancel)",
             sessionId = sessionId
         )
 
-        logger?.invoke("ChatStreamBridge: cancel session=$sessionId")
+        logger?.invoke("ChatStreamBridge: cancel session=$sessionId msg=${msg.lowercase(Locale.US)}")
         publishStats(force = true)
         sessionId
     }
@@ -359,17 +378,18 @@ class ChatStreamBridge(
 
         activeSessionId.set(0L)
 
+        val msg = message.trim().ifBlank { CANCELLED_MESSAGE }
         lastCancelSessionId = id
-        lastCancelMessage = message
+        lastCancelMessage = msg
 
         emittedError.incrementAndGet()
         emitEvent(
-            ChatStreamEvent.Error(id, message),
+            ChatStreamEvent.Error(id, msg),
             kind = "Error(cancelActive)",
             sessionId = id
         )
 
-        logger?.invoke("ChatStreamBridge: cancelActive session=$id")
+        logger?.invoke("ChatStreamBridge: cancelActive session=$id msg=${msg.lowercase(Locale.US)}")
         publishStats(force = true)
         id
     }

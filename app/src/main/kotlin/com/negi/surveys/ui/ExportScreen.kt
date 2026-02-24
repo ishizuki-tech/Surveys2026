@@ -102,15 +102,31 @@ fun ExportScreen(
     val sha256 = digest.sha256
     val lenBytes = digest.utf8Bytes
 
+    // English comments only.
+    /** Track whether the user manually toggled the preview/full mode. */
+    var userToggled by remember { mutableStateOf(false) }
+
+    // Default display policy:
+    // - If payload is large, start in preview mode.
+    // - If digest isn't ready yet, start in preview mode and correct once bytes are known.
+    var showFull by remember { mutableStateOf(false) }
+
+    // English comments only.
+    /** Auto-select showFull once bytes are known, but do NOT override user's manual choice. */
+    LaunchedEffect(lenBytes) {
+        if (userToggled) return@LaunchedEffect
+        if (lenBytes < 0) {
+            showFull = false
+            return@LaunchedEffect
+        }
+        showFull = lenBytes <= DEFAULT_SHOW_FULL_BYTES_THRESHOLD
+    }
+
     LaunchedEffect(sha256, lenChars, lenBytes) {
         if (BuildConfig.DEBUG) {
             AppLog.d(TAG, "ExportScreen: chars=$lenChars bytes=$lenBytes sha256=$sha256")
             Log.d(TAG, "ExportScreen: chars=$lenChars bytes=$lenBytes sha256=$sha256")
         }
-    }
-
-    var showFull by remember {
-        mutableStateOf(lenBytes <= DEFAULT_SHOW_FULL_BYTES_THRESHOLD)
     }
 
     val displayedText = remember(exportText, showFull) {
@@ -156,7 +172,11 @@ fun ExportScreen(
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             OutlinedButton(
-                onClick = { showFull = !showFull },
+                onClick = {
+                    userToggled = true
+                    showFull = !showFull
+                    AppLog.i(TAG, "toggle: showFull=$showFull")
+                },
                 modifier = Modifier.weight(1f)
             ) {
                 Text(if (showFull) "Show Preview" else "Show Full")
@@ -219,7 +239,6 @@ fun ExportScreen(
 }
 
 private const val TAG = "ExportScreen"
-
 private const val SHA_COMPUTING = "__computing__"
 
 /** Default preview length (chars). */
@@ -312,15 +331,12 @@ private fun copyToClipboardSafe(context: Context, label: String, text: String): 
         val bytes = text.toByteArray(StandardCharsets.UTF_8)
         if (bytes.size <= MAX_TEXT_BYTES_FOR_CLIPBOARD) {
             cm.setPrimaryClip(ClipData.newPlainText(label, text))
-            AppLog.i(TAG, "copyToClipboard: ok bytes=${bytes.size}")
+            AppLog.i(TAG, "copyToClipboard: ok(full) bytes=${bytes.size}")
             true
         } else {
             val truncated = text.previewText(DEFAULT_PREVIEW_CHARS)
             cm.setPrimaryClip(ClipData.newPlainText(label, truncated))
-            AppLog.w(
-                TAG,
-                "copyToClipboard: payload too large (bytes=${bytes.size}); copied preview instead"
-            )
+            AppLog.w(TAG, "copyToClipboard: ok(preview) payloadTooLarge bytes=${bytes.size}")
             true
         }
     }.onFailure { t ->
@@ -349,7 +365,6 @@ private fun shareExportSafe(context: Context, subject: String, text: String): Bo
         } else {
             val okFile = shareAsFileViaFileProvider(context, subject = subject, text = text)
             if (okFile) true else {
-                // Fallback: share a preview to avoid binder errors.
                 val preview = text.previewText(DEFAULT_PREVIEW_CHARS)
                 shareText(context, subject = subject, text = preview)
             }
@@ -395,9 +410,29 @@ private fun shareAsFileViaFileProvider(context: Context, subject: String, text: 
 
         outFile.writeText(text, Charsets.UTF_8)
 
-        val authority = context.packageName + ".fileprovider"
-        val uri = FileProvider.getUriForFile(context, authority, outFile)
+        // English comments only.
+        /** Prefer APPLICATION_ID-based authority; fallback to packageName-based authority. */
+        val authorities = listOf(
+            BuildConfig.APPLICATION_ID + ".fileprovider",
+            context.packageName + ".fileprovider"
+        ).distinct()
 
+        var uri = runCatching {
+            FileProvider.getUriForFile(context, authorities.first(), outFile)
+        }.getOrNull()
+
+        if (uri == null && authorities.size > 1) {
+            uri = runCatching {
+                FileProvider.getUriForFile(context, authorities[1], outFile)
+            }.getOrNull()
+        }
+
+        if (uri == null) {
+            throw IllegalArgumentException("FileProvider authority not configured: tried=$authorities")
+        }
+
+        // English comments only.
+        /** Use EXTRA_STREAM for large payloads; keep MIME flexible for broad app compatibility. */
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "application/json"
             putExtra(Intent.EXTRA_SUBJECT, subject)

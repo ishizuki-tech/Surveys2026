@@ -16,7 +16,6 @@ package com.negi.surveys.chat
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.withTimeout
 
 /**
@@ -86,7 +85,7 @@ suspend fun Flow<String>.collectToText(
  *
  * Timeout semantics:
  * - timeoutMs > 0 => enforce timeout using withTimeout(timeoutMs).
- * - timeoutMs <= 0 => NO TIMEOUT (collect until completion or maxChars).
+ * - timeoutMs <= 0 => NO TIMEOUT (collect until completion or maxChars limit).
  */
 suspend fun Flow<String>.collectToTextSafely(
     timeoutMs: Long = 30_000L,
@@ -190,21 +189,51 @@ private suspend fun Flow<String>.collectInto(
         val remain = maxChars - sb.length
         if (remain <= 0) throw MaxCharsReached()
 
-        val toAppend = if (chunk.length <= remain) chunk else chunk.substring(0, remain)
-        sb.append(toAppend)
+        val toAppend = clipToRemainPreserveSurrogates(chunk, remain)
+        if (toAppend.isNotEmpty()) {
+            sb.append(toAppend)
 
-        if (onChunk != null) {
-            try {
-                onChunk.invoke(toAppend, sb.length)
-            } catch (ce: CancellationException) {
-                throw ce
-            } catch (_: Throwable) {
-                // Swallow onChunk exceptions to avoid losing the collected output.
+            if (onChunk != null) {
+                try {
+                    onChunk.invoke(toAppend, sb.length)
+                } catch (ce: CancellationException) {
+                    throw ce
+                } catch (_: Throwable) {
+                    // Swallow onChunk exceptions to avoid losing the collected output.
+                }
             }
         }
 
         if (sb.length >= maxChars) throw MaxCharsReached()
     }
+}
+
+/**
+ * Clips [chunk] to at most [remain] UTF-16 code units, avoiding surrogate pair splits.
+ *
+ * Notes:
+ * - Kotlin String indexing uses UTF-16 code units.
+ * - If we cut between a high surrogate and low surrogate, the resulting String becomes invalid.
+ * - This function steps back by 1 code unit when it detects such a split.
+ */
+private fun clipToRemainPreserveSurrogates(chunk: String, remain: Int): String {
+    if (remain <= 0) return ""
+    if (chunk.length <= remain) return chunk
+
+    var end = remain.coerceAtMost(chunk.length)
+    if (end <= 0) return ""
+
+    // Avoid ending after a high surrogate if the next char is a low surrogate.
+    if (end < chunk.length) {
+        val last = chunk[end - 1]
+        val next = chunk[end]
+        if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
+            end -= 1
+        }
+    }
+
+    if (end <= 0) return ""
+    return chunk.substring(0, end)
 }
 
 /**

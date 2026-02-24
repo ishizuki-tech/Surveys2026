@@ -110,7 +110,22 @@ class FakeSlmRepository(
 
         /** Optional metadata logger (do not log raw prompts/answers). */
         val logger: ((String) -> Unit)? = null
-    )
+    ) {
+        /** Normalize config to safe operational values. */
+        fun normalized(): Config {
+            return copy(
+                requestSetupDelayMs = requestSetupDelayMs.coerceAtLeast(0L),
+                throwAfterEmits = throwAfterEmits,
+                chunkDelayMs = chunkDelayMs.coerceAtLeast(0L),
+                chunkSizeChars = chunkSizeChars.coerceAtLeast(1),
+                minMainAnswerChars = minMainAnswerChars.coerceAtLeast(1),
+                requiredFollowUps = requiredFollowUps.coerceAtLeast(1),
+                minFollowUpAnswerChars = minFollowUpAnswerChars.coerceAtLeast(1)
+            )
+        }
+    }
+
+    private val cfg: Config = config.normalized()
 
     override fun buildPrompt(userPrompt: String): String {
         // NOTE:
@@ -146,11 +161,11 @@ $userPrompt
 
     override suspend fun request(prompt: String): Flow<String> {
         val promptLen = prompt.length
-        val setupDelay = config.requestSetupDelayMs.coerceAtLeast(0L)
+        val setupDelay = cfg.requestSetupDelayMs
 
-        config.logger?.invoke("FakeSlmRepository.request: setup (chars=$promptLen delayMs=$setupDelay)")
+        cfg.logger?.invoke("FakeSlmRepository.request: setup (chars=$promptLen delayMs=$setupDelay)")
 
-        if (config.throwOnRequestSetup) {
+        if (cfg.throwOnRequestSetup) {
             throw IllegalStateException("fake_request_setup_error")
         }
 
@@ -158,12 +173,12 @@ $userPrompt
             delay(setupDelay)
         }
 
-        val safeChunkSize = config.chunkSizeChars.coerceAtLeast(1)
-        val safeChunkDelay = config.chunkDelayMs.coerceAtLeast(0L)
-        val throwAfter = config.throwAfterEmits
+        val safeChunkSize = cfg.chunkSizeChars
+        val safeChunkDelay = cfg.chunkDelayMs
+        val throwAfter = cfg.throwAfterEmits
 
         return flow {
-            config.logger?.invoke("FakeSlmRepository.request: stream start")
+            cfg.logger?.invoke("FakeSlmRepository.request: stream start")
 
             val phase = detectPhase(prompt)
 
@@ -219,15 +234,16 @@ $userPrompt
 
             val finalText = buildString {
                 if (prependNonJson) {
+                    // Intentionally invalid output for robustness testing.
                     append("analysis: (fake) streaming output begins\n")
                 }
                 append(json)
-                if (config.appendTrailingNewline) append("\n")
+                if (cfg.appendTrailingNewline) append("\n")
             }
 
-            config.logger?.invoke(
+            cfg.logger?.invoke(
                 "FakeSlmRepository.request: meta phase=$phase mainLen=${mainAnswer.trim().length} " +
-                        "followUps=${followUpAnswers.size} outChars=${finalText.length}"
+                        "followUps=${followUpAnswers.size} outChars=${finalText.length} prependNonJson=$prependNonJson"
             )
 
             var emitCount = 0
@@ -247,7 +263,7 @@ $userPrompt
                 if (safeChunkDelay > 0L) delay(safeChunkDelay)
             }
 
-            config.logger?.invoke("FakeSlmRepository.request: stream done (chunks=$emitCount)")
+            cfg.logger?.invoke("FakeSlmRepository.request: stream done (chunks=$emitCount)")
         }
     }
 
@@ -269,7 +285,7 @@ $userPrompt
     private fun validateMain(mainAnswer: String, followUpAnswers: List<String>): String {
         val a = mainAnswer.trim()
 
-        return if (a.length >= config.minMainAnswerChars) {
+        return if (a.length >= cfg.minMainAnswerChars) {
             jsonAccepted("Looks good. Thanks!")
         } else {
             val q = nextFollowUpQuestion(index = 1)
@@ -287,36 +303,40 @@ $userPrompt
      * - If main answer is already long enough, ACCEPTED immediately.
      * - Otherwise, require N follow-ups (N may scale slightly based on main length).
      * - Each follow-up must be "useful" (min length) to count.
+     *
+     * Strategy (deterministic):
+     * - If any provided follow-up is non-empty but too short, request clarification of that slot first.
+     * - Otherwise, if not enough useful follow-ups, ask the next follow-up question.
      */
     private fun validateFollowUp(mainAnswer: String, followUpAnswers: List<String>): String {
         val a = mainAnswer.trim()
-        val requiresFollowUp = a.length < config.minMainAnswerChars
+        val requiresFollowUp = a.length < cfg.minMainAnswerChars
 
         if (!requiresFollowUp) {
             return jsonAccepted("Looks good. Thanks!")
         }
 
         val required = requiredFollowUpsForMain(a)
-        val useful = followUpAnswers.filter { it.trim().length >= config.minFollowUpAnswerChars }
 
-        // Ask next follow-up if we don't have enough useful answers yet.
-        if (useful.size < required) {
-            val q = nextFollowUpQuestion(index = useful.size + 1)
-            return jsonNeedFollowUp(
-                assistantMessage = "Good. One more concrete detail would make this answer complete.",
-                followUpQuestion = q
-            )
-        }
-
-        // If any provided follow-up exists but is too short/vague, ask to clarify that slot.
+        // First, if any answer is present but too short, ask to clarify it (more stable than adding new questions).
         val shortIdx = followUpAnswers.indexOfFirst {
             val t = it.trim()
-            t.isNotEmpty() && t.length < config.minFollowUpAnswerChars
+            t.isNotEmpty() && t.length < cfg.minFollowUpAnswerChars
         }
         if (shortIdx >= 0) {
             val q = "Could you make follow-up #${shortIdx + 1} more concrete (numbers, place, or example)?"
             return jsonNeedFollowUp(
                 assistantMessage = "That detail is still a bit vague.",
+                followUpQuestion = q
+            )
+        }
+
+        val useful = followUpAnswers.filter { it.trim().length >= cfg.minFollowUpAnswerChars }
+
+        if (useful.size < required) {
+            val q = nextFollowUpQuestion(index = useful.size + 1)
+            return jsonNeedFollowUp(
+                assistantMessage = "Good. One more concrete detail would make this answer complete.",
                 followUpQuestion = q
             )
         }
@@ -332,8 +352,8 @@ $userPrompt
      * - Keep this deterministic and simple for SmallStep testing.
      */
     private fun requiredFollowUpsForMain(main: String): Int {
-        val base = config.requiredFollowUps.coerceAtLeast(1)
-        val veryShortThreshold = (config.minMainAnswerChars / 2).coerceAtLeast(1)
+        val base = cfg.requiredFollowUps.coerceAtLeast(1)
+        val veryShortThreshold = (cfg.minMainAnswerChars / 2).coerceAtLeast(1)
         return if (main.length < veryShortThreshold) base + 1 else base
     }
 
@@ -386,9 +406,7 @@ $userPrompt
         text.lineSequence().forEach { line ->
             val t = line.trim()
             if (!inside) {
-                if (t == begin) {
-                    inside = true
-                }
+                if (t == begin) inside = true
                 return@forEach
             }
 
@@ -431,25 +449,48 @@ $userPrompt
      *   FOLLOW_UP_2_A: ...
      *
      * Notes:
-     * - We only collect "_A:" lines.
-     * - This function intentionally avoids being "too smart".
+     * - We only collect "_A:" blocks.
+     * - Supports multi-line answers: continuation lines are included until the next "FOLLOW_UP_" marker.
+     * - Keeps behavior deterministic and simple for SmallStep testing.
      */
     private fun parseFollowUpAnswersFromHistory(history: String): List<String> {
         val h = history.trim()
         if (h.isEmpty() || h == "(none)") return emptyList()
 
         val out = mutableListOf<String>()
+        val current = StringBuilder()
+
+        fun flushCurrent() {
+            val s = current.toString().trim()
+            if (s.isNotBlank()) out += s
+            current.setLength(0)
+        }
+
         h.lineSequence().forEach { line ->
             val t = line.trim()
-            if (!t.startsWith("FOLLOW_UP_")) return@forEach
 
-            // Accept patterns like "FOLLOW_UP_1_A: answer"
-            val idx = t.indexOf("_A:")
-            if (idx > 0 && idx + 3 < t.length) {
-                val ans = t.substring(idx + 3).trim()
-                if (ans.isNotBlank()) out += ans
+            // Start of a new follow-up marker.
+            if (t.startsWith("FOLLOW_UP_")) {
+                // If we were collecting an answer, flush it when a new marker begins.
+                if (current.isNotEmpty()) flushCurrent()
+
+                val idx = t.indexOf("_A:")
+                if (idx > 0 && idx + 3 <= t.length) {
+                    val ans = t.substring(idx + 3).trim()
+                    if (ans.isNotBlank()) {
+                        current.append(ans)
+                    }
+                }
+                return@forEach
+            }
+
+            // Continuation line (multi-line answer body).
+            if (current.isNotEmpty()) {
+                current.append('\n').append(line)
             }
         }
+
+        if (current.isNotEmpty()) flushCurrent()
         return out
     }
 
@@ -474,7 +515,7 @@ $userPrompt
      * - Deterministic "pseudo-random" based on prompt fingerprint is reproducible.
      */
     private fun shouldPrependNonJson(prompt: String): Boolean {
-        if (!config.occasionallyPrependNonJson) return false
+        if (!cfg.occasionallyPrependNonJson) return false
         val fp = promptFingerprint(prompt)
         // Roughly 1 out of 5 requests will prepend non-JSON text.
         return (fp % 5) == 0

@@ -222,6 +222,7 @@ class FakeAnswerValidator(
                 t == "none" ||
                 t == "unknown" ||
                 t == "idk" ||
+                t == "nil" ||
                 t == "-" ||
                 t == "--" ||
                 t == "?" ||
@@ -244,23 +245,55 @@ class FakeAnswerValidator(
      * Parse follow-up answers from either:
      * - VM-style history block: FOLLOW_UP_#_A: ...
      * - Single follow-up text (fallback)
+     *
+     * Notes:
+     * - Supports multi-line answers in history: continuation lines are included until the next "FOLLOW_UP_" marker.
+     * - Uses line-bounded block extraction to avoid accidental marker substring matches.
      */
     private fun parseFollowUpAnswers(text: String): List<String> {
         val raw = text.trim()
         if (raw.isEmpty() || raw == "(none)") return emptyList()
 
-        val history = extractBlock(raw, "FOLLOW_UP_HISTORY_BEGIN", "FOLLOW_UP_HISTORY_END") ?: raw
+        val history = extractBlockLineBounded(raw, "FOLLOW_UP_HISTORY_BEGIN", "FOLLOW_UP_HISTORY_END") ?: raw
 
         val out = mutableListOf<String>()
+        val current = StringBuilder()
+
+        fun flushCurrent() {
+            val s = current.toString().trim()
+            if (s.isNotBlank()) out += s
+            current.setLength(0)
+        }
+
+        var collecting = false
+
         history.lineSequence().forEach { line ->
             val t = line.trim()
-            if (!t.startsWith("FOLLOW_UP_")) return@forEach
-            val idx = t.indexOf("_A:")
-            if (idx > 0 && idx + 3 < t.length) {
-                val ans = t.substring(idx + 3).trim()
-                if (ans.isNotBlank()) out += ans
+
+            if (t.startsWith("FOLLOW_UP_")) {
+                // New marker begins: flush previous answer if we were collecting.
+                if (collecting && current.isNotEmpty()) flushCurrent()
+                collecting = false
+
+                // Collect only answers ("_A:").
+                val idx = t.indexOf("_A:")
+                if (idx > 0 && idx + 3 <= t.length) {
+                    val ans = t.substring(idx + 3).trim()
+                    if (ans.isNotBlank()) {
+                        current.append(ans)
+                        collecting = true
+                    }
+                }
+                return@forEach
+            }
+
+            // Continuation lines for a multi-line answer.
+            if (collecting) {
+                current.append('\n').append(line)
             }
         }
+
+        if (collecting && current.isNotEmpty()) flushCurrent()
 
         // If it didn't look like history, treat it as a single answer.
         if (out.isEmpty()) {
@@ -271,15 +304,31 @@ class FakeAnswerValidator(
     }
 
     /**
-     * Extract a multi-line block between markers.
+     * Extract a multi-line block between markers, treating markers as standalone lines.
+     *
+     * Why:
+     * - Avoid accidental matches if user content contains marker substrings.
+     * - Matches the "line-bounded" convention used elsewhere in the fake stack.
      */
-    private fun extractBlock(text: String, begin: String, end: String): String? {
-        val b = text.indexOf(begin)
-        if (b < 0) return null
-        val start = b + begin.length
-        val e = text.indexOf(end, startIndex = start)
-        if (e < 0) return null
-        return text.substring(start, e).trim()
+    private fun extractBlockLineBounded(text: String, begin: String, end: String): String? {
+        var inside = false
+        val out = StringBuilder()
+
+        text.lineSequence().forEach { line ->
+            val t = line.trim()
+            if (!inside) {
+                if (t == begin) inside = true
+                return@forEach
+            }
+
+            if (t == end) {
+                return out.toString().trim()
+            }
+
+            out.append(line).append('\n')
+        }
+
+        return null
     }
 
     /**
@@ -319,8 +368,6 @@ class FakeAnswerValidator(
     private suspend fun emitModelStreamIfEnabled(out: ValidationOutcome, phase: String) {
         val bridge = streamBridge ?: return
 
-        val sessionId = bridge.begin()
-
         val json = buildString {
             append("{")
             append("\"phase\":").append(phase.jsonQuote()).append(',')
@@ -334,6 +381,8 @@ class FakeAnswerValidator(
             append("}")
         }
 
+        val sessionId = bridge.begin()
+
         try {
             var i = 0
             while (i < json.length) {
@@ -344,25 +393,43 @@ class FakeAnswerValidator(
             }
             bridge.end(sessionId)
         } catch (ce: CancellationException) {
-            bridge.error(sessionId, "cancelled")
+            runCatching { bridge.error(sessionId, "cancelled") }
             throw ce
         } catch (_: Throwable) {
-            bridge.error(sessionId, "error")
+            runCatching { bridge.error(sessionId, "error") }
         }
     }
 
     /**
      * JSON-string-escape and wrap with quotes.
+     *
+     * Notes:
+     * - Escapes common control chars.
+     * - Escapes any other control character (< 0x20) as \\uXXXX.
      */
     private fun String.jsonQuote(): String {
-        val s = this
-            .replace("\\", "\\\\")
-            .replace("\"", "\\\"")
-            .replace("\b", "\\b")
-            .replace("\u000C", "\\f")
-            .replace("\n", "\\n")
-            .replace("\r", "\\r")
-            .replace("\t", "\\t")
-        return "\"$s\""
+        val sb = StringBuilder(this.length + 2)
+        sb.append('"')
+        for (ch in this) {
+            when (ch) {
+                '\\' -> sb.append("\\\\")
+                '"' -> sb.append("\\\"")
+                '\b' -> sb.append("\\b")
+                '\u000C' -> sb.append("\\f")
+                '\n' -> sb.append("\\n")
+                '\r' -> sb.append("\\r")
+                '\t' -> sb.append("\\t")
+                else -> {
+                    if (ch.code < 0x20) {
+                        sb.append("\\u")
+                        sb.append(ch.code.toString(16).padStart(4, '0'))
+                    } else {
+                        sb.append(ch)
+                    }
+                }
+            }
+        }
+        sb.append('"')
+        return sb.toString()
     }
 }

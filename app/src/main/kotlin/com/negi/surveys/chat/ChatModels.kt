@@ -13,6 +13,8 @@
 
 package com.negi.surveys.chat
 
+import androidx.compose.runtime.Immutable
+
 /**
  * Chat message role.
  *
@@ -72,6 +74,7 @@ enum class ChatStreamState {
  * @property streamCollapsed Whether [streamText] should be collapsed by default.
  * @property streamSessionId Optional stream session id (e.g., from ChatStreamBridge.begin()).
  */
+@Immutable
 data class ChatMessage(
     val id: String,
     val role: ChatRole,
@@ -101,7 +104,8 @@ data class ChatMessage(
      *   Otherwise the UI might not render the streaming bubble until the first chunk arrives.
      */
     val hasStreamDetails: Boolean
-        get() = streamState != ChatStreamState.NONE && (!streamText.isNullOrBlank() || streamState == ChatStreamState.STREAMING)
+        get() = streamState != ChatStreamState.NONE &&
+                (!streamText.isNullOrBlank() || streamState == ChatStreamState.STREAMING)
 
     /** True when this message is actively streaming. */
     val isStreaming: Boolean
@@ -144,9 +148,11 @@ data class ChatMessage(
      * Notes:
      * - This is a pure helper; it does not mutate.
      * - Applies an optional [maxChars] cap to bound memory usage.
+     * - Avoids surrogate pair splits when clipping (emoji-safe).
      */
     fun appendStreamChunk(chunk: String, maxChars: Int = Int.MAX_VALUE): ChatMessage {
         if (chunk.isEmpty()) return this
+
         val cap = maxChars.coerceAtLeast(0)
         if (cap == 0) return this
 
@@ -154,7 +160,9 @@ data class ChatMessage(
         val remain = cap - base.length
         if (remain <= 0) return this
 
-        val toAdd = if (chunk.length <= remain) chunk else chunk.substring(0, remain)
+        val toAdd = clipToRemainPreserveSurrogates(chunk, remain)
+        if (toAdd.isEmpty()) return this
+
         return copy(streamText = base + toAdd)
     }
 
@@ -340,6 +348,7 @@ enum class ValidationStatus {
  * @property assistantMessage Assistant feedback message for the user.
  * @property followUpQuestion Follow-up question if status == NEED_FOLLOW_UP.
  */
+@Immutable
 data class ValidationOutcome(
     val status: ValidationStatus,
     val assistantMessage: String,
@@ -385,4 +394,31 @@ data class ValidationOutcome(
             )
         }
     }
+}
+
+/**
+ * Clips [chunk] to at most [remain] UTF-16 code units, avoiding surrogate pair splits.
+ *
+ * Notes:
+ * - Kotlin String indexing uses UTF-16 code units.
+ * - If we cut between a high surrogate and low surrogate, the resulting String becomes invalid.
+ * - This helper steps back by 1 code unit when it detects such a split.
+ */
+private fun clipToRemainPreserveSurrogates(chunk: String, remain: Int): String {
+    if (remain <= 0) return ""
+    if (chunk.length <= remain) return chunk
+
+    var end = remain.coerceAtMost(chunk.length)
+    if (end <= 0) return ""
+
+    if (end < chunk.length) {
+        val last = chunk[end - 1]
+        val next = chunk[end]
+        if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
+            end -= 1
+        }
+    }
+
+    if (end <= 0) return ""
+    return chunk.substring(0, end)
 }

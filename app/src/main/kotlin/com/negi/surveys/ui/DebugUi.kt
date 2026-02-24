@@ -66,6 +66,7 @@ fun DebugPanel(
     modifier: Modifier = Modifier,
     maxCharsPerValue: Int = 96
 ) {
+    // English comments only.
     /** Clamp values defensively so debug rendering never breaks on odd inputs. */
     val maxValueChars = maxCharsPerValue.coerceAtLeast(0)
 

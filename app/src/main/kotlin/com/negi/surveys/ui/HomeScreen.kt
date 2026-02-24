@@ -64,6 +64,7 @@ fun HomeScreen(
     val latestOnStartSurvey by rememberUpdatedState(onStartSurvey)
     val latestOnExport by rememberUpdatedState(onExport)
 
+    // Debug-only "composed" trace (PII-safe).
     if (BuildConfig.DEBUG) {
         LaunchedEffect(Unit) {
             AppLog.d(TAG, "composed")

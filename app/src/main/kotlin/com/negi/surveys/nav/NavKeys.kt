@@ -13,6 +13,7 @@
 
 package com.negi.surveys.nav
 
+import androidx.navigation3.runtime.NavKey
 import kotlinx.serialization.Serializable
 
 /**
@@ -84,7 +85,7 @@ object QuestionIds {
 fun AppNavKey.appBarTitle(): String = when (this) {
     Home -> "Home"
     SurveyStart -> "Survey Start"
-    is Question -> "Question: $id"
+    is Question -> "Question: ${id.trim()}"
     Review -> "Review"
     Export -> "Export"
 }
@@ -99,7 +100,7 @@ fun AppNavKey.appBarTitle(): String = when (this) {
 fun AppNavKey.debugName(): String = when (this) {
     Home -> "Home"
     SurveyStart -> "SurveyStart"
-    is Question -> "Question(id=$id)"
+    is Question -> "Question(id=${id.trim()})"
     Review -> "Review"
     Export -> "Export"
 }
