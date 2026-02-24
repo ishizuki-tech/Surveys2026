@@ -45,6 +45,7 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -63,7 +64,7 @@ import com.negi.surveys.BuildConfig as AppBuildConfig
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.logging.GitHubLogUploadManager
-import com.negi.surveys.logging.LogUploadManager
+import com.negi.surveys.logging.SupabaseLogUploadManager
 import com.negi.surveys.nav.AppNavigator
 import com.negi.surveys.nav.Export
 import com.negi.surveys.nav.Home
@@ -99,6 +100,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
 
     BackHandler(enabled = canPop) {
         Log.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
+        AppLog.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
         nav.pop()
     }
 
@@ -116,17 +118,32 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     val exportText = exportTextState.value
 
     val streamBridge: ChatStreamBridge = remember {
-        ChatStreamBridge(logger = { Log.d("StreamBridge", it) })
+        ChatStreamBridge(
+            logger = {
+                Log.d("StreamBridge", it)
+                AppLog.d("StreamBridge", it)
+            }
+        )
     }
 
     val streamStats: ChatStreamBridge.StreamStats by streamBridge.stats.collectAsStateWithLifecycle()
 
-    LaunchedEffect(currentKey, canPop, logs.size, exportText.length, streamStats.activeSessionId, streamStats.droppedEvents) {
-        Log.d(
-            TAG,
-            "NavState: size=${backStack.size} canPop=$canPop current=${currentKey.javaClass.simpleName} " +
-                    "logs=${logs.size} exportLen=${exportText.length} streamActive=${streamStats.activeSessionId} dropped=${streamStats.droppedEvents}"
-        )
+    if (AppBuildConfig.DEBUG) {
+        LaunchedEffect(
+            currentKey,
+            canPop,
+            logs.size,
+            exportText.length,
+            streamStats.activeSessionId,
+            streamStats.droppedEvents
+        ) {
+            Log.d(
+                TAG,
+                "NavState: size=${backStack.size} canPop=$canPop current=${currentKey.javaClass.simpleName} " +
+                        "logs=${logs.size} exportLen=${exportText.length} streamActive=${streamStats.activeSessionId} " +
+                        "dropped=${streamStats.droppedEvents}"
+            )
+        }
     }
 
     val buildLabel = remember { buildLabelSafe() }
@@ -144,7 +161,8 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         streamStats.ignoredError,
         streamStats.ignoredCancel
     ) {
-        val ignoredTotal = streamStats.ignoredDelta + streamStats.ignoredEnd + streamStats.ignoredError + streamStats.ignoredCancel
+        val ignoredTotal =
+            streamStats.ignoredDelta + streamStats.ignoredEnd + streamStats.ignoredError + streamStats.ignoredCancel
 
         DebugInfo(
             currentRoute = titleFor(currentKey),
@@ -165,46 +183,52 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         )
     }
 
+    val latestDebugInfo by rememberUpdatedState(debugInfo)
+
     val appContext = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
     var uploadStatus by remember { mutableStateOf<String?>(null) }
+    val latestUploadStatus by rememberUpdatedState(uploadStatus)
 
-    fun startManualUpload(from: String) {
-        scope.launch(Dispatchers.IO) {
-            val reason = "manual:$from"
-            val gh = runCatching {
-                if (GitHubLogUploadManager.isConfigured()) {
-                    GitHubLogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
-                } else null
-            }.getOrNull()
+    val startManualUpload: (String) -> Unit = remember(appContext, scope) {
+        { from ->
+            scope.launch(Dispatchers.IO) {
+                val reason = "manual:$from"
 
-            val sb = runCatching {
-                if (LogUploadManager.isConfigured()) {
-                    LogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
-                } else null
-            }.getOrNull()
+                val gh = runCatching {
+                    if (GitHubLogUploadManager.isConfigured()) {
+                        GitHubLogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
+                    } else null
+                }.getOrNull()
 
-            val summary = buildString {
-                append("gh=").append(gh ?: "fail").append(" sb=").append(sb ?: "fail")
-            }
+                val sb = runCatching {
+                    if (SupabaseLogUploadManager.isConfigured()) {
+                        SupabaseLogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
+                    } else null
+                }.getOrNull()
 
-            AppLog.i(TAG, "manual upload: $summary")
-            Log.d(TAG, "manual upload: $summary")
+                val summary = buildString {
+                    append("gh=").append(gh ?: "fail").append(" sb=").append(sb ?: "fail")
+                }
 
-            withContext(Dispatchers.Main) {
-                uploadStatus = summary
-                Toast.makeText(appContext, "Upload: $summary", Toast.LENGTH_SHORT).show()
+                AppLog.i(TAG, "manual upload: $summary")
+                Log.d(TAG, "manual upload: $summary")
+
+                withContext(Dispatchers.Main) {
+                    uploadStatus = summary
+                    Toast.makeText(appContext, "Upload: $summary", Toast.LENGTH_SHORT).show()
+                }
             }
         }
     }
 
-    val entries: (NavKey) -> NavEntry<NavKey> = remember(nav, prompts, sessionVm, debugInfo, uploadStatus) {
+    val entries: (NavKey) -> NavEntry<NavKey> = remember(nav, prompts, sessionVm) {
         entryProvider {
             entry<Home> {
                 HomeScreen(
                     onStartSurvey = { nav.startSurvey() },
                     onExport = { nav.goExport() },
-                    debugInfo = debugInfo
+                    debugInfo = latestDebugInfo
                 )
             }
 
@@ -212,7 +236,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 SurveyStartScreen(
                     onBegin = { nav.beginQuestions("Q1") },
                     onBack = { nav.pop() },
-                    debugInfo = debugInfo
+                    debugInfo = latestDebugInfo
                 )
             }
 
@@ -243,7 +267,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                     onExport = { nav.goExport() },
                     onBack = { nav.pop() },
                     onUploadLogs = { startManualUpload("review") },
-                    uploadStatusLine = uploadStatus
+                    uploadStatusLine = latestUploadStatus
                 )
             }
 

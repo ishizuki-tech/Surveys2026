@@ -66,28 +66,34 @@ fun DebugPanel(
     modifier: Modifier = Modifier,
     maxCharsPerValue: Int = 96
 ) {
-    /**
-     * Clamp values defensively so debug rendering never breaks on odd inputs.
-     */
+    /** Clamp values defensively so debug rendering never breaks on odd inputs. */
     val maxValueChars = maxCharsPerValue.coerceAtLeast(0)
 
     val route = debugInfo.currentRoute
-        .trim()
+        .sanitizeSingleLine()
         .ifBlank { "(none)" }
         .ellipsize(maxChars = maxValueChars)
 
     val build = debugInfo.buildLabel
-        ?.trim()
+        ?.sanitizeSingleLine()
+        ?.ifBlank { "" }
         ?.takeIf { it.isNotEmpty() }
         ?.ellipsize(maxChars = maxValueChars)
 
     val extras = debugInfo.extras
         .asSequence()
         .map { row ->
-            DebugRow(
-                label = row.label.trim().ifBlank { "(key)" }.ellipsize(32),
-                value = row.value.trim().ifBlank { "(none)" }.ellipsize(maxValueChars)
-            )
+            val k = row.label
+                .sanitizeSingleLine()
+                .ifBlank { "(key)" }
+                .ellipsize(32)
+
+            val v = row.value
+                .sanitizeSingleLine()
+                .ifBlank { "(none)" }
+                .ellipsize(maxValueChars)
+
+            DebugRow(label = k, value = v)
         }
         .toList()
 
@@ -145,4 +151,28 @@ private fun String.ellipsize(maxChars: Int): String {
     if (length <= maxChars) return this
     if (maxChars == 1) return "…"
     return take(maxChars - 1) + "…"
+}
+
+/**
+ * Sanitizes debug strings to a single line:
+ * - Converts CR/LF/TAB to spaces
+ * - Drops other control chars (< 0x20)
+ * - Trims extra whitespace
+ */
+private fun String.sanitizeSingleLine(): String {
+    if (isEmpty()) return ""
+    val out = StringBuilder(length)
+    for (ch in this) {
+        when (ch) {
+            '\n', '\r', '\t' -> out.append(' ')
+            else -> {
+                if (ch.code < 0x20) {
+                    // Drop remaining control chars.
+                } else {
+                    out.append(ch)
+                }
+            }
+        }
+    }
+    return out.toString().trim().replace(Regex("\\s+"), " ")
 }

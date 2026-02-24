@@ -14,6 +14,7 @@
 package com.negi.surveys.ui
 
 import androidx.compose.runtime.Immutable
+import com.negi.surveys.BuildConfig
 
 /**
  * Review model types.
@@ -22,11 +23,18 @@ import androidx.compose.runtime.Immutable
  * - Immutable snapshot models for Review/Export.
  * - Keep deterministic and stable across recompositions.
  */
-enum class ReviewChatKind {
-    USER,
-    AI,
-    FOLLOW_UP,
-    MODEL_RAW
+
+/**
+ * Chat line kind for review/export.
+ *
+ * Notes:
+ * - [wireName] is a stable string used for export (rename-safe).
+ */
+enum class ReviewChatKind(val wireName: String) {
+    USER("user"),
+    AI("ai"),
+    FOLLOW_UP("follow_up"),
+    MODEL_RAW("model_raw")
 }
 
 /**
@@ -39,7 +47,20 @@ enum class ReviewChatKind {
 data class ReviewChatLine(
     val kind: ReviewChatKind,
     val text: String
-)
+) {
+    companion object {
+        /**
+         * Safe factory to normalize input.
+         *
+         * Notes:
+         * - Trims nothing by default (preserve content).
+         * - Guards against null-like accidents by converting to empty string.
+         */
+        fun of(kind: ReviewChatKind, text: String?): ReviewChatLine {
+            return ReviewChatLine(kind = kind, text = text.orEmpty())
+        }
+    }
+}
 
 /**
  * Snapshot log for a single question.
@@ -55,7 +76,48 @@ data class ReviewQuestionLog(
     val isSkipped: Boolean,
     val completionPayload: String,
     val lines: List<ReviewChatLine>
-)
+) {
+    companion object {
+        /**
+         * Safe factory that creates a defensive snapshot.
+         *
+         * Why:
+         * - Callers might pass a MutableList and mutate it later by mistake.
+         * - This factory snapshots the list to reduce "accidental mutation" bugs.
+         *
+         * Notes:
+         * - In debug builds, we validate invariants more strictly.
+         */
+        fun of(
+            questionId: String,
+            prompt: String,
+            isSkipped: Boolean,
+            completionPayload: String,
+            lines: List<ReviewChatLine>
+        ): ReviewQuestionLog {
+            val qid = questionId.trim()
+            val pr = prompt
+            val payload = completionPayload
+
+            if (BuildConfig.DEBUG) {
+                require(qid.isNotBlank()) { "questionId must not be blank" }
+                require(pr.isNotBlank()) { "prompt must not be blank" }
+                require(payload.isNotBlank()) { "completionPayload must not be blank" }
+            }
+
+            // Defensive snapshot: avoid later mutation via MutableList references.
+            val snapLines = lines.toList()
+
+            return ReviewQuestionLog(
+                questionId = qid,
+                prompt = pr,
+                isSkipped = isSkipped,
+                completionPayload = payload,
+                lines = snapLines
+            )
+        }
+    }
+}
 
 /**
  * Flattened, review-friendly timeline items.

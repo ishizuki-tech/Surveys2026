@@ -47,6 +47,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
+import com.negi.surveys.logging.AppLog
 import java.security.MessageDigest
 
 /**
@@ -80,42 +81,61 @@ fun QuestionScreen(
      */
     var answer by rememberSaveable(questionId) { mutableStateOf("") }
 
+    /** Prevent double-submit from rapid taps / IME spam. */
+    var submitInFlight by remember(questionId) { mutableStateOf(false) }
+
     /**
      * Apply initialAnswer only if the user hasn't typed yet, to avoid overwriting input.
      */
     LaunchedEffect(questionId, initialAnswer) {
         if (answer.isBlank() && initialAnswer.isNotBlank()) {
             answer = initialAnswer
-            Log.d(TAG, "QuestionScreen: applied initialAnswer qid=$questionId len=${initialAnswer.length}")
+            AppLog.d(TAG, "applied initialAnswer qid=$questionId len=${initialAnswer.length}")
+            Log.d(TAG, "applied initialAnswer qid=$questionId len=${initialAnswer.length}")
         }
     }
 
-    val trimmed by remember { derivedStateOf { answer.trim() } }
-    val isValid by remember { derivedStateOf { trimmed.isNotEmpty() } }
-    val answerLen by remember { derivedStateOf { answer.length } }
+    val trimmed by remember(answer) { derivedStateOf { answer.trim() } }
+    val isValid by remember(trimmed) { derivedStateOf { trimmed.isNotEmpty() } }
+    val answerLen by remember(answer) { derivedStateOf { answer.length } }
 
     LaunchedEffect(questionId) {
-        Log.d(TAG, "QuestionScreen: composed qid=$questionId")
+        AppLog.d(TAG, "composed qid=$questionId")
+        Log.d(TAG, "composed qid=$questionId")
     }
 
     DisposableEffect(questionId) {
         onDispose {
-            Log.d(TAG, "QuestionScreen: disposed qid=$questionId")
+            AppLog.d(TAG, "disposed qid=$questionId")
+            Log.d(TAG, "disposed qid=$questionId")
         }
     }
 
     fun submitIfValid() {
-        if (!isValid) {
-            Log.d(TAG, "QuestionScreen: submit blocked (invalid) qid=$questionId len=$answerLen")
+        if (submitInFlight) {
+            AppLog.w(TAG, "submit blocked (inFlight) qid=$questionId")
             return
         }
+
+        val text = answer.trim()
+        if (text.isEmpty()) {
+            AppLog.d(TAG, "submit blocked (invalid) qid=$questionId len=$answerLen")
+            Log.d(TAG, "submit blocked (invalid) qid=$questionId len=$answerLen")
+            return
+        }
+
+        submitInFlight = true
+
         /**
          * Avoid logging full answer (potentially sensitive user input).
          * Log only length + short SHA-256 prefix.
          */
-        val sha8 = sha256Hex(trimmed).take(8)
-        Log.d(TAG, "QuestionScreen: next qid=$questionId len=${trimmed.length} sha8=$sha8")
-        onNext(trimmed)
+        val sha8 = sha256Hex(text).take(8)
+        AppLog.i(TAG, "next qid=$questionId len=${text.length} sha8=$sha8")
+        Log.d(TAG, "next qid=$questionId len=${text.length} sha8=$sha8")
+
+        // Let the parent navigate; if it returns to this screen, state will be reset by questionId change.
+        onNext(text)
     }
 
     Column(
@@ -140,7 +160,10 @@ fun QuestionScreen(
 
         OutlinedTextField(
             value = answer,
-            onValueChange = { newValue -> answer = newValue },
+            onValueChange = { newValue ->
+                answer = newValue
+                if (submitInFlight) submitInFlight = false
+            },
             modifier = Modifier.fillMaxWidth(),
             label = { Text("Your answer") },
             singleLine = false,
@@ -153,9 +176,7 @@ fun QuestionScreen(
                 onDone = { submitIfValid() }
             ),
             supportingText = {
-                /**
-                 * Show debug-friendly metadata without exposing the answer itself.
-                 */
+                /** Show debug-friendly metadata without exposing the answer itself. */
                 Text("Length: $answerLen")
             }
         )
@@ -168,18 +189,20 @@ fun QuestionScreen(
         ) {
             OutlinedButton(
                 onClick = {
-                    Log.d(TAG, "QuestionScreen: back clicked qid=$questionId")
+                    AppLog.d(TAG, "back clicked qid=$questionId")
+                    Log.d(TAG, "back clicked qid=$questionId")
                     onBack()
-                }
+                },
+                enabled = !submitInFlight
             ) {
                 Text("Back")
             }
 
             Button(
                 onClick = { submitIfValid() },
-                enabled = isValid
+                enabled = isValid && !submitInFlight
             ) {
-                Text("Next")
+                Text(if (submitInFlight) "Submitting..." else "Next")
             }
         }
 
@@ -197,14 +220,16 @@ fun QuestionScreen(
  * - Do not log full input values.
  */
 private fun sha256Hex(text: String): String {
-    val digest = MessageDigest.getInstance("SHA-256")
-    val bytes = digest.digest(text.toByteArray(Charsets.UTF_8))
-    val sb = StringBuilder(bytes.size * 2)
-    for (b in bytes) {
-        sb.append(((b.toInt() shr 4) and 0xF).toString(16))
-        sb.append((b.toInt() and 0xF).toString(16))
+    val digest = MessageDigest.getInstance("SHA-256").digest(text.toByteArray(Charsets.UTF_8))
+    val hexChars = "0123456789abcdef".toCharArray()
+    val out = CharArray(digest.size * 2)
+    var j = 0
+    for (b in digest) {
+        val v = b.toInt() and 0xFF
+        out[j++] = hexChars[v ushr 4]
+        out[j++] = hexChars[v and 0x0F]
     }
-    return sb.toString()
+    return String(out)
 }
 
 private const val TAG = "QuestionScreen"
