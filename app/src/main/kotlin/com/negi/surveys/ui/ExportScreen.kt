@@ -102,7 +102,7 @@ fun ExportScreen(
     val sha256 = digest.sha256
     val lenBytes = digest.utf8Bytes
 
-    // English comments only.
+    
     /** Track whether the user manually toggled the preview/full mode. */
     var userToggled by remember { mutableStateOf(false) }
 
@@ -111,7 +111,7 @@ fun ExportScreen(
     // - If digest isn't ready yet, start in preview mode and correct once bytes are known.
     var showFull by remember { mutableStateOf(false) }
 
-    // English comments only.
+    
     /** Auto-select showFull once bytes are known, but do NOT override user's manual choice. */
     LaunchedEffect(lenBytes) {
         if (userToggled) return@LaunchedEffect
@@ -410,7 +410,7 @@ private fun shareAsFileViaFileProvider(context: Context, subject: String, text: 
 
         outFile.writeText(text, Charsets.UTF_8)
 
-        // English comments only.
+        
         /** Prefer APPLICATION_ID-based authority; fallback to packageName-based authority. */
         val authorities = listOf(
             BuildConfig.APPLICATION_ID + ".fileprovider",
@@ -431,7 +431,7 @@ private fun shareAsFileViaFileProvider(context: Context, subject: String, text: 
             throw IllegalArgumentException("FileProvider authority not configured: tried=$authorities")
         }
 
-        // English comments only.
+        
         /** Use EXTRA_STREAM for large payloads; keep MIME flexible for broad app compatibility. */
         val intent = Intent(Intent.ACTION_SEND).apply {
             type = "application/json"

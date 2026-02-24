@@ -180,7 +180,7 @@ class AppNavigator(
         object Default : Logger {
             private const val TAG = "AppNavigator"
 
-            // English comments only.
+            
             /** Toggle navigator debug logging. */
             private const val ENABLED = true
 

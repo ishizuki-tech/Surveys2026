@@ -90,7 +90,7 @@ fun ReviewScreen(
         timeline ?: buildTimelineFromLogs(sortedLogs)
     }
 
-    // English comments only.
+    
     /** Debug: detect duplicate timeline keys early (should be impossible after index-based keys). */
     LaunchedEffect(timelineKey ?: logsKey) {
         if (!BuildConfig.DEBUG) return@LaunchedEffect
@@ -230,7 +230,7 @@ fun ReviewScreen(
                     ReviewViewMode.TIMELINE -> {
                         itemsIndexed(
                             items = resolvedTimeline,
-                            // English comments only.
+                            
                             // Keys MUST be unique among siblings. Never use content-based keys for MODEL_RAW.
                             key = { idx, item -> timelineRowKey(idx, item) }
                         ) { idx, item ->
@@ -244,7 +244,7 @@ fun ReviewScreen(
                     ReviewViewMode.BY_QUESTION -> {
                         itemsIndexed(
                             items = sortedLogs,
-                            // English comments only.
+                            
                             // Be robust even if questionId duplicates by mistake.
                             key = { idx, item -> "${item.questionId}:$idx" }
                         ) { _, log ->
@@ -432,7 +432,7 @@ private fun timelineItemFingerprint(item: ReviewTimelineItem): Int {
 }
 
 private fun timelineRowKey(index: Int, item: ReviewTimelineItem): String {
-    // English comments only.
+    
     // Compose requires unique keys among sibling items. Use index-based keys to guarantee uniqueness.
     return when (item) {
         is ReviewTimelineItem.QuestionHeader -> "H:${item.questionId}:$index"
@@ -519,7 +519,7 @@ private fun TimelineLineBubble(
     val isRaw = line.kind == ReviewChatKind.MODEL_RAW
     val canToggle = isRaw && line.text.length > 260
 
-    // English comments only.
+    
     // Stable expansion key: prefer per-row key so identical raw text does not cross-toggle.
     val key = if (isRaw) rawLineKeyForRow(item.questionId, index, line.text) else null
     val expanded = if (key == null) false else (rawExpanded[key] ?: false)
@@ -671,7 +671,7 @@ private fun QuestionTranscriptCard(
 
             log.lines.forEachIndexed { index, line ->
                 val isRaw = line.kind == ReviewChatKind.MODEL_RAW
-                // English comments only.
+                
                 // Stable expansion key: keep per-row uniqueness to avoid cross-question collisions.
                 val key = if (isRaw) rawLineKeyForRow(log.questionId, index, line.text) else "${log.questionId}:$index"
                 val expanded = rawExpanded[key] ?: false
@@ -864,14 +864,14 @@ private fun logFingerprint(log: ReviewQuestionLog): Int {
 }
 
 private fun rawLineKey(questionId: String, rawText: String): String {
-    // English comments only.
+    
     // This key is ONLY for expansion-state tracking (not for LazyColumn item keys).
     // NOTE: This can collide across rows if text is identical. Prefer rawLineKeyForRow for per-row toggles.
     return "$questionId:raw:${rawText.length}:${rawText.hashCode()}"
 }
 
 private fun rawLineKeyForRow(questionId: String, index: Int, rawText: String): String {
-    // English comments only.
+    
     // Stable expansion key per row: avoids cross-toggle when identical raw text appears multiple times.
     return "$questionId:rawRow:$index:${rawText.length}:${rawText.hashCode()}"
 }
