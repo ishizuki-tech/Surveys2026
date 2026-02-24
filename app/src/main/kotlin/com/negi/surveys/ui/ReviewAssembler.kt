@@ -139,13 +139,13 @@ object ReviewAssembler {
     ): List<ReviewChatLine> {
         if (isEmpty()) return emptyList()
 
-        // English comments only.
+        
         /** Prefer embedded model output on ASSISTANT messages over transient MODEL bubbles. */
         val hasEmbeddedModelOutput = any { it.role == ChatRole.ASSISTANT && !it.streamText.isNullOrBlank() }
 
         val out = ArrayList<ReviewChatLine>(size * 2)
 
-        // English comments only.
+        
         /** De-duplicate MODEL_RAW lines by content signature to reduce double-counting. */
         val seenModelRaw = HashSet<String>(8)
 
@@ -178,7 +178,7 @@ object ReviewAssembler {
                     val a = m.assistantMessage?.trim().orEmpty()
                     val q = normalizeFollowUp(m.followUpQuestion)
 
-                    // English comments only.
+                    
                     /** Drop the initial seed prompt bubble to avoid duplication in Review. */
                     val isSeedPrompt =
                         !seenUser &&
@@ -301,7 +301,7 @@ object ReviewAssembler {
     // Signatures
     // ---------------------------------------------------------------------
 
-    // English comments only.
+    
     /** SHA-256 hex for content de-dup signatures (fast enough for review assembly). */
     private fun sha256Hex(text: String): String {
         val digest = MessageDigest.getInstance("SHA-256")

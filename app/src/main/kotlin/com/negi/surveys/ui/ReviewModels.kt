@@ -49,6 +49,16 @@ enum class ReviewChatKind(val wireName: String) {
             val w = wireName?.trim()?.lowercase() ?: return null
             return entries.firstOrNull { it.wireName == w }
         }
+
+        /**
+         * Parse a persisted/exported wire name into an enum, with a fallback.
+         *
+         * Notes:
+         * - This is useful at rendering time where you prefer "show something" over null handling.
+         */
+        fun fromWireNameOr(wireName: String?, fallback: ReviewChatKind): ReviewChatKind {
+            return fromWireName(wireName) ?: fallback
+        }
     }
 }
 
@@ -82,7 +92,8 @@ data class ReviewChatLine(
  *
  * Notes:
  * - [lines] must be treated as an immutable snapshot (no mutation after creation).
- * - [completionPayload] is expected to be non-empty by contract (skipped payload is generated if needed).
+ * - [completionPayload] should be non-empty by contract.
+ *   If [isSkipped] is true and a blank payload is provided, we auto-generate a stable skipped payload.
  */
 @Immutable
 data class ReviewQuestionLog(
@@ -111,6 +122,7 @@ data class ReviewQuestionLog(
          * Notes:
          * - In debug builds, we validate invariants more strictly.
          * - Does not trim prompt/payload to preserve export fidelity.
+         * - Always trims [questionId] to make keys stable for map usage.
          */
         fun of(
             questionId: String,
@@ -121,20 +133,36 @@ data class ReviewQuestionLog(
         ): ReviewQuestionLog {
             val qid = questionId.trim()
 
+            // Generate a stable payload for skipped questions if the caller forgets to provide one.
+            val payload =
+                if (completionPayload.isNotBlank()) {
+                    completionPayload
+                } else {
+                    if (isSkipped) SKIPPED_PAYLOAD_V1 else completionPayload
+                }
+
             if (BuildConfig.DEBUG) {
                 require(qid.isNotBlank()) { "questionId must not be blank" }
                 require(prompt.isNotBlank()) { "prompt must not be blank" }
-                require(completionPayload.isNotBlank()) { "completionPayload must not be blank" }
+                require(payload.isNotBlank()) { "completionPayload must not be blank (or provide isSkipped=true)" }
             }
 
             return ReviewQuestionLog(
                 questionId = qid,
                 prompt = prompt,
                 isSkipped = isSkipped,
-                completionPayload = completionPayload,
+                completionPayload = payload,
                 lines = lines.toList()
             )
         }
+
+        /**
+         * Stable skipped payload for export/debug.
+         *
+         * Notes:
+         * - Keep this string stable across releases to avoid unnecessary diffs in exported artifacts.
+         */
+        private const val SKIPPED_PAYLOAD_V1 = "{\"skipped\":true}"
     }
 }
 

@@ -32,12 +32,18 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.AppLog
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 
 private const val TAG = "HomeScreen"
 
@@ -58,11 +64,33 @@ private const val TAG = "HomeScreen"
 fun HomeScreen(
     onStartSurvey: () -> Unit,
     onExport: () -> Unit,
-    debugInfo: DebugInfo? = null
+    debugInfo: DebugInfo? = null,
+    exportEnabled: Boolean = true
 ) {
     // Always call the latest callbacks, even if the lambdas change across recompositions.
     val latestOnStartSurvey by rememberUpdatedState(onStartSurvey)
     val latestOnExport by rememberUpdatedState(onExport)
+
+    val scope = rememberCoroutineScope()
+
+    // Simple click guard to prevent double navigation due to rapid taps.
+    var clickLocked by remember { mutableStateOf(false) }
+
+    fun runGuardedClick(actionName: String, block: () -> Unit) {
+        if (clickLocked) {
+            AppLog.w(TAG, "click: ignored (locked) action=$actionName")
+            return
+        }
+        clickLocked = true
+        AppLog.i(TAG, "click: $actionName")
+        block()
+
+        // Unlock shortly after to avoid accidental double triggers.
+        scope.launch {
+            delay(350L)
+            clickLocked = false
+        }
+    }
 
     // Debug-only "composed" trace (PII-safe).
     if (BuildConfig.DEBUG) {
@@ -99,8 +127,9 @@ fun HomeScreen(
 
         Button(
             onClick = {
-                AppLog.i(TAG, "click: startSurvey")
-                latestOnStartSurvey()
+                runGuardedClick("startSurvey") {
+                    latestOnStartSurvey()
+                }
             },
             modifier = Modifier
                 .fillMaxWidth()
@@ -113,9 +142,11 @@ fun HomeScreen(
 
         OutlinedButton(
             onClick = {
-                AppLog.i(TAG, "click: export")
-                latestOnExport()
+                runGuardedClick("export") {
+                    latestOnExport()
+                }
             },
+            enabled = exportEnabled,
             modifier = Modifier
                 .fillMaxWidth()
                 .testTag("home_export")

@@ -49,6 +49,7 @@ class SurveySessionViewModel : ViewModel() {
      * Notes:
      * - Uses "natural" ordering for IDs like Q1..Q10 (instead of lexical Q1,Q10,Q2).
      * - If an ID doesn't match the expected pattern, it falls back to raw string ordering.
+     * - Prefix ordering is case-insensitive for stability across data sources.
      */
     val logs: StateFlow<List<ReviewQuestionLog>> =
         _logsMap
@@ -57,7 +58,7 @@ class SurveySessionViewModel : ViewModel() {
                     .map { it to questionIdKey(it.questionId) }
                     .sortedWith(
                         compareBy<Pair<ReviewQuestionLog, QuestionIdKey>>(
-                            { it.second.prefix },
+                            { it.second.prefixSort },
                             { it.second.number },
                             { it.second.raw }
                         )
@@ -107,34 +108,40 @@ class SurveySessionViewModel : ViewModel() {
      *
      * Concurrency note:
      * - StateFlow.updateAndGet() may retry the lambda under contention.
-     * - Do NOT mutate outer variables inside the update lambda. Determine acceptance from final state.
+     * - Do NOT mutate outer variables inside the update lambda.
      */
     fun upsertLog(log: ReviewQuestionLog) {
-        val qid = log.questionId.trim()
-        val normalized = if (qid == log.questionId) log else log.copy(questionId = qid)
+        val key = log.questionId.trim()
+        if (key.isEmpty()) {
+            AppLog.w(TAG, "upsertLog: ignored (blank questionId)")
+            return
+        }
+
+        val normalized = if (key == log.questionId) log else log.copy(questionId = key)
 
         val after = _logsMap.updateAndGet { prev ->
-            val existing = prev[qid]
+            val existing = prev[key]
             val should = existing == null || shouldAcceptUpdate(existing, normalized)
             if (!should) return@updateAndGet prev
 
             val next = prev.toMutableMap()
-            next[qid] = normalized
+            next[key] = normalized
             next.toMap()
         }
 
-        val accepted = after[qid] === normalized
+        // Reference check is intentional: we want to know if *this exact incoming instance* won.
+        val accepted = after[key] === normalized
 
         if (accepted) {
             AppLog.d(
                 TAG,
-                "upsertLog: accepted qid=$qid skipped=${normalized.isSkipped} " +
+                "upsertLog: accepted qid=$key skipped=${normalized.isSkipped} " +
                         "lines=${normalized.lines.size} payloadLen=${normalized.completionPayload.length}"
             )
         } else {
             AppLog.w(
                 TAG,
-                "upsertLog: dropped(stale) qid=$qid skipped=${normalized.isSkipped} " +
+                "upsertLog: dropped(stale) qid=$key skipped=${normalized.isSkipped} " +
                         "lines=${normalized.lines.size} payloadLen=${normalized.completionPayload.length}"
             )
         }
@@ -226,22 +233,33 @@ class SurveySessionViewModel : ViewModel() {
      * Decide whether to accept an incoming update for the same questionId.
      */
     private fun shouldAcceptUpdate(existing: ReviewQuestionLog, incoming: ReviewQuestionLog): Boolean {
+        // Always accept explicit user action changes.
         if (existing.isSkipped != incoming.isSkipped) return true
 
-        val existingLines = existing.lines.size
-        val incomingLines = incoming.lines.size
-        if (incomingLines != existingLines) return incomingLines > existingLines
+        // Prefer "more complete" logs.
+        // Priority: lines -> payload -> prompt (same as the previous implementation).
+        val existingScore = completenessScore(existing)
+        val incomingScore = completenessScore(incoming)
+        if (incomingScore != existingScore) return incomingScore > existingScore
 
-        val existingPayload = existing.completionPayload.length
-        val incomingPayload = incoming.completionPayload.length
-        if (incomingPayload != existingPayload) return incomingPayload > existingPayload
-
-        val existingPrompt = existing.prompt.length
-        val incomingPrompt = incoming.prompt.length
-        if (incomingPrompt != existingPrompt) return incomingPrompt > existingPrompt
-
-        // If all heuristics are tied, accept the incoming update to allow minor edits.
+        // If tied, accept the incoming update to allow minor edits.
         return true
+    }
+
+    /**
+     * Compute a monotonic score for "completeness".
+     *
+     * Note:
+     * - We intentionally weigh line count the heaviest to prioritize transcript integrity.
+     */
+    private fun completenessScore(log: ReviewQuestionLog): Long {
+        val lines = log.lines.size.coerceAtLeast(0).toLong()
+        val payload = log.completionPayload.length.coerceAtLeast(0).toLong()
+        val prompt = log.prompt.length.coerceAtLeast(0).toLong()
+
+        // Weighting chosen to preserve the original priority order.
+        // lines dominates payload, payload dominates prompt.
+        return (lines * 1_000_000_000L) + (payload * 1_000L) + prompt
     }
 
     /**
@@ -279,15 +297,26 @@ class SurveySessionViewModel : ViewModel() {
         val raw = id.trim()
         val m = ID_PATTERN.matchEntire(raw)
         if (m != null) {
-            val prefix = m.groupValues[1]
+            val prefixRaw = m.groupValues[1]
             val number = m.groupValues[2].toIntOrNull() ?: Int.MAX_VALUE
-            return QuestionIdKey(prefix = prefix, number = number, raw = raw)
+            return QuestionIdKey(
+                prefixSort = prefixRaw.lowercase(),
+                prefixRaw = prefixRaw,
+                number = number,
+                raw = raw
+            )
         }
-        return QuestionIdKey(prefix = raw, number = Int.MAX_VALUE, raw = raw)
+        return QuestionIdKey(
+            prefixSort = raw.lowercase(),
+            prefixRaw = raw,
+            number = Int.MAX_VALUE,
+            raw = raw
+        )
     }
 
     private data class QuestionIdKey(
-        val prefix: String,
+        val prefixSort: String,
+        val prefixRaw: String,
         val number: Int,
         val raw: String
     )

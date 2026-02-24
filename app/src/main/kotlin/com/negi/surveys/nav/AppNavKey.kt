@@ -64,7 +64,7 @@ fun NavKey.requireAppNavKey(context: String = "NavKey"): AppNavKey {
  *   but does not replace proper type discipline in key definitions.
  */
 fun NavBackStack<NavKey>.assertAllAppKeys(context: String = "NavBackStack") {
-    // English comments only.
+    
     /** Fail fast with the first offending key for concise error messages. */
     forEachIndexed { idx, key ->
         if (key !is AppNavKey) {
@@ -81,7 +81,7 @@ fun NavBackStack<NavKey>.assertAllAppKeys(context: String = "NavBackStack") {
  * - Keeping the assertion shared avoids duplicating loops in AppNavigator and elsewhere.
  */
 fun List<NavKey>.assertAllAppKeys(context: String = "NavKeyList") {
-    // English comments only.
+    
     /** Fail fast with the first offending key for concise error messages. */
     forEachIndexed { idx, key ->
         if (key !is AppNavKey) {

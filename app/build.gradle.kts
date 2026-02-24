@@ -18,8 +18,16 @@ import org.jetbrains.kotlin.gradle.tasks.KotlinCompile
 
 plugins {
     alias(libs.plugins.android.application)
-    alias(libs.plugins.kotlin.android)
+
+    // NOTE:
+    // - AGP 9+ has built-in Kotlin support.
+    // - Do NOT apply org.jetbrains.kotlin.android (kotlin-android) here. :contentReference[oaicite:1]{index=1}
+
+    // Compose compiler Gradle plugin (should map to id "org.jetbrains.kotlin.plugin.compose")
+    // See Compose compiler plugin setup docs. :contentReference[oaicite:2]{index=2}
     alias(libs.plugins.kotlin.compose)
+
+    // Kotlinx Serialization compiler plugin
     alias(libs.plugins.kotlin.serialization)
 }
 

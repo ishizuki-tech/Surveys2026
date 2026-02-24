@@ -84,7 +84,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SurveyAppRoot(modifier: Modifier = Modifier) {
     val backStack: NavBackStack<NavKey> = rememberNavBackStack(Home)
@@ -189,7 +188,6 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         )
     }
 
-    // English comments only.
     /** Keep State wrappers stable so entryProvider can read the latest values without being rebuilt. */
     val debugInfoState: State<DebugInfo> = rememberUpdatedState(debugInfo)
 
