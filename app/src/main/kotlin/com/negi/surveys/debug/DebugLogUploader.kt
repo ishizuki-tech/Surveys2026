@@ -31,7 +31,7 @@ import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 /**
- * Collects a debug log file on-device and uploads it (Supabase preferred, GitHub fallback).
+ * Collects a debug log file on-device and uploads it (GitHub only).
  *
  * Notes:
  * - Never prints secret values.
@@ -54,7 +54,7 @@ object DebugLogUploader {
      * Behavior:
      * 1) Collect logcat for this process (best-effort).
      * 2) Write to filesDir/logs/...
-     * 3) Upload to Supabase if configured; otherwise GitHub; otherwise return local path.
+     * 3) Upload to GitHub if configured; otherwise return local path.
      */
     suspend fun collectAndUpload(context: Context): UploadResult = withContext(Dispatchers.IO) {
         val file = runCatching { collectLogFile(context) }
@@ -64,18 +64,13 @@ object DebugLogUploader {
                 writeFallbackFile(context, "collectLogFile failed: ${e.javaClass.simpleName}: ${e.message}")
             }
 
-        // Prefer Supabase when configured.
-        val supabase = runCatching { uploadToSupabaseIfConfigured(file) }.getOrNull()
-        if (supabase != null && supabase.ok) return@withContext supabase
-
-        // Fallback to GitHub.
         val github = runCatching { uploadToGithubIfConfigured(file) }.getOrNull()
         if (github != null && github.ok) return@withContext github
 
         UploadResult(
             ok = false,
             destination = "local",
-            message = "Saved locally: ${file.absolutePath} (upload not configured or failed)"
+            message = "Saved locally: ${file.absolutePath} (GitHub upload not configured or failed)"
         )
     }
 
@@ -117,7 +112,6 @@ object DebugLogUploader {
 
         // IMPORTANT: Never include token strings in logs.
         val hasGhToken = BuildConfig.GH_TOKEN.isNotBlank() || BuildConfig.GITHUB_TOKEN.isNotBlank()
-        val hasSb = BuildConfig.SUPABASE_URL.isNotBlank() && BuildConfig.SUPABASE_ANON_KEY.isNotBlank()
 
         return """
             # SurveyApp Debug Log
@@ -141,7 +135,6 @@ object DebugLogUploader {
             abi=${Build.SUPPORTED_ABIS.joinToString(",")}
 
             # Integrations present (no secrets)
-            supabaseConfigured=$hasSb
             githubTokenPresent=$hasGhToken
         """.trimIndent()
     }
@@ -221,67 +214,6 @@ object DebugLogUploader {
         file.writeText(body)
         Log.w(TAG, "Wrote fallback log file: ${file.absolutePath}")
         return file
-    }
-
-    /**
-     * Upload to Supabase Storage when configured.
-     *
-     * Implementation:
-     * POST {SUPABASE_URL}/storage/v1/object/{bucket}/{prefix}/{filename}
-     * Headers:
-     * - apikey: <anonKey>
-     * - Authorization: Bearer <anonKey>
-     * - x-upsert: true
-     */
-    private fun uploadToSupabaseIfConfigured(file: File): UploadResult? {
-        val baseUrl = BuildConfig.SUPABASE_URL.trim().trimEnd('/')
-        val anonKey = BuildConfig.SUPABASE_ANON_KEY.trim()
-        val bucket = BuildConfig.SUPABASE_LOG_BUCKET.trim().ifBlank { "logs" }
-        val prefix = BuildConfig.SUPABASE_LOG_PREFIX.trim().ifBlank { "surveyapp" }
-
-        if (baseUrl.isBlank() || anonKey.isBlank()) return null
-
-        val safePrefix = prefix.trim('/').ifBlank { "surveyapp" }
-        val path = "$safePrefix/${file.name}"
-
-        val endpoint = "$baseUrl/storage/v1/object/$bucket/$path"
-        val url = URL(endpoint)
-        val conn = (url.openConnection() as HttpURLConnection)
-
-        conn.requestMethod = "POST"
-        conn.doOutput = true
-        conn.connectTimeout = 15_000
-        conn.readTimeout = 30_000
-
-        conn.setRequestProperty("apikey", anonKey)
-        conn.setRequestProperty("Authorization", "Bearer $anonKey")
-        conn.setRequestProperty("x-upsert", "true")
-        conn.setRequestProperty("Content-Type", "text/plain; charset=utf-8")
-
-        file.inputStream().use { input ->
-            conn.outputStream.use { out ->
-                input.copyTo(out)
-            }
-        }
-
-        val code = conn.responseCode
-        val ok = code in 200..299
-        val msg = readHttpMessage(conn)
-
-        return if (ok) {
-            UploadResult(
-                ok = true,
-                destination = "supabase",
-                message = "Uploaded to Supabase: bucket=$bucket path=$path (HTTP $code)"
-            )
-        } else {
-            Log.w(TAG, "Supabase upload failed: HTTP $code msg=$msg endpoint=$endpoint")
-            UploadResult(
-                ok = false,
-                destination = "supabase",
-                message = "Supabase upload failed: HTTP $code ($msg)"
-            )
-        }
     }
 
     /**

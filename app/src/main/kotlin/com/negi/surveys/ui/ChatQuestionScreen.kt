@@ -15,11 +15,19 @@ package com.negi.surveys.ui
 
 import android.util.Log
 import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.LinearEasing
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -66,8 +74,14 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
@@ -76,6 +90,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.negi.surveys.chat.AdvancedAnswerValidator
 import com.negi.surveys.chat.AnswerValidator
 import com.negi.surveys.chat.ChatDraftStore
 import com.negi.surveys.chat.ChatMessage
@@ -84,10 +99,9 @@ import com.negi.surveys.chat.ChatRole
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatStreamState
 import com.negi.surveys.chat.DraftKey
-import com.negi.surveys.chat.FakeSlmRepository
 import com.negi.surveys.chat.InMemoryChatDraftStore
+import com.negi.surveys.chat.LiteRtLmRepository
 import com.negi.surveys.chat.Repository
-import com.negi.surveys.chat.SlmAnswerValidator
 import java.util.Locale
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
@@ -100,60 +114,32 @@ fun ChatQuestionScreen(
     questionId: String,
     prompt: String = "Question prompt for $questionId (placeholder)",
     repository: Repository? = null,
-
-    /**
-     * Called when user taps Next.
-     *
-     * Contract:
-     * - Provides a full snapshot log for Review.
-     * - log.completionPayload is always non-empty (skipped payload is generated when needed).
-     */
     onNext: (log: ReviewQuestionLog) -> Unit,
-
     onBack: () -> Unit
 ) {
     val onNextLatest by rememberUpdatedState(onNext)
     val onBackLatest by rememberUpdatedState(onBack)
 
-    /**
-     * IMPORTANT:
-     * - Do NOT create ChatStreamBridge per screen.
-     * - Use the session-shared instance provided by SurveyAppRoot via CompositionLocalProvider.
-     */
     val streamBridge: ChatStreamBridge = LocalChatStreamBridge.current
-
-    /**
-     * Shared draft store for the whole process (in-memory prototype).
-     *
-     * Notes:
-     * - This is fine to be a singleton while prototyping.
-     * - Replace with persistent store later if needed.
-     */
     val draftStore: ChatDraftStore = remember { ChatDraftStoreHolder.store }
 
     val promptHash = remember(prompt) { prompt.hashCode() }
-
     val draftKey = remember(questionId, promptHash) {
         DraftKey(questionId = questionId, promptHash = promptHash)
     }
 
-    /**
-     * Repository selection:
-     * - Keep call order stable by always using remember() exactly once.
-     */
-    val repo: Repository = remember(repository) {
-        repository ?: FakeSlmRepository()
+    val appContext = LocalContext.current.applicationContext
+
+    val repo: Repository = remember(repository, appContext) {
+        // Use the provided repository if present; otherwise use the LiteRT-LM backed implementation.
+        repository ?: LiteRtLmRepository(appContext)
     }
 
-    /**
-     * Validator:
-     * - Uses the session-shared streamBridge so streaming state does not reset per screen instance.
-     */
     val validator: AnswerValidator = remember(questionId, promptHash, repo, streamBridge) {
-        SlmAnswerValidator(
+        AdvancedAnswerValidator(
             repository = repo,
             streamBridge = streamBridge,
-            logger = { Log.d("SlmValidator", it) }
+            logger = { Log.d("AdvancedValidator", it) }
         )
     }
 
@@ -181,13 +167,12 @@ fun ChatQuestionScreen(
     val completionPayload by vm.completionPayload.collectAsStateWithLifecycle()
 
     val canSubmit = input.trim().isNotEmpty() && !isBusy
-
     var nextInFlight by remember(vmKey) { mutableStateOf(false) }
 
     val listState = rememberLazyListState()
 
     var bottomBarPx by remember(vmKey) { mutableIntStateOf(0) }
-    val density = LocalDensity.current
+    val density = androidx.compose.ui.platform.LocalDensity.current
     val bottomBarDp = remember(bottomBarPx, density) { with(density) { bottomBarPx.toDp() } }
 
     val detailsExpanded = remember(vmKey) { mutableStateMapOf<String, Boolean>() }
@@ -198,37 +183,31 @@ fun ChatQuestionScreen(
     }
 
     LaunchedEffect(vmKey) {
-        // PII-safe bridge identity trace (helps confirm it is NOT recreated per screen).
         Log.d(TAG, "Using shared streamBridge identity=${System.identityHashCode(streamBridge)} qid=$questionId")
     }
 
-    LaunchedEffect(vmKey, bottomBarPx) {
+    LaunchedEffect(vmKey) {
         snapshotFlow {
-            val last = messages.lastOrNull()
-            if (last == null) {
-                null
-            } else {
-                val streamLen = last.streamText?.length ?: 0
-                val textLen = last.text.length
-                val sig = (last.id.hashCode() * 31) + (textLen * 7) + streamLen
-                Pair(messages.size, sig)
-            }
+            if (messages.isEmpty()) return@snapshotFlow null
+
+            val last = messages.last()
+            val streamLen = last.streamText?.length ?: 0
+            val textLen = last.text.length
+            val sig = (last.id.hashCode() * 31) + (textLen * 7) + streamLen
+            Triple(bottomBarPx, messages.size, sig)
         }
             .filterNotNull()
             .distinctUntilChanged()
             .debounce(80)
             .collect {
                 if (messages.isEmpty()) return@collect
+
                 val lastIndex = messages.size - 1
                 val lastMsg = messages[lastIndex]
                 val streaming = lastMsg.role == ChatRole.MODEL && lastMsg.streamState == ChatStreamState.STREAMING
 
                 runCatching {
-                    if (streaming) {
-                        listState.scrollToItem(lastIndex)
-                    } else {
-                        listState.animateScrollToItem(lastIndex)
-                    }
+                    if (streaming) listState.scrollToItem(lastIndex) else listState.animateScrollToItem(lastIndex)
                 }.onFailure { e ->
                     Log.w(TAG, "Auto-scroll failed (non-fatal). size=${messages.size}", e)
                 }
@@ -237,7 +216,6 @@ fun ChatQuestionScreen(
 
     DisposableEffect(vm) {
         onDispose {
-            // Respect structured concurrency & ensure any in-flight streaming is stopped.
             vm.cancelValidation("screen_dispose")
         }
     }
@@ -294,10 +272,7 @@ fun ChatQuestionScreen(
                             detailsExpanded = detailsExpanded[msg.id] ?: false,
                             onToggleDetailsExpand = { expand ->
                                 detailsExpanded[msg.id] = expand
-                                Log.d(
-                                    TAG,
-                                    "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}"
-                                )
+                                Log.d(TAG, "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}")
                             }
                         )
                     }
@@ -327,10 +302,6 @@ fun ChatQuestionScreen(
                         Log.w(TAG, "Next clicked while inFlight=true (ignored). qid=$questionId")
                         return@BottomComposerCard
                     }
-
-                    // Prevent snapshot/export from missing assistant follow-up lines.
-                    // If we navigate away while a validation stream is still running,
-                    // the Review log can be captured before the ASSISTANT outcome exists.
                     if (isBusy) {
                         Log.w(TAG, "Next clicked while busy=true (ignored). qid=$questionId")
                         return@BottomComposerCard
@@ -338,18 +309,13 @@ fun ChatQuestionScreen(
 
                     nextInFlight = true
                     try {
+                        val payloadNow = vm.completionPayload.value
+                        val messagesNow = vm.messages.value
+
                         vm.cancelValidation("next_click")
 
-                        // IMPORTANT:
-                        // - Do NOT rely on Compose-collected snapshots here.
-                        // - The user can tap Next faster than recomposition, so `messages` / `completionPayload`
-                        //   may be stale and miss the latest assistant follow-up.
-                        // - Read the VM StateFlow values directly for a consistent snapshot.
-                        val payloadNow = vm.completionPayload.value
                         val skipped = (payloadNow == null)
                         val payload = payloadNow ?: buildSkippedPayload(questionId, prompt)
-
-                        val messagesNow = vm.messages.value
 
                         val log = buildReviewQuestionLog(
                             questionId = questionId,
@@ -359,10 +325,7 @@ fun ChatQuestionScreen(
                             messagesSnapshot = messagesNow
                         )
 
-                        Log.d(
-                            TAG,
-                            "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}"
-                        )
+                        Log.d(TAG, "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}")
                         onNextLatest(log)
                     } finally {
                         nextInFlight = false
@@ -409,7 +372,6 @@ private fun HeaderCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-
                 StatusPill(label = statusLabel)
             }
 
@@ -770,7 +732,9 @@ private fun ChatBubbleStructured(
                     }
 
                     isModel -> {
-                        val raw = msg.streamText?.takeIf { it.isNotBlank() } ?: msg.text
+                        val streamRaw = msg.streamText.orEmpty()
+                        val ttftActive = isStreamingModelBubble && streamRaw.isBlank()
+                        val raw = if (streamRaw.isNotBlank()) streamRaw else msg.text
 
                         val canClick = !isStreamingModelBubble && raw.isNotBlank()
                         val clickMod = if (canClick) {
@@ -816,27 +780,40 @@ private fun ChatBubbleStructured(
                                     .then(clickMod)
                             ) {
                                 val blockShape = RoundedCornerShape(14.dp)
-                                Box(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .clip(blockShape)
-                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                        .border(1.dp, outline, blockShape)
-                                        .padding(horizontal = 10.dp, vertical = 10.dp)
-                                ) {
-                                    Text(
-                                        text = raw.ifBlank { "Validating…" },
-                                        style = MaterialTheme.typography.bodySmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
+
+                                if (isStreamingModelBubble) {
+                                    FancyStreamingModelBlock(
+                                        shape = blockShape,
+                                        ttftActive = ttftActive,
+                                        raw = raw,
+                                        onOutline = outline
                                     )
+                                } else {
+                                    Box(
+                                        modifier = Modifier
+                                            .fillMaxWidth()
+                                            .clip(blockShape)
+                                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                                            .border(1.dp, outline, blockShape)
+                                            .padding(horizontal = 10.dp, vertical = 10.dp)
+                                    ) {
+                                        Text(
+                                            text = raw.ifBlank { "Validating…" },
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                                        )
+                                    }
                                 }
 
                                 Spacer(Modifier.height(6.dp))
 
                                 Text(
-                                    text = if (isStreamingModelBubble) "Streaming…"
-                                    else if (expanded) "Tap to collapse"
-                                    else "Tap to expand",
+                                    text = when {
+                                        ttftActive -> "Warming up…"
+                                        isStreamingModelBubble -> "Streaming…"
+                                        expanded -> "Tap to collapse"
+                                        else -> "Tap to expand"
+                                    },
                                     style = MaterialTheme.typography.labelSmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant
                                 )
@@ -849,6 +826,357 @@ private fun ChatBubbleStructured(
     }
 }
 
+@Composable
+private fun FancyStreamingModelBlock(
+    shape: RoundedCornerShape,
+    ttftActive: Boolean,
+    raw: String,
+    onOutline: androidx.compose.ui.graphics.Color
+) {
+    val infinite = rememberInfiniteTransition(label = "streamFancy")
+
+    val borderPulse by infinite.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 0.85f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "borderPulse"
+    )
+
+    val bgPulse by infinite.animateFloat(
+        initialValue = 0.10f,
+        targetValue = 0.22f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1100, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "bgPulse"
+    )
+
+    val shimmerPhase by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1350, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmerPhase"
+    )
+
+    val borderColor = MaterialTheme.colorScheme.primary.copy(alpha = borderPulse * 0.9f)
+    val baseBg = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f + bgPulse)
+
+    val brush = androidx.compose.ui.graphics.Brush.linearGradient(
+        colors = listOf(
+            baseBg,
+            MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.22f),
+            baseBg
+        ),
+        start = Offset(x = -400f + shimmerPhase * 800f, y = 0f),
+        end = Offset(x = 400f + shimmerPhase * 800f, y = 220f)
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(shape)
+            .background(brush)
+            .border(
+                width = 1.dp,
+                color = borderColor,
+                shape = shape
+            )
+            .padding(horizontal = 10.dp, vertical = 10.dp)
+    ) {
+        Column {
+            FancyStreamingHeader(ttftActive = ttftActive, outline = onOutline)
+
+            Spacer(Modifier.height(10.dp))
+
+            if (ttftActive) {
+                TtftIndicator()
+            } else {
+                StreamingMonospaceTextWithCursor(
+                    raw = raw.ifBlank { "Validating…" }
+                )
+            }
+
+            Spacer(Modifier.height(12.dp))
+
+            StreamingMiniShimmerBar()
+        }
+    }
+}
+
+@Composable
+private fun StreamingMonospaceTextWithCursor(
+    raw: String,
+    modifier: Modifier = Modifier
+) {
+    val infinite = rememberInfiniteTransition(label = "cursor")
+    val a by infinite.animateFloat(
+        initialValue = 0.0f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 650, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "cursorAlpha"
+    )
+
+    var layoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val textToRender = raw
+
+    val baseColor = MaterialTheme.colorScheme.onSurfaceVariant
+    val cursorColor = baseColor.copy(alpha = a)
+
+    Text(
+        text = textToRender,
+        style = MaterialTheme.typography.bodySmall,
+        color = baseColor,
+        fontFamily = FontFamily.Monospace,
+        modifier = modifier.drawWithContent {
+            drawContent()
+            val lr = layoutResult ?: return@drawWithContent
+
+            val caret = lr.getCursorRect(textToRender.length.coerceAtLeast(0))
+            val w = 2.dp.toPx().coerceAtLeast(1f)
+            val h = caret.height.coerceAtLeast(10f)
+
+            drawRoundRect(
+                color = cursorColor,
+                topLeft = Offset(caret.left, caret.top),
+                size = Size(w, h),
+                cornerRadius = CornerRadius(w / 2f, w / 2f)
+            )
+        },
+        onTextLayout = { layoutResult = it }
+    )
+}
+
+@Composable
+private fun FancyStreamingHeader(
+    ttftActive: Boolean,
+    outline: androidx.compose.ui.graphics.Color
+) {
+    val infinite = rememberInfiniteTransition(label = "streamHeader")
+
+    val dotAlpha by infinite.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 650, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "dotAlpha"
+    )
+
+    val chipShape = RoundedCornerShape(999.dp)
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Row(
+            modifier = Modifier
+                .clip(chipShape)
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.35f))
+                .border(1.dp, outline.copy(alpha = 0.55f), chipShape)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(999.dp))
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = dotAlpha))
+                    .width(7.dp)
+                    .height(7.dp)
+            )
+
+            Spacer(Modifier.width(8.dp))
+
+            Text(
+                text = if (ttftActive) "WARMUP" else "STREAM",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+
+        Spacer(Modifier.weight(1f))
+
+        Row(
+            modifier = Modifier
+                .clip(chipShape)
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.25f))
+                .border(1.dp, outline.copy(alpha = 0.45f), chipShape)
+                .padding(horizontal = 10.dp, vertical = 6.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = "MODEL",
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold
+            )
+        }
+    }
+}
+
+@Composable
+private fun StreamingMiniShimmerBar() {
+    val infinite = rememberInfiniteTransition(label = "miniBar")
+    val phase by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "miniPhase"
+    )
+
+    val barShape = RoundedCornerShape(999.dp)
+
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(6.dp)
+            .clip(barShape)
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.25f))
+    ) {
+        val wPx = with(androidx.compose.ui.platform.LocalDensity.current) { maxWidth.toPx() }.coerceAtLeast(1f)
+        val x = (phase * 2f - 1f) * wPx
+
+        val brush = androidx.compose.ui.graphics.Brush.linearGradient(
+            colors = listOf(
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.15f),
+                MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.30f),
+                MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.15f)
+            ),
+            start = Offset(x - wPx, 0f),
+            end = Offset(x + wPx, 0f)
+        )
+
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(brush)
+        )
+    }
+}
+
+@Composable
+private fun TtftIndicator(modifier: Modifier = Modifier) {
+    val infinite = rememberInfiniteTransition(label = "ttft")
+
+    val dot1 by infinite.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 520, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "dot1"
+    )
+    val dot2 by infinite.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 520, delayMillis = 140, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "dot2"
+    )
+    val dot3 by infinite.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 520, delayMillis = 280, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "dot3"
+    )
+
+    val shimmerPhase by infinite.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1050, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "shimmer"
+    )
+
+    val base = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
+
+    Column(modifier = modifier.fillMaxWidth()) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                text = "Thinking",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                fontWeight = FontWeight.SemiBold
+            )
+
+            Spacer(Modifier.width(8.dp))
+
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                TtftDot(alpha = dot1, color = base)
+                Spacer(Modifier.width(4.dp))
+                TtftDot(alpha = dot2, color = base)
+                Spacer(Modifier.width(4.dp))
+                TtftDot(alpha = dot3, color = base)
+            }
+        }
+
+        Spacer(Modifier.height(10.dp))
+
+        val barShape = RoundedCornerShape(999.dp)
+        BoxWithConstraints(
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(7.dp)
+                .clip(barShape)
+                .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.35f))
+        ) {
+            val wPx = with(androidx.compose.ui.platform.LocalDensity.current) { maxWidth.toPx() }.coerceAtLeast(1f)
+            val x = (shimmerPhase * 2f - 1f) * wPx
+
+            val brush = androidx.compose.ui.graphics.Brush.linearGradient(
+                colors = listOf(
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.15f),
+                    MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.28f),
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.15f)
+                ),
+                start = Offset(x - wPx, 0f),
+                end = Offset(x + wPx, 0f)
+            )
+
+            Box(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(brush)
+            )
+        }
+    }
+}
+
+@Composable
+private fun TtftDot(alpha: Float, color: androidx.compose.ui.graphics.Color) {
+    Box(
+        modifier = Modifier
+            .clip(RoundedCornerShape(999.dp))
+            .background(color.copy(alpha = alpha))
+            .width(6.dp)
+            .height(6.dp)
+    )
+}
+
+// ---- existing helpers below (unchanged) ----
+
 private fun buildSkippedPayload(questionId: String, prompt: String): String {
     val promptHash = prompt.hashCode()
     return buildString {
@@ -859,15 +1187,6 @@ private fun buildSkippedPayload(questionId: String, prompt: String): String {
     }.trim()
 }
 
-/**
- * Converts the current chat messages into a Review snapshot.
- *
- * Updated policy:
- * - If skipped: export USER lines, plus assistant lines / follow-up lines that happen after at least one USER line.
- * - Seed prompt message is excluded (prompt is already shown in the card header).
- * - MODEL_RAW is included even when skipped, but only after at least one USER line.
- * - MODEL_RAW duplicates (same as immediately previous MODEL_RAW) are suppressed.
- */
 private fun buildReviewQuestionLog(
     questionId: String,
     prompt: String,
@@ -958,10 +1277,7 @@ private fun buildReviewQuestionLog(
         }
     }
 
-    Log.d(
-        TAG,
-        "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}"
-    )
+    Log.d(TAG, "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}")
 
     return ReviewQuestionLog(
         questionId = questionId,
@@ -1004,7 +1320,6 @@ private fun normalizeFollowUp(text: String?): String? {
         "skip", "0", "-"
     )
     if (l2 in garbage) return null
-
     if (t.length < 3) return null
 
     return t

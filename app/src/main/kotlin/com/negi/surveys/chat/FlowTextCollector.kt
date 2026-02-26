@@ -233,7 +233,7 @@ private fun clipToRemainPreserveSurrogates(chunk: String, remain: Int): String {
     }
 
     if (end <= 0) return ""
-    return chunk.substring(0, end)
+    return chunk.take(end)
 }
 
 /**

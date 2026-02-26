@@ -26,63 +26,40 @@ import kotlinx.coroutines.flow.asStateFlow
 /**
  * A thin, UI-agnostic streaming bridge for model output.
  *
- * Why:
- * - The repository/validator layer may stream tokens (Flow<String>).
- * - The ViewModel updates a single "streaming" bubble without coupling model code to VM internals.
- *
- * Design:
- * - Producer calls begin() -> session id, then emitChunk(sessionId,...),
- *   and finally end(sessionId) or error(sessionId,...).
- * - Consumer (ViewModel) collects [events] and ignores stale sessions.
- *
- * Important:
- * - Session ids MUST be monotonically increasing and never reused.
- *   Otherwise "cancelled session id" tracking in the VM can break future sessions.
- *
  * Replacement policy:
  * - Only one active session is supported.
  * - If begin() is called while another session is active:
  *   (1) activeSessionId is cleared first (so late deltas are ignored)
- *   (2) End(prev) is emitted
+ *   (2) the previous session is terminated as Error("replaced") (NOT End)
  *   (3) Begin(new) is emitted
  *
- * Observability:
- * - This bridge maintains lightweight counters and:
- *   - snapshot API ([statsSnapshot])
- *   - reactive StateFlow ([stats])
- *   so the app can debug event drops and stale-event ignores without logging user content.
+ * Rationale:
+ * - "replaced" is not a normal completion. Emitting End(prev) can cause the UI to treat partial
+ *   output as a successful stream end and embed it into the next assistant bubble.
  *
- * Threading:
- * - Producers may emit from any thread/dispatcher; SharedFlow is thread-safe.
+ * Overflow note:
+ * - BufferOverflow.DROP_OLDEST can overwrite older events without tryEmit() failing.
+ * - droppedEvents counts only hard tryEmit failures (rare), not overwritten items.
+ *
+ * Threading contract:
+ * - All producer APIs are safe to call from any thread.
+ * - Event ordering is enforced per session: Begin -> Delta* -> End/Error.
  */
 class ChatStreamBridge(
-    /**
-     * Optional metadata logger.
-     *
-     * Notes:
-     * - Do NOT log user content.
-     * - Use this only for session ids / counters / stop reasons.
-     */
     private val logger: ((String) -> Unit)? = null
 ) {
 
     private val lock = Any()
 
-    /** Monotonic id generator. Never reset. */
     private val nextSessionId = AtomicLong(0L)
-
-    /** Currently active session id (0 => none). */
     private val activeSessionId = AtomicLong(0L)
 
     private val _events = MutableSharedFlow<ChatStreamEvent>(
         replay = 0,
-        // Keep a reasonably large buffer so Begin/End/Error are unlikely to be dropped.
-        // DROP_OLDEST means control events still get through even under heavy Delta load.
         extraBufferCapacity = 2048,
         onBufferOverflow = BufferOverflow.DROP_OLDEST
     )
 
-    /** Stream of Begin/Delta/End/Error events. */
     val events: SharedFlow<ChatStreamEvent> = _events.asSharedFlow()
 
     // ---------------------------------------------------------------------
@@ -93,12 +70,6 @@ class ChatStreamBridge(
     private val emittedDelta = AtomicLong(0L)
     private val emittedEnd = AtomicLong(0L)
     private val emittedError = AtomicLong(0L)
-
-    /**
-     * NOTE:
-     * - With DROP_OLDEST overflow policy, tryEmit(...) is typically "successful" by dropping old items.
-     * - Therefore droppedEvents counts only hard failures (rare), not overwritten items.
-     */
     private val droppedEvents = AtomicLong(0L)
 
     private val ignoredDelta = AtomicLong(0L)
@@ -106,13 +77,6 @@ class ChatStreamBridge(
     private val ignoredError = AtomicLong(0L)
     private val ignoredCancel = AtomicLong(0L)
 
-    /**
-     * Throttle tick for very frequent paths.
-     *
-     * Why:
-     * - Previously throttle used emittedDelta only, which failed to update UI when only ignoredDelta grew.
-     * - We increment this for BOTH emittedDelta and ignoredDelta paths so debug UI remains informative.
-     */
     private val deltaTick = AtomicLong(0L)
 
     @Volatile private var lastEventNs: Long = 0L
@@ -122,13 +86,6 @@ class ChatStreamBridge(
     @Volatile private var lastCancelSessionId: Long = 0L
     @Volatile private var lastCancelMessage: String? = null
 
-    /**
-     * Immutable snapshot of bridge-level stats.
-     *
-     * Notes:
-     * - PII-safe by design.
-     * - Useful to render in DebugPanel or to dump to logs.
-     */
     data class StreamStats(
         val activeSessionId: Long,
         val nextSessionId: Long,
@@ -149,12 +106,8 @@ class ChatStreamBridge(
     )
 
     private val _stats = MutableStateFlow(statsSnapshot())
-    /** Reactive stats stream for debug UI (PII-safe). */
     val stats: StateFlow<StreamStats> = _stats.asStateFlow()
 
-    /**
-     * Returns a PII-safe snapshot of the current bridge stats.
-     */
     fun statsSnapshot(): StreamStats {
         val now = System.nanoTime()
         val ageMs = if (lastEventNs <= 0L) Long.MAX_VALUE else ((now - lastEventNs) / 1_000_000L)
@@ -179,20 +132,11 @@ class ChatStreamBridge(
         )
     }
 
-    /**
-     * Publishes stats to [stats].
-     *
-     * Notes:
-     * - Delta/ignoredDelta can be very frequent; we throttle those updates.
-     * - Control events (Begin/End/Error/Cancel) publish immediately.
-     */
     private fun publishStats(force: Boolean) {
         if (force) {
             _stats.value = statsSnapshot()
             return
         }
-
-        // Throttle: publish every 64 delta-path operations (emitted OR ignored).
         val t = deltaTick.get()
         if ((t and 0x3FL) == 0L) {
             _stats.value = statsSnapshot()
@@ -216,25 +160,22 @@ class ChatStreamBridge(
     // Producer API
     // ---------------------------------------------------------------------
 
-    /**
-     * Begin a new streaming session.
-     *
-     * Returns:
-     * - A unique session id.
-     *
-     * Replacement:
-     * - If a previous session is still active, it is ended first (End event) to avoid UI leaks.
-     * - Critical: activeSessionId is cleared BEFORE emitting End(prev) so late deltas for prev are ignored.
-     */
     fun begin(): Long = synchronized(lock) {
         val prev = activeSessionId.get()
         if (prev > 0L) {
-            // Critical ordering:
-            // - Clear active first so any concurrent emitChunk(prev, ...) becomes ignored.
             activeSessionId.set(0L)
 
-            emittedEnd.incrementAndGet()
-            emitEvent(ChatStreamEvent.End(prev), kind = "End(replaced)", sessionId = prev)
+            lastCancelSessionId = prev
+            lastCancelMessage = REPLACED_MESSAGE
+
+            emittedError.incrementAndGet()
+            emitEvent(
+                ChatStreamEvent.Error(prev, REPLACED_MESSAGE),
+                kind = "Error(replaced)",
+                sessionId = prev
+            )
+
+            logger?.invoke("ChatStreamBridge: replaced prev session=$prev")
         }
 
         val id = nextSessionId.incrementAndGet()
@@ -249,33 +190,32 @@ class ChatStreamBridge(
     }
 
     /**
-     * Emit a chunk for the given session.
+     * Emit a delta chunk for an active session.
      *
-     * Notes:
-     * - If [sessionId] does not match the currently active session, the event is ignored.
-     * - This prevents late chunks from a previous request corrupting the current UI.
+     * IMPORTANT:
+     * - This method is synchronized to guarantee ordering against end()/error()/cancel().
+     * - Without this, "Delta after End/Error" can happen under race conditions.
      */
     fun emitChunk(sessionId: Long, chunk: String) {
         if (chunk.isEmpty()) return
         if (sessionId <= 0L) return
 
-        val active = activeSessionId.get()
-        if (active != sessionId) {
-            ignoredDelta.incrementAndGet()
-            deltaTick.incrementAndGet()
-            publishStats(force = false)
-            return
-        }
+        synchronized(lock) {
+            val active = activeSessionId.get()
+            if (active != sessionId) {
+                ignoredDelta.incrementAndGet()
+                deltaTick.incrementAndGet()
+                publishStats(force = false)
+                return
+            }
 
-        emittedDelta.incrementAndGet()
-        deltaTick.incrementAndGet()
-        emitEvent(ChatStreamEvent.Delta(sessionId, chunk), kind = "Delta", sessionId = sessionId)
-        publishStats(force = false)
+            emittedDelta.incrementAndGet()
+            deltaTick.incrementAndGet()
+            emitEvent(ChatStreamEvent.Delta(sessionId, chunk), kind = "Delta", sessionId = sessionId)
+            publishStats(force = false)
+        }
     }
 
-    /**
-     * End the given session normally.
-     */
     fun end(sessionId: Long): Unit = synchronized(lock) {
         if (sessionId <= 0L) return
 
@@ -286,7 +226,6 @@ class ChatStreamBridge(
             return
         }
 
-        // Clear active first so late emitChunk/end/error are ignored.
         activeSessionId.set(0L)
 
         emittedEnd.incrementAndGet()
@@ -296,9 +235,6 @@ class ChatStreamBridge(
         publishStats(force = true)
     }
 
-    /**
-     * End the given session with an error.
-     */
     fun error(sessionId: Long, message: String): Unit = synchronized(lock) {
         if (sessionId <= 0L) return
 
@@ -309,7 +245,6 @@ class ChatStreamBridge(
             return
         }
 
-        // Clear active first so late emitChunk/end/error are ignored.
         activeSessionId.set(0L)
 
         val msg = message.trim().take(256)
@@ -320,16 +255,6 @@ class ChatStreamBridge(
         publishStats(force = true)
     }
 
-    /**
-     * Cancel the given session.
-     *
-     * NOTE:
-     * - Convenience wrapper used by the UI/VM layer.
-     * - Message is intentionally "cancelled" to match suppression logic in the VM collector.
-     *
-     * Returns:
-     * - The cancelled session id (or 0 if nothing was cancelled).
-     */
     fun cancel(sessionId: Long, message: String = CANCELLED_MESSAGE): Long = synchronized(lock) {
         if (sessionId <= 0L) return 0L
 
@@ -358,16 +283,6 @@ class ChatStreamBridge(
         sessionId
     }
 
-    /**
-     * Cancel the currently active session without requiring the caller to know the id.
-     *
-     * Why:
-     * - The ViewModel may need to cancel immediately (Back/Next) before it even receives Begin/Delta.
-     * - This prevents late End/Delta from attaching stale model output to the next assistant bubble.
-     *
-     * Returns:
-     * - The cancelled session id (or 0 if nothing was cancelled).
-     */
     fun cancelActive(message: String = CANCELLED_MESSAGE): Long = synchronized(lock) {
         val id = activeSessionId.get()
         if (id <= 0L) {
@@ -396,5 +311,6 @@ class ChatStreamBridge(
 
     private companion object {
         private const val CANCELLED_MESSAGE = "cancelled"
+        private const val REPLACED_MESSAGE = "replaced"
     }
 }
