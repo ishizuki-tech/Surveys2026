@@ -2,7 +2,7 @@
  * =====================================================================
  *  IshizukiTech LLC — Survey App (Fake SLM Repository)
  *  ---------------------------------------------------------------------
- *  File: FakeSlmRepository.kt
+ *  File: BaseSlmRepository.kt
  *  Author: Shu Ishizuki
  *  License: MIT License
  *  © 2026 IshizukiTech LLC. All rights reserved.
@@ -62,18 +62,28 @@ interface Repository {
  *
  * Test hooks:
  * - requestSetupDelayMs: simulate slow request preparation (before Flow is returned).
+ * - firstChunkDelayMs: simulate time-to-first-token (delay before first emit).
  * - throwOnRequestSetup / throwAfterEmits: inject failures to exercise ERROR paths.
  *
  * Privacy:
  * - Do NOT log raw prompts/answers. If you pass [logger], keep it metadata-only.
  */
-class FakeSlmRepository(
+class BaseSlmRepository(
     private val config: Config = Config()
 ) : Repository {
 
     data class Config(
         /** Delay before returning the Flow to simulate request preparation latency. */
         val requestSetupDelayMs: Long = 0L,
+
+        /**
+         * Delay before emitting the first chunk to simulate time-to-first-token latency.
+         *
+         * Notes:
+         * - This differs from [requestSetupDelayMs]. It affects the first `emit(...)` timing.
+         * - Useful for reproducing cold start / warmup behavior in streaming pipelines.
+         */
+        val firstChunkDelayMs: Long = 3000L,
 
         /** If true, throw during request setup (before Flow is returned). */
         val throwOnRequestSetup: Boolean = false,
@@ -82,7 +92,7 @@ class FakeSlmRepository(
         val throwAfterEmits: Int = -1,
 
         /** Delay per chunk to simulate streaming latency. */
-        val chunkDelayMs: Long = 80L,
+        val chunkDelayMs: Long = 30L,
 
         /** Chunk size in characters emitted per Flow emission. Must be >= 1. */
         val chunkSizeChars: Int = 2,
@@ -115,6 +125,7 @@ class FakeSlmRepository(
         fun normalized(): Config {
             return copy(
                 requestSetupDelayMs = requestSetupDelayMs.coerceAtLeast(0L),
+                firstChunkDelayMs = firstChunkDelayMs.coerceAtLeast(0L),
                 throwAfterEmits = throwAfterEmits,
                 chunkDelayMs = chunkDelayMs.coerceAtLeast(0L),
                 chunkSizeChars = chunkSizeChars.coerceAtLeast(1),
@@ -162,8 +173,11 @@ $userPrompt
     override suspend fun request(prompt: String): Flow<String> {
         val promptLen = prompt.length
         val setupDelay = cfg.requestSetupDelayMs
+        val firstDelay = cfg.firstChunkDelayMs
 
-        cfg.logger?.invoke("FakeSlmRepository.request: setup (chars=$promptLen delayMs=$setupDelay)")
+        cfg.logger?.invoke(
+            "FakeSlmRepository.request: setup (chars=$promptLen setupDelayMs=$setupDelay firstChunkDelayMs=$firstDelay)"
+        )
 
         if (cfg.throwOnRequestSetup) {
             throw IllegalStateException("fake_request_setup_error")
@@ -245,6 +259,16 @@ $userPrompt
                 "FakeSlmRepository.request: meta phase=$phase mainLen=${mainAnswer.trim().length} " +
                         "followUps=${followUpAnswers.size} outChars=${finalText.length} prependNonJson=$prependNonJson"
             )
+
+            // Preserve the documented behavior: 0 => throw before first emit (no artificial delay).
+            if (throwAfter == 0) {
+                throw RuntimeException("fake_stream_error")
+            }
+
+            // Simulate time-to-first-token latency.
+            if (cfg.firstChunkDelayMs > 0L) {
+                delay(cfg.firstChunkDelayMs)
+            }
 
             var emitCount = 0
             var i = 0

@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  FileProvider paths for export sharing.
+
+  Keep this minimal and restricted:
+  - ExportScreen writes to: context.cacheDir/exports/
+  - Only expose that directory via FileProvider.
+-->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path
+        name="exports_cache"
+        path="exports/" />
+</paths>

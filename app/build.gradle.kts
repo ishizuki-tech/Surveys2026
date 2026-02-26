@@ -261,11 +261,6 @@ android {
 
     val hfToken = gradlePropAny("hf.token", "HF_TOKEN") ?: ""
 
-    val supabaseUrl = gradleProp("supabase.url") ?: ""
-    val supabaseAnonKey = gradleProp("supabase.anonKey") ?: ""
-    val supabaseLogBucket = gradleProp("supabase.logBucket") ?: "logs"
-    val supabaseLogPrefix = gradleProp("supabase.logPrefix") ?: "surveyapp"
-
     /**
      * By default, secrets are NOT embedded in release builds.
      * To explicitly allow (internal builds only), set:
@@ -292,12 +287,6 @@ android {
         buildConfigField("String", "GIT_SHA", quote(sha))
         buildConfigField("boolean", "GIT_DIRTY", dirty.toString())
         buildConfigField("String", "BUILD_TIME_UTC", quote(timeUtc))
-
-        // Optional Supabase config (anon key is "public-ish" but still keep it out of logs).
-        buildConfigField("String", "SUPABASE_URL", quote(supabaseUrl))
-        buildConfigField("String", "SUPABASE_ANON_KEY", quote(supabaseAnonKey))
-        buildConfigField("String", "SUPABASE_LOG_BUCKET", quote(supabaseLogBucket))
-        buildConfigField("String", "SUPABASE_LOG_PREFIX", quote(supabaseLogPrefix))
 
         // GitHub upload config (KEEP TOKENS OUT OF GIT).
         // Provide both GH_* and GITHUB_* for backward compatibility.
@@ -399,8 +388,11 @@ dependencies {
     implementation(libs.androidx.navigation3.runtime.alpha)
     implementation(libs.androidx.navigation3.ui.alpha)
 
-    // Kotlinx Serialization (JSON)
+    implementation(libs.kaml)
     implementation(libs.kotlinx.serialization.json)
+
+    // LiteRT-LM
+    implementation(libs.litertlm)
 
     // Compose (BOM + modules)
     implementation(platform(libs.androidx.compose.bom))

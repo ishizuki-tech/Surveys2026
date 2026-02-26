@@ -1,0 +1,15 @@
+graph:
+  startId: start
+  nodes:
+    - id: start
+      type: START
+      nextId: done
+    - id: done
+      type: DONE
+
+model_defaults:
+  default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
+  default_file_name: "Gemma3n4B.litertlm"
+  timeout_ms: 1800000
+  ui_throttle_ms: 250
+  ui_min_delta_bytes: 1048576

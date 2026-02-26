@@ -29,8 +29,6 @@ import androidx.compose.ui.Modifier
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.logging.CrashCapture
 import com.negi.surveys.logging.GitHubLogUploadManager
-import com.negi.surveys.logging.SupabaseLogUploadManager
-import java.net.URI
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -113,11 +111,7 @@ private object PendingCrashUploadKickoff {
  * Design:
  * - Never blocks the main thread.
  * - Safe to call on every launch; no-ops if there is nothing to upload.
- * - Only attempts providers that are configured (reduces noisy failures).
- *
- * Critical ordering:
- * - Run Supabase first to avoid "GitHub moved pending -> Supabase sees 0" behavior.
- * - When both providers are enabled, only the last provider should move crash files.
+ * - Only attempts upload when GitHub is configured (reduces noisy failures).
  */
 private fun kickOffPendingCrashUpload(context: Context) {
     runCatching {
@@ -132,14 +126,12 @@ private fun kickOffPendingCrashUpload(context: Context) {
             try {
                 // Snapshot configuration early for deterministic logs.
                 val ghConfigured = runCatching { GitHubLogUploadManager.isConfigured() }.getOrDefault(false)
-                val sbConfigured = runCatching { SupabaseLogUploadManager.isConfigured() }.getOrDefault(false)
-
                 val pending0 = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
 
                 AppLog.i(
                     TAG,
                     "pending crash upload: start pending=$pending0 " +
-                            "ghConfigured=$ghConfigured sbConfigured=$sbConfigured " +
+                            "ghConfigured=$ghConfigured " +
                             "pid=${Process.myPid()} " +
                             "build=${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
                 )
@@ -149,93 +141,31 @@ private fun kickOffPendingCrashUpload(context: Context) {
                     return@thread
                 }
 
-                if (!ghConfigured && !sbConfigured) {
-                    AppLog.w(TAG, "pending crash upload: no providers configured; skip")
+                if (!ghConfigured) {
+                    AppLog.w(TAG, "pending crash upload: GitHub not configured; skip")
                     return@thread
                 }
 
-                // Emit a small Supabase config trace (PII-safe: host/bucket/prefix only).
                 runCatching {
-                    val rawUrl = buildConfigString("SUPABASE_URL").trim()
-                    val urlHost = runCatching { if (rawUrl.isBlank()) "" else URI(rawUrl).host.orEmpty() }
-                        .getOrDefault("")
+                    val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
 
-                    val bucket = buildConfigString("SUPABASE_LOG_BUCKET").trim()
-                    val prefix = buildConfigString("SUPABASE_LOG_PREFIX").trim().trim('/').ifBlank { "surveyapp" }
+                    val r = GitHubLogUploadManager.tryUploadPendingCrashesBlocking(appCtx)
+
+                    val err = r.exceptionOrNull()
+                    val errMsg = err?.message?.replace('\n', ' ')?.take(ERR_MSG_MAX).orEmpty()
 
                     AppLog.i(
                         TAG,
-                        "crash upload config: ghConfigured=$ghConfigured sbConfigured=$sbConfigured " +
-                                "supabaseHost=${urlHost.ifBlank { "(blank)" }} bucket=${bucket.ifBlank { "(blank)" }} prefix=$prefix"
+                        "pending crash upload (GitHub): pendingBefore=$pendingBefore ok=${r.isSuccess} " +
+                                "result=${r.getOrNull()} err=${err?.javaClass?.simpleName} msg=${if (errMsg.isBlank()) "-" else errMsg}"
                     )
-                }.onFailure {
-                    AppLog.w(TAG, "crash upload config: failed to summarize (non-fatal): ${it.javaClass.simpleName}")
-                }
 
-                /**
-                 * When both are enabled:
-                 * - Supabase should NOT move crash files on success (otherwise GitHub sees 0).
-                 * - GitHub runs after and performs the move (or whatever its implementation does).
-                 */
-                val sbMoveOnSuccess = !ghConfigured
-
-                // Provider: Supabase (run first).
-                if (sbConfigured) {
-                    runCatching {
-                        val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
-
-                        val r = SupabaseLogUploadManager.tryUploadPendingCrashesBlocking(
-                            context = appCtx,
-                            userJwt = null,
-                            moveOnSuccess = sbMoveOnSuccess
-                        )
-
-                        val err = r.exceptionOrNull()
-                        val errMsg = err?.message?.replace('\n', ' ')?.take(ERR_MSG_MAX).orEmpty()
-
-                        AppLog.i(
-                            TAG,
-                            "pending crash upload (Supabase): pendingBefore=$pendingBefore ok=${r.isSuccess} " +
-                                    "result=${r.getOrNull()} moveOnSuccess=$sbMoveOnSuccess " +
-                                    "err=${err?.javaClass?.simpleName} msg=${if (errMsg.isBlank()) "-" else errMsg}"
-                        )
-
-                        if (err != null && BuildConfig.DEBUG) {
-                            Log.e(TAG, "pending crash upload (Supabase) failed", err)
-                        }
-                    }.onFailure { t ->
-                        if (BuildConfig.DEBUG) Log.e(TAG, "pending crash upload (Supabase) failed", t)
-                        AppLog.e(TAG, "pending crash upload (Supabase) failed", t)
+                    if (err != null && BuildConfig.DEBUG) {
+                        Log.e(TAG, "pending crash upload (GitHub) failed", err)
                     }
-                } else {
-                    AppLog.w(TAG, "pending crash upload (Supabase) skipped: not configured")
-                }
-
-                // Provider: GitHub (run second).
-                if (ghConfigured) {
-                    runCatching {
-                        val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
-
-                        val r = GitHubLogUploadManager.tryUploadPendingCrashesBlocking(appCtx)
-
-                        val err = r.exceptionOrNull()
-                        val errMsg = err?.message?.replace('\n', ' ')?.take(ERR_MSG_MAX).orEmpty()
-
-                        AppLog.i(
-                            TAG,
-                            "pending crash upload (GitHub): pendingBefore=$pendingBefore ok=${r.isSuccess} " +
-                                    "result=${r.getOrNull()} err=${err?.javaClass?.simpleName} msg=${if (errMsg.isBlank()) "-" else errMsg}"
-                        )
-
-                        if (err != null && BuildConfig.DEBUG) {
-                            Log.e(TAG, "pending crash upload (GitHub) failed", err)
-                        }
-                    }.onFailure { t ->
-                        if (BuildConfig.DEBUG) Log.e(TAG, "pending crash upload (GitHub) failed", t)
-                        AppLog.e(TAG, "pending crash upload (GitHub) failed", t)
-                    }
-                } else {
-                    AppLog.w(TAG, "pending crash upload (GitHub) skipped: not configured")
+                }.onFailure { t ->
+                    if (BuildConfig.DEBUG) Log.e(TAG, "pending crash upload (GitHub) failed", t)
+                    AppLog.e(TAG, "pending crash upload (GitHub) failed", t)
                 }
 
                 val pendingAfter = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
@@ -274,19 +204,4 @@ private fun buildStartupLog(savedInstanceState: Bundle?): String {
             "pid=${Process.myPid()} " +
             "recreated=$recreation " +
             "build=$buildLabel"
-}
-
-/**
- * Reads a String field from BuildConfig via reflection.
- *
- * Notes:
- * - Avoids compile-time dependency on optional fields.
- * - Returns "" if missing or not a String.
- */
-private fun buildConfigString(fieldName: String): String {
-    return runCatching {
-        val f = BuildConfig::class.java.getDeclaredField(fieldName).apply { isAccessible = true }
-        val v = f.get(null)
-        (v as? String).orEmpty()
-    }.getOrDefault("")
 }
