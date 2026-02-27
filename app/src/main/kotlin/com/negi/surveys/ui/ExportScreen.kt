@@ -17,7 +17,6 @@ import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
-import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -123,10 +122,7 @@ fun ExportScreen(
     }
 
     LaunchedEffect(sha256, lenChars, lenBytes) {
-        if (BuildConfig.DEBUG) {
-            AppLog.d(TAG, "ExportScreen: chars=$lenChars bytes=$lenBytes sha256=$sha256")
-            Log.d(TAG, "ExportScreen: chars=$lenChars bytes=$lenBytes sha256=$sha256")
-        }
+        AppLog.d(TAG, "ExportScreen: chars=$lenChars bytes=$lenBytes sha256=$sha256")
     }
 
     val displayedText = remember(exportText, showFull) {
@@ -340,7 +336,6 @@ private fun copyToClipboardSafe(context: Context, label: String, text: String): 
             true
         }
     }.onFailure { t ->
-        Log.w(TAG, "copyToClipboard failed (${t.javaClass.simpleName})", t)
         AppLog.w(TAG, "copyToClipboard failed (${t.javaClass.simpleName})")
     }.getOrDefault(false)
 }
@@ -370,7 +365,6 @@ private fun shareExportSafe(context: Context, subject: String, text: String): Bo
             }
         }
     }.onFailure { t ->
-        Log.w(TAG, "shareExportSafe failed (${t.javaClass.simpleName})", t)
         AppLog.w(TAG, "shareExportSafe failed (${t.javaClass.simpleName})")
     }.getOrDefault(false)
 }
@@ -390,7 +384,6 @@ private fun shareText(context: Context, subject: String, text: String): Boolean 
         AppLog.i(TAG, "shareText: launched")
         true
     }.onFailure { t ->
-        Log.w(TAG, "shareText failed (${t.javaClass.simpleName})", t)
         AppLog.w(TAG, "shareText failed (${t.javaClass.simpleName})")
     }.getOrDefault(false)
 }
@@ -448,7 +441,6 @@ private fun shareAsFileViaFileProvider(context: Context, subject: String, text: 
         // Common failures:
         // - IllegalArgumentException: missing FileProvider/authority
         // - ActivityNotFoundException: no share targets
-        Log.w(TAG, "shareAsFileViaFileProvider failed (${t.javaClass.simpleName})", t)
         AppLog.w(TAG, "shareAsFileViaFileProvider failed (${t.javaClass.simpleName})")
     }.getOrDefault(false)
 }

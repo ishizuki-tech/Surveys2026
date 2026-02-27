@@ -17,8 +17,8 @@ import android.content.Context
 import android.os.Build
 import android.os.Process
 import android.util.Base64
-import android.util.Log
 import com.negi.surveys.BuildConfig
+import com.negi.surveys.logging.AppLog
 import java.io.BufferedInputStream
 import java.io.ByteArrayOutputStream
 import java.io.File
@@ -59,7 +59,7 @@ object DebugLogUploader {
     suspend fun collectAndUpload(context: Context): UploadResult = withContext(Dispatchers.IO) {
         val file = runCatching { collectLogFile(context) }
             .getOrElse { e ->
-                Log.w(TAG, "collectLogFile failed: ${e.message}")
+                AppLog.w(TAG, "collectLogFile failed: ${e.message}")
                 // Always produce *some* file to avoid "No log file found".
                 writeFallbackFile(context, "collectLogFile failed: ${e.javaClass.simpleName}: ${e.message}")
             }
@@ -101,7 +101,7 @@ object DebugLogUploader {
             .toString()
 
         file.writeText(body)
-        Log.d(TAG, "Collected debug log file: ${file.absolutePath} (len=${file.length()})")
+        AppLog.d(TAG, "Collected debug log file: ${file.absolutePath} (len=${file.length()})")
         return file
     }
 
@@ -212,7 +212,7 @@ object DebugLogUploader {
         }
 
         file.writeText(body)
-        Log.w(TAG, "Wrote fallback log file: ${file.absolutePath}")
+        AppLog.w(TAG, "Wrote fallback log file: ${file.absolutePath}")
         return file
     }
 
@@ -271,7 +271,7 @@ object DebugLogUploader {
                 message = "Uploaded to GitHub: $webUrl (HTTP $code)"
             )
         } else {
-            Log.w(TAG, "GitHub upload failed: HTTP $code msg=$msg endpoint=$endpoint")
+            AppLog.w(TAG, "GitHub upload failed: HTTP $code msg=$msg endpoint=$endpoint")
             UploadResult(
                 ok = false,
                 destination = "github",

@@ -39,9 +39,9 @@
 package com.negi.surveys.config
 
 import android.content.Context
-import android.util.Log
 import com.charleskorn.kaml.Yaml
 import com.charleskorn.kaml.YamlConfiguration
+import com.negi.surveys.logging.AppLog
 import java.io.File
 import java.nio.charset.Charset
 import java.util.ArrayDeque
@@ -894,23 +894,6 @@ enum class ConfigFormat { JSON, YAML, AUTO }
 
 object SurveyConfigLoader {
 
-    @Volatile private var debugFormat: Boolean = false
-    @Volatile private var debugValidate: Boolean = false
-    @Volatile private var debugPrompts: Boolean = false
-    @Volatile private var debugDumpSystemPrompts: Boolean = false
-
-    fun setDebug(
-        format: Boolean? = null,
-        validate: Boolean? = null,
-        prompts: Boolean? = null,
-        dumpSystemPrompts: Boolean? = null
-    ) {
-        format?.let { debugFormat = it }
-        validate?.let { debugValidate = it }
-        prompts?.let { debugPrompts = it }
-        dumpSystemPrompts?.let { debugDumpSystemPrompts = it }
-    }
-
     internal data class FormatDecision(
         val format: ConfigFormat,
         val reason: String,
@@ -987,13 +970,11 @@ object SurveyConfigLoader {
         format: ConfigFormat = ConfigFormat.AUTO
     ): SurveyConfig =
         fromAssets(context, fileName, charset, format).also {
-            if (debugPrompts) Log.d(TAG, "Loaded config (assets/$fileName): ${it.debugSummary()}")
-            if (debugValidate) {
-                val issues = it.validate()
-                Log.d(TAG, "fromAssetsValidated -> issues=${issues.size} (${it.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
-            }
-            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
+            AppLog.d(TAG, "Loaded config (assets/$fileName): ${it.debugSummary()}")
+            val issues = it.validate()
+            AppLog.d(TAG, "fromAssetsValidated -> issues=${issues.size} (${it.debugSummary()})")
+            issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
+            AppLog.d(TAG, it.debugDump())
             it.requireValid()
         }
 
@@ -1022,13 +1003,11 @@ object SurveyConfigLoader {
         format: ConfigFormat = ConfigFormat.AUTO
     ): SurveyConfig =
         fromFile(path, charset, format).also {
-            if (debugPrompts) Log.d(TAG, "Loaded config (file/$path): ${it.debugSummary()}")
-            if (debugValidate) {
-                val issues = it.validate()
-                Log.d(TAG, "fromFileValidated -> issues=${issues.size} (${it.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
-            }
-            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
+            AppLog.d(TAG, "Loaded config (file/$path): ${it.debugSummary()}")
+            val issues = it.validate()
+            AppLog.d(TAG, "fromFileValidated -> issues=${issues.size} (${it.debugSummary()})")
+            issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
+            AppLog.d(TAG, it.debugDump())
             it.requireValid()
         }
 
@@ -1072,9 +1051,7 @@ object SurveyConfigLoader {
         val sanitized = text.normalizeText()
         val decision = decideFormat(desired = format, fileName = fileNameHint, text = sanitized)
 
-        if (debugFormat) {
-            Log.d(TAG, "fromString -> ${decision.debugString()} file='${fileNameHint.orEmpty()}'")
-        }
+        AppLog.d(TAG, "fromString -> ${decision.debugString()} file='${fileNameHint.orEmpty()}'")
 
         val cfg = try {
             when (decision.format) {
@@ -1099,12 +1076,8 @@ object SurveyConfigLoader {
             )
         }
 
-        if (debugPrompts) {
-            Log.d(TAG, "fromString loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
-        }
-        if (debugDumpSystemPrompts) {
-            Log.d(TAG, cfg.debugDump())
-        }
+        AppLog.d(TAG, "fromString loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
+        AppLog.d(TAG, cfg.debugDump())
 
         return cfg
     }
@@ -1115,12 +1088,10 @@ object SurveyConfigLoader {
         fileNameHint: String? = null
     ): SurveyConfig =
         fromString(text, format, fileNameHint).also {
-            if (debugValidate) {
-                val issues = it.validate()
-                Log.d(TAG, "fromStringValidated -> issues=${issues.size} (${it.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
-            }
-            if (debugDumpSystemPrompts) Log.d(TAG, it.debugDump())
+            val issues = it.validate()
+            AppLog.d(TAG, "fromStringValidated -> issues=${issues.size} (${it.debugSummary()})")
+            issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
+            AppLog.d(TAG, it.debugDump())
             it.requireValid()
         }
 
@@ -1131,13 +1102,11 @@ object SurveyConfigLoader {
         val sanitized = text.normalizeText()
         try {
             val cfg = yamlStrict.decodeFromString(SurveyConfig.serializer(), sanitized)
-            if (debugPrompts) Log.d(TAG, "strictYaml loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
-            if (debugValidate) {
-                val issues = cfg.validate()
-                Log.d(TAG, "fromStringYamlStrictValidated -> issues=${issues.size} (${cfg.debugSummary()})")
-                issues.forEach { msg -> Log.d(TAG, "  - $msg") }
-            }
-            if (debugDumpSystemPrompts) Log.d(TAG, cfg.debugDump())
+            AppLog.d(TAG, "strictYaml loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
+            val issues = cfg.validate()
+            AppLog.d(TAG, "fromStringYamlStrictValidated -> issues=${issues.size} (${cfg.debugSummary()})")
+            issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
+            AppLog.d(TAG, cfg.debugDump())
             cfg.requireValid()
             return cfg
         } catch (ex: Exception) {

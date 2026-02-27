@@ -13,7 +13,6 @@
 
 package com.negi.surveys.ui
 
-import android.util.Log
 import androidx.compose.animation.animateContentSize
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
@@ -102,6 +101,7 @@ import com.negi.surveys.chat.DraftKey
 import com.negi.surveys.chat.InMemoryChatDraftStore
 import com.negi.surveys.chat.LiteRtLmRepository
 import com.negi.surveys.chat.Repository
+import com.negi.surveys.logging.AppLog
 import java.util.Locale
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
@@ -139,7 +139,7 @@ fun ChatQuestionScreen(
         AdvancedAnswerValidator(
             repository = repo,
             streamBridge = streamBridge,
-            logger = { Log.d("AdvancedValidator", it) }
+            logger = { AppLog.d("AdvancedValidator", it) }
         )
     }
 
@@ -179,11 +179,11 @@ fun ChatQuestionScreen(
 
     LaunchedEffect(vmKey) {
         nextInFlight = false
-        Log.d(TAG, "Next latch reset. qid=$questionId vmKey=$vmKey")
+        AppLog.d(TAG, "Next latch reset. qid=$questionId vmKey=$vmKey")
     }
 
     LaunchedEffect(vmKey) {
-        Log.d(TAG, "Using shared streamBridge identity=${System.identityHashCode(streamBridge)} qid=$questionId")
+        AppLog.d(TAG, "Using shared streamBridge identity=${System.identityHashCode(streamBridge)} qid=$questionId")
     }
 
     LaunchedEffect(vmKey) {
@@ -283,7 +283,7 @@ fun ChatQuestionScreen(
                             detailsExpanded = detailsExpanded[msg.id] ?: false,
                             onToggleDetailsExpand = { expand ->
                                 detailsExpanded[msg.id] = expand
-                                Log.d(TAG, "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}")
+                                AppLog.d(TAG, "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}")
                             }
                         )
                     }
@@ -300,21 +300,21 @@ fun ChatQuestionScreen(
                 nextInFlight = nextInFlight,
                 onInputChange = { vm.setInput(it) },
                 onBack = {
-                    Log.d(TAG, "Back clicked. qid=$questionId busy=$isBusy")
+                    AppLog.d(TAG, "Back clicked. qid=$questionId busy=$isBusy")
                     vm.cancelValidation("back_click")
                     onBackLatest()
                 },
                 onSubmit = {
-                    Log.d(TAG, "Submit clicked. qid=$questionId len=${input.length}")
+                    AppLog.d(TAG, "Submit clicked. qid=$questionId len=${input.length}")
                     vm.submit()
                 },
                 onNext = {
                     if (nextInFlight) {
-                        Log.w(TAG, "Next clicked while inFlight=true (ignored). qid=$questionId")
+                        AppLog.w(TAG, "Next clicked while inFlight=true (ignored). qid=$questionId")
                         return@BottomComposerCard
                     }
                     if (isBusy) {
-                        Log.w(TAG, "Next clicked while busy=true (ignored). qid=$questionId")
+                        AppLog.w(TAG, "Next clicked while busy=true (ignored). qid=$questionId")
                         return@BottomComposerCard
                     }
 
@@ -336,7 +336,7 @@ fun ChatQuestionScreen(
                             messagesSnapshot = messagesNow
                         )
 
-                        Log.d(TAG, "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}")
+                        AppLog.d(TAG, "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}")
                         onNextLatest(log)
                     } finally {
                         nextInFlight = false
@@ -1081,6 +1081,7 @@ private fun StreamingMiniShimmerBar() {
 
 @Composable
 private fun TtftIndicator(modifier: Modifier = Modifier) {
+
     val infinite = rememberInfiniteTransition(label = "ttft")
 
     val dot1 by infinite.animateFloat(
@@ -1146,6 +1147,8 @@ private fun TtftIndicator(modifier: Modifier = Modifier) {
         Spacer(Modifier.height(10.dp))
 
         val barShape = RoundedCornerShape(999.dp)
+
+        @Suppress("COMPOSE_APPLIER_CALL_MISMATCH")
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
@@ -1153,6 +1156,7 @@ private fun TtftIndicator(modifier: Modifier = Modifier) {
                 .clip(barShape)
                 .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.35f))
         ) {
+
             val wPx = with(androidx.compose.ui.platform.LocalDensity.current) { maxWidth.toPx() }.coerceAtLeast(1f)
             val x = (shimmerPhase * 2f - 1f) * wPx
 
@@ -1166,11 +1170,7 @@ private fun TtftIndicator(modifier: Modifier = Modifier) {
                 end = Offset(x + wPx, 0f)
             )
 
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .background(brush)
-            )
+            Box(modifier = Modifier.fillMaxSize().background(brush))
         }
     }
 }
@@ -1288,7 +1288,7 @@ private fun buildReviewQuestionLog(
         }
     }
 
-    Log.d(TAG, "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}")
+    AppLog.d(TAG, "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}")
 
     return ReviewQuestionLog(
         questionId = questionId,

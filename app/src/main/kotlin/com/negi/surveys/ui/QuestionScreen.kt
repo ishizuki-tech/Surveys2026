@@ -13,7 +13,6 @@
 
 package com.negi.surveys.ui
 
-import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -48,8 +47,9 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.unit.dp
-import com.negi.surveys.logging.AppLog
 import java.security.MessageDigest
+
+import com.negi.surveys.logging.AppLog
 
 /**
  * Question screen (frame-ready, text-answer variant).
@@ -96,7 +96,6 @@ fun QuestionScreen(
             answer = initialAnswer
             submitInFlight = false
             AppLog.d(TAG, "applied initialAnswer qid=$questionId len=${initialAnswer.length}")
-            Log.d(TAG, "applied initialAnswer qid=$questionId len=${initialAnswer.length}")
         }
     }
 
@@ -106,13 +105,11 @@ fun QuestionScreen(
 
     LaunchedEffect(questionId) {
         AppLog.d(TAG, "composed qid=$questionId")
-        Log.d(TAG, "composed qid=$questionId")
     }
 
     DisposableEffect(questionId) {
         onDispose {
             AppLog.d(TAG, "disposed qid=$questionId")
-            Log.d(TAG, "disposed qid=$questionId")
         }
     }
 
@@ -125,7 +122,6 @@ fun QuestionScreen(
         val text = trimmed
         if (text.isEmpty()) {
             AppLog.d(TAG, "submit blocked (invalid) qid=$questionId len=$answerLen")
-            Log.d(TAG, "submit blocked (invalid) qid=$questionId len=$answerLen")
             return
         }
 
@@ -137,7 +133,6 @@ fun QuestionScreen(
          */
         val sha8 = sha256Hex(text).take(8)
         AppLog.i(TAG, "next qid=$questionId len=${text.length} sha8=$sha8")
-        Log.d(TAG, "next qid=$questionId len=${text.length} sha8=$sha8")
 
         // Let the parent navigate; if it returns to this screen, state will be reset by questionId change.
         latestOnNext(text)
@@ -196,7 +191,6 @@ fun QuestionScreen(
             OutlinedButton(
                 onClick = {
                     AppLog.d(TAG, "back clicked qid=$questionId")
-                    Log.d(TAG, "back clicked qid=$questionId")
                     latestOnBack()
                 },
                 enabled = !submitInFlight

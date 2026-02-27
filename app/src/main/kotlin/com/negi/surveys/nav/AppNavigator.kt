@@ -11,9 +11,9 @@
 
 package com.negi.surveys.nav
 
-import android.util.Log
 import androidx.navigation3.runtime.NavBackStack
 import androidx.navigation3.runtime.NavKey
+import com.negi.surveys.logging.AppLog
 
 /**
  * Centralized navigation controller for a single Nav3 back stack.
@@ -179,13 +179,8 @@ class AppNavigator(
 
         object Default : Logger {
             private const val TAG = "AppNavigator"
-
-            
-            /** Toggle navigator debug logging. */
-            private const val ENABLED = true
-
             override fun d(msg: String) {
-                if (ENABLED) Log.d(TAG, msg)
+                AppLog.d(TAG, msg)
             }
         }
     }
