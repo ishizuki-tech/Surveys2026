@@ -32,16 +32,19 @@ import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.AppLog
+import com.negi.surveys.slm.SlmWarmup
 import kotlinx.coroutines.delay
 
 private const val TAG = "SurveyStartScreen"
@@ -52,21 +55,25 @@ private const val TAG = "SurveyStartScreen"
  * Goals:
  * - Provide a clear "pre-flight" step before starting questions.
  * - Prevent accidental double navigation (e.g., rapid taps).
- * - Offer an optional debug panel hook for future ViewModel/config/session wiring.
+ * - Gate "Begin" until the SLM compile warmup is ready to avoid UI jank and
+ *   reduce the chance of a first-question stall.
  *
  * Notes:
  * - Keep this composable UI-only. It emits intents via callbacks.
- * - In later steps, you can inject survey config metadata (name/version/language),
- *   eligibility summary, or a "resume session" option.
+ * - Warmup is process-scoped via [SlmWarmup].
  */
 @Composable
 fun SurveyStartScreen(
     onBegin: () -> Unit,
     onBack: () -> Unit,
-    debugInfo: DebugInfo? = null
+    debugInfo: DebugInfo? = null,
 ) {
     val latestOnBegin by rememberUpdatedState(onBegin)
     val latestOnBack by rememberUpdatedState(onBack)
+
+    val appContext = LocalContext.current.applicationContext
+
+    val compileState by SlmWarmup.compileState.collectAsState()
 
     /**
      * Guard flag to prevent duplicate navigations caused by rapid multiple taps.
@@ -77,6 +84,39 @@ fun SurveyStartScreen(
      */
     var beginLocked by remember { mutableStateOf(false) }
 
+    /**
+     * User requested "Begin" but the model is not ready yet.
+     * We keep the user on this screen and proceed automatically once warmup is ready.
+     */
+    var beginPendingWarmup by remember { mutableStateOf(false) }
+
+    // Request compile warmup once we have a frame on screen.
+    CompileWarmupOnFirstNeedEffect(
+        warmupKey = Unit,
+        compileWarmup = {
+            SlmWarmup.startCompileIfConfigured(appContext)
+        },
+        delayMsAfterFirstFrame = COMPILE_REQUEST_DELAY_MS,
+        onRequested = {
+            AppLog.d(TAG, "compile warmup requested")
+            if (BuildConfig.DEBUG) Log.d(TAG, "compile warmup requested")
+        }
+    )
+
+    fun proceedBegin(source: String) {
+        beginLocked = true
+        AppLog.i(TAG, "begin proceed: source=$source state=${compileState.javaClass.simpleName}")
+        if (BuildConfig.DEBUG) Log.d(TAG, "begin proceed: source=$source state=${compileState.javaClass.simpleName}")
+
+        runCatching { latestOnBegin() }
+            .onFailure { t ->
+                // If begin throws synchronously, unlock immediately to avoid trapping the UI.
+                beginLocked = false
+                AppLog.w(TAG, "begin callback failed (unlocked): ${t.javaClass.simpleName}")
+                if (BuildConfig.DEBUG) Log.w(TAG, "begin callback failed (unlocked)", t)
+            }
+    }
+
     if (BuildConfig.DEBUG) {
         LaunchedEffect(Unit) {
             AppLog.d(TAG, "composed")
@@ -84,9 +124,21 @@ fun SurveyStartScreen(
         }
     }
 
+    // If the user requested Begin early, proceed automatically once warmup is ready.
+    LaunchedEffect(beginPendingWarmup, compileState) {
+        if (!beginPendingWarmup) return@LaunchedEffect
+        if (isWarmupReady(compileState)) {
+            beginPendingWarmup = false
+            proceedBegin(source = "autoAfterWarmup")
+        }
+    }
+
     /**
-     * Auto-unlock if we stay on this screen for too long after "Begin".
+     * Auto-unlock if we stay on this screen for too long after we actually invoked navigation.
      * If navigation succeeds, this composable will typically leave composition, so this effect cancels.
+     *
+     * Important:
+     * - Do NOT apply this timeout while waiting for warmup.
      */
     LaunchedEffect(beginLocked) {
         if (!beginLocked) return@LaunchedEffect
@@ -121,6 +173,21 @@ fun SurveyStartScreen(
             DebugPanel(debugInfo = debugInfo)
         }
 
+        // Warmup status (show only when it matters, to keep the UI clean).
+        val showWarmupStatus = beginPendingWarmup || !isWarmupReady(compileState)
+        if (showWarmupStatus) {
+            Spacer(Modifier.height(6.dp))
+            WarmupStatusPanel(
+                compileState = compileState,
+                onRetry = {
+                    AppLog.w(TAG, "warmup retry requested")
+                    if (BuildConfig.DEBUG) Log.d(TAG, "warmup retry requested")
+                    SlmWarmup.resetForRetry(reason = "uiRetry")
+                    SlmWarmup.startCompileIfConfigured(appContext)
+                }
+            )
+        }
+
         Spacer(Modifier.height(12.dp))
 
         Row(
@@ -129,6 +196,13 @@ fun SurveyStartScreen(
         ) {
             OutlinedButton(
                 onClick = {
+                    if (beginPendingWarmup) {
+                        // Cancel "pending begin" and return.
+                        beginPendingWarmup = false
+                        AppLog.d(TAG, "begin pending cancelled by back")
+                        if (BuildConfig.DEBUG) Log.d(TAG, "begin pending cancelled by back")
+                    }
+
                     AppLog.d(TAG, "click: back")
                     if (BuildConfig.DEBUG) Log.d(TAG, "click: back")
                     runCatching { latestOnBack() }
@@ -152,32 +226,90 @@ fun SurveyStartScreen(
                         if (BuildConfig.DEBUG) Log.d(TAG, "begin ignored (locked)")
                         return@Button
                     }
+                    if (beginPendingWarmup) {
+                        AppLog.w(TAG, "begin ignored (pendingWarmup)")
+                        if (BuildConfig.DEBUG) Log.d(TAG, "begin ignored (pendingWarmup)")
+                        return@Button
+                    }
 
-                    beginLocked = true
-                    AppLog.i(TAG, "click: begin")
-                    if (BuildConfig.DEBUG) Log.d(TAG, "click: begin")
+                    if (isWarmupReady(compileState)) {
+                        AppLog.i(TAG, "click: begin")
+                        if (BuildConfig.DEBUG) Log.d(TAG, "click: begin")
+                        proceedBegin(source = "immediate")
+                        return@Button
+                    }
 
-                    runCatching { latestOnBegin() }
-                        .onFailure { t ->
-                            // If begin throws synchronously, unlock immediately to avoid trapping the UI.
-                            beginLocked = false
-                            AppLog.w(TAG, "begin callback failed (unlocked): ${t.javaClass.simpleName}")
-                            if (BuildConfig.DEBUG) Log.w(TAG, "begin callback failed (unlocked)", t)
-                        }
+                    // Not ready yet: request warmup (idempotent) and wait on this screen.
+                    beginPendingWarmup = true
+                    AppLog.i(TAG, "click: begin (waiting for warmup)")
+                    if (BuildConfig.DEBUG) Log.d(TAG, "click: begin (waiting for warmup)")
+                    SlmWarmup.startCompileIfConfigured(appContext)
                 },
-                enabled = !beginLocked,
+                enabled = !beginLocked && !beginPendingWarmup,
                 modifier = Modifier
                     .weight(1f)
                     .testTag("survey_start_begin")
             ) {
-                Text("Begin (Q1)")
+                Text(
+                    when {
+                        beginPendingWarmup -> "Preparing…"
+                        else -> "Begin (Q1)"
+                    }
+                )
             }
         }
 
         if (beginLocked) {
             Text("Starting…")
+        } else if (beginPendingWarmup) {
+            Text("Preparing the AI model… (this may take a while on first run)")
         }
     }
 }
 
+@Composable
+private fun WarmupStatusPanel(
+    compileState: SlmWarmup.CompileState,
+    onRetry: () -> Unit,
+) {
+    val text = when (compileState) {
+        is SlmWarmup.CompileState.Idle -> "AI warmup: idle"
+        is SlmWarmup.CompileState.WaitingForPrefetch ->
+            "AI warmup: waiting for prefetch (${formatElapsed(compileState.elapsedMs)})"
+        is SlmWarmup.CompileState.Compiling ->
+            "AI warmup: compiling (${formatElapsed(compileState.elapsedMs)})"
+        is SlmWarmup.CompileState.Compiled ->
+            "AI warmup: ready (${formatElapsed(compileState.elapsedMs)})"
+        is SlmWarmup.CompileState.Cancelled ->
+            "AI warmup: cancelled (${formatElapsed(compileState.elapsedMs)})"
+        is SlmWarmup.CompileState.Failed ->
+            "AI warmup: failed (${compileState.message})"
+        is SlmWarmup.CompileState.SkippedNotConfigured ->
+            "AI warmup: skipped (${compileState.reason})"
+    }
+
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(text)
+        if (compileState is SlmWarmup.CompileState.Failed || compileState is SlmWarmup.CompileState.Cancelled) {
+            OutlinedButton(onClick = onRetry, modifier = Modifier.testTag("warmup_retry")) {
+                Text("Retry warmup")
+            }
+        }
+    }
+}
+
+private fun isWarmupReady(state: SlmWarmup.CompileState): Boolean {
+    return when (state) {
+        is SlmWarmup.CompileState.Compiled,
+        is SlmWarmup.CompileState.SkippedNotConfigured -> true
+        else -> false
+    }
+}
+
+private fun formatElapsed(ms: Long): String {
+    val sec = ms.coerceAtLeast(0L) / 1000.0
+    return String.format("%.1fs", sec)
+}
+
 private const val BEGIN_LOCK_TIMEOUT_MS: Long = 2_000L
+private const val COMPILE_REQUEST_DELAY_MS: Long = 250L

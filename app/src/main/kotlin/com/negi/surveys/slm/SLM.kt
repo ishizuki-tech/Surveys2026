@@ -52,6 +52,8 @@ import com.google.ai.edge.litertlm.Message
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.logging.AppLog
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.suspendCancellableCoroutine
 import java.lang.reflect.InvocationTargetException
 import java.lang.reflect.Method
 import java.lang.reflect.Modifier
@@ -63,8 +65,6 @@ import kotlin.coroutines.Continuation
 import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
-import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.suspendCancellableCoroutine
 
 private const val TAG = "SLM"
 
@@ -164,13 +164,13 @@ data class Model(
  * Parse an accelerator string safely.
  */
 private fun parseAcceleratorLabel(raw: String?): String {
-    val s = raw?.trim()?.uppercase(Locale.US).orEmpty()
+    val s = raw?.trim()?.uppercase(Locale.ROOT).orEmpty()
     return when (s) {
         Accelerator.CPU.label -> Accelerator.CPU.label
         Accelerator.GPU.label -> Accelerator.GPU.label
         "" -> Accelerator.GPU.label
         else -> {
-            /** Unknown label -> default GPU for compatibility. */
+            // Unknown label -> default GPU for compatibility.
             Accelerator.GPU.label
         }
     }
@@ -918,15 +918,33 @@ object SLM {
             "generateText: model='${model.name}' textLen=${input.length} images=${images.size} audio=${audioClips.size}"
         }
 
+        val reflectedBuffer = StringBuilder()
+        val reflectedNormalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
+
+        val onPartialWrapped: (String) -> Unit = { chunk ->
+            val delta = reflectedNormalizer.toDelta(chunk)
+            if (delta.isNotEmpty()) {
+                reflectedBuffer.append(delta)
+                runCatching { onPartial(delta) }
+                    .onFailure { t -> w(t) { "generateText onPartial failed: ${t.message}" } }
+            }
+        }
+
         try {
             val res = invokeLiteRtLmBestEffortSuspend(
                 methodName = "generateText",
-                argsNoCont = arrayOf(model, input, images, audioClips, onPartial),
+                argsNoCont = arrayOf(model, input, images, audioClips, onPartialWrapped),
                 onFailLog = "LiteRtLM.generateText unavailable",
             )
             if (res.invoked) {
-                val s = res.value as? String
-                if (s != null) return s
+                val v = res.value
+                if (v is String) return v
+                if (v is CharSequence) return v.toString()
+                if (reflectedBuffer.isNotEmpty()) return reflectedBuffer.toString()
+
+                val type = v?.javaClass?.name ?: "null"
+                w { "generateText: invoked but returned unexpected value ($type); returning empty to avoid double inference" }
+                return ""
             }
         } catch (ce: CancellationException) {
             throw ce
@@ -963,7 +981,7 @@ object SLM {
             val onError: (String) -> Unit = onError@{ msg ->
                 if (!terminal.compareAndSet(false, true)) return@onError
 
-                val lc = msg.lowercase(Locale.US)
+                val lc = msg.lowercase(Locale.ROOT)
                 val ex = if (lc.contains("cancel")) {
                     CancellationException("Cancelled")
                 } else {

@@ -52,14 +52,8 @@ class MainActivity : ComponentActivity() {
 
         val appContext = applicationContext
 
-        // Initialize file logger early so crash capture can write minimal traces too.
-        AppLog.init(appContext)
-
-        // Install crash capture as early as possible.
-        CrashCapture.install(appContext)
-
-        // Attempt to upload any pending crash logs from a previous session (best-effort).
-        PendingCrashUploadKickoff.tryStart(appContext)
+        // Keep diagnostics initialization process-scoped and non-fatal.
+        AppBootstrap.ensureInitialized(appContext)
 
         // Enable edge-to-edge layout so the app shell can correctly handle system insets.
         enableEdgeToEdge()
@@ -82,8 +76,55 @@ class MainActivity : ComponentActivity() {
 }
 
 private const val TAG = "MainActivity"
+private const val BOOT_TAG = "AppBootstrap"
 private const val THREAD_NAME = "PendingCrashUpload"
 private const val ERR_MSG_MAX = 220
+
+/**
+ * Process-scoped bootstrap to keep startup stable.
+ *
+ * Why:
+ * - Activities can be recreated; initialization should not run multiple times.
+ * - Diagnostics code must never prevent the app from showing UI.
+ */
+private object AppBootstrap {
+    private val started = AtomicBoolean(false)
+
+    fun ensureInitialized(context: Context) {
+        val appCtx = context.applicationContext
+        if (!started.compareAndSet(false, true)) {
+            // Already initialized in this process.
+            AppLog.d(BOOT_TAG, "bootstrap: already initialized (skip)")
+            return
+        }
+
+        val t0 = SystemClock.elapsedRealtime()
+
+        // Initialize file logger early so crash capture can write minimal traces too.
+        runCatching {
+            AppLog.init(appCtx)
+        }.onFailure { t ->
+            // Fall back to Logcat only; do not crash.
+            Log.w(BOOT_TAG, "AppLog.init failed (non-fatal): ${t.javaClass.simpleName}", t)
+        }
+
+        // Install crash capture as early as possible (still best-effort).
+        runCatching {
+            CrashCapture.install(appCtx)
+        }.onFailure { t ->
+            Log.w(BOOT_TAG, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}", t)
+            // If AppLog is partially available, record it too.
+            runCatching { AppLog.w(BOOT_TAG, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}") }
+        }
+
+        // Attempt to upload any pending crash logs from a previous session (best-effort).
+        PendingCrashUploadKickoff.tryStart(appCtx)
+
+        val dt = SystemClock.elapsedRealtime() - t0
+        runCatching { AppLog.i(BOOT_TAG, "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()}") }
+        if (BuildConfig.DEBUG) Log.d(BOOT_TAG, "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()}")
+    }
+}
 
 /**
  * Process-scoped guard to prevent starting multiple upload threads due to Activity recreation.
@@ -201,7 +242,8 @@ private fun buildStartupLog(savedInstanceState: Bundle?): String {
 
     return "onCreate: sdk=${Build.VERSION.SDK_INT} " +
             "device=${Build.MANUFACTURER}/${Build.MODEL} " +
-            "pid=${Process.myPid()} " +
+            "pid=${Process.myPid()} uid=${Process.myUid()} " +
+            "uptimeMs=${SystemClock.uptimeMillis()} " +
             "recreated=$recreation " +
             "build=$buildLabel"
 }

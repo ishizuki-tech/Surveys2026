@@ -12,6 +12,7 @@
 package com.negi.surveys
 
 import android.os.Build
+import android.os.SystemClock
 import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
@@ -75,16 +76,20 @@ import com.negi.surveys.nav.Review
 import com.negi.surveys.nav.SurveyStart
 import com.negi.surveys.slm.SlmWarmup
 import com.negi.surveys.ui.ChatQuestionScreen
+import com.negi.surveys.ui.CompileWarmupOnFirstNeedEffect
 import com.negi.surveys.ui.DebugInfo
 import com.negi.surveys.ui.DebugRow
 import com.negi.surveys.ui.ExportScreen
 import com.negi.surveys.ui.HomeScreen
 import com.negi.surveys.ui.LocalChatStreamBridge
 import com.negi.surveys.ui.ReviewScreen
+import com.negi.surveys.ui.StartupPrefetchEffect
 import com.negi.surveys.ui.SurveyStartScreen
 import java.util.Locale
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -134,119 +139,58 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     val appContext = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
 
-    // --- SLM warmup state ---
-    val warmupState: SlmWarmup.PrefetchState by SlmWarmup.state.collectAsStateWithLifecycle()
+    // --- Split warmup states ---
+    val prefetchState: SlmWarmup.PrefetchState by SlmWarmup.prefetchState.collectAsStateWithLifecycle()
+    val compileState: SlmWarmup.CompileState by SlmWarmup.compileState.collectAsStateWithLifecycle()
 
-    // Raw label: changes only when state emits (good for logs).
-    val warmupRawLabel: String = remember(warmupState) { warmupLabelFor(warmupState) }
+    // --- Log labels (state-only) ---
+    val prefetchLogLabel: String = remember(prefetchState) { prefetchLabelForLog(prefetchState) }
+    val compileLogLabel: String = remember(compileState) { compileLabelForLog(compileState) }
 
-    // UI timing (monotonic) so "Initializing ..." updates in real-time AND "Initialized in X" is available.
-    val inProgress = warmupState is SlmWarmup.PrefetchState.Running || warmupState is SlmWarmup.PrefetchState.Initializing
+    // --- UI labels (ticking) for Home debug display ---
+    val (prefetchUiLabel, compileUiLabel) = rememberWarmupUiLabels(
+        prefetchState = prefetchState,
+        compileState = compileState,
+        tickIntervalMs = 500L,
+        format = WARMUP_UI_FORMAT_HOME
+    )
 
-    var warmupStartedAtMs by remember { mutableStateOf<Long?>(null) }
-    var warmupFinalElapsedMs by remember { mutableStateOf<Long?>(null) }
-
-    var warmupUiNowMs by remember { mutableLongStateOf(android.os.SystemClock.elapsedRealtime()) }
-
-    // Pin start time / finalize elapsed exactly once per run.
-    LaunchedEffect(warmupState) {
-        val now = android.os.SystemClock.elapsedRealtime()
-        when (val s = warmupState) {
-            is SlmWarmup.PrefetchState.Idle -> {
-                warmupStartedAtMs = null
-                warmupFinalElapsedMs = null
-            }
-
-            is SlmWarmup.PrefetchState.Running -> {
-                if (warmupStartedAtMs == null) {
-                    warmupStartedAtMs = (now - s.elapsedMs).coerceAtMost(now)
-                }
-                warmupFinalElapsedMs = null
-            }
-
-            is SlmWarmup.PrefetchState.Initializing -> {
-                if (warmupStartedAtMs == null) {
-                    warmupStartedAtMs = (now - s.elapsedMs).coerceAtMost(now)
-                }
-                warmupFinalElapsedMs = null
-            }
-
-            is SlmWarmup.PrefetchState.Initialized -> {
-                if (warmupFinalElapsedMs == null) {
-                    val start = warmupStartedAtMs
-                    warmupFinalElapsedMs = if (start != null) (now - start).coerceAtLeast(0L) else null
-                }
-            }
-
-            is SlmWarmup.PrefetchState.Failed -> {
-                if (warmupFinalElapsedMs == null) {
-                    val start = warmupStartedAtMs
-                    warmupFinalElapsedMs = if (start != null) (now - start).coerceAtLeast(0L) else null
-                }
-            }
-
-            is SlmWarmup.PrefetchState.Cancelled -> {
-                if (warmupFinalElapsedMs == null) {
-                    val start = warmupStartedAtMs
-                    warmupFinalElapsedMs = if (start != null) (now - start).coerceAtLeast(0L) else null
-                }
-            }
-
-            is SlmWarmup.PrefetchState.SkippedNotConfigured -> {
-                if (warmupFinalElapsedMs == null) {
-                    val start = warmupStartedAtMs
-                    warmupFinalElapsedMs = if (start != null) (now - start).coerceAtLeast(0L) else null
-                }
+    /**
+     * Warmup request after the very first frame.
+     *
+     * Policy:
+     * - Start IO-only prefetch early.
+     * - As soon as prefetch completes (terminal), immediately request compile.
+     *
+     * Rationale:
+     * - Keep behavior independent from individual screens.
+     * - Reduce the chance of heavy compile colliding with SurveyStart/Question transitions.
+     */
+    StartupPrefetchEffect(
+        prefetch = {
+            // NOTE: positional args to avoid mismatching parameter names.
+            SlmWarmup.requestCompileAfterPrefetch(appContext, "root")
+        },
+        delayMsAfterFirstFrame = 150L,
+        onRequested = {
+            if (BuildConfig.DEBUG) {
+                Log.d(TAG, "SLM Warmup requested (prefetch -> compile) (startup)")
+                AppLog.d(TAG, "SLM Warmup requested (prefetch -> compile) (startup)")
             }
         }
-    }
+    )
 
-    // UI ticker: updates ONLY while warmup is in progress (good for DebugRow/Home/Gate screen).
-    LaunchedEffect(inProgress) {
-        if (!inProgress) return@LaunchedEffect
-        while (true) {
-            warmupUiNowMs = android.os.SystemClock.elapsedRealtime()
-            delay(250L)
-        }
-    }
-
-    val displayElapsedMs: Long = when {
-        inProgress && warmupStartedAtMs != null -> (warmupUiNowMs - warmupStartedAtMs!!).coerceAtLeast(0L)
-        warmupFinalElapsedMs != null -> warmupFinalElapsedMs!!
-        else -> extractElapsedMs(warmupState) ?: 0L
-    }
-
-    val warmupUiLabel: String = remember(warmupState, displayElapsedMs, warmupFinalElapsedMs) {
-        warmupLabelForUi(warmupState, displayElapsedMs, warmupFinalElapsedMs)
-    }
-
-    // Use updated states so the entryProvider can safely reference changing values without rebuilding.
-    val warmupStateState: State<SlmWarmup.PrefetchState> = rememberUpdatedState(warmupState)
-    val warmupUiLabelState: State<String> = rememberUpdatedState(warmupUiLabel)
-
-    LaunchedEffect(Unit) {
-        // Warmup is idempotent per process.
-        SlmWarmup.startWarmupIfConfigured(appContext)
-    }
-
+    // NOTE:
+    // - Keep logs based on state-only labels (no UI ticking).
+    // - Do NOT log UI labels to avoid spam.
     if (BuildConfig.DEBUG) {
-        // Keep the raw log (no spam during the UI ticker).
-        LaunchedEffect(warmupRawLabel) {
-            Log.d(TAG, "SLM Warmup: $warmupRawLabel")
-            AppLog.d(TAG, "SLM Warmup: $warmupRawLabel")
+        LaunchedEffect(prefetchLogLabel) {
+            Log.d(TAG, "SLM Prefetch: $prefetchLogLabel")
+            AppLog.d(TAG, "SLM Prefetch: $prefetchLogLabel")
         }
-
-        // NEW: print the "in XXs" version only when warmup is finalized.
-        LaunchedEffect(warmupState, warmupFinalElapsedMs) {
-            when (warmupState) {
-                is SlmWarmup.PrefetchState.Initialized,
-                is SlmWarmup.PrefetchState.Failed,
-                is SlmWarmup.PrefetchState.Cancelled -> {
-                    Log.d(TAG, "SLM Warmup Final: $warmupUiLabel")
-                    AppLog.d(TAG, "SLM Warmup Final: $warmupUiLabel")
-                }
-                else -> Unit
-            }
+        LaunchedEffect(compileLogLabel) {
+            Log.d(TAG, "SLM Compile: $compileLogLabel")
+            AppLog.d(TAG, "SLM Compile: $compileLogLabel")
         }
     }
 
@@ -258,13 +202,14 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
             exportText.length,
             streamStats.activeSessionId,
             streamStats.droppedEvents,
-            warmupRawLabel
+            prefetchLogLabel,
+            compileLogLabel
         ) {
             Log.d(
                 TAG,
                 "NavState: size=${backStack.size} canPop=$canPop current=${currentKey.javaClass.simpleName} " +
                         "logs=${logs.size} exportLen=${exportText.length} streamActive=${streamStats.activeSessionId} " +
-                        "dropped=${streamStats.droppedEvents} slmWarmup=$warmupRawLabel"
+                        "dropped=${streamStats.droppedEvents} prefetch=$prefetchLogLabel compile=$compileLogLabel"
             )
         }
     }
@@ -283,7 +228,8 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         streamStats.ignoredEnd,
         streamStats.ignoredError,
         streamStats.ignoredCancel,
-        warmupUiLabel,
+        prefetchUiLabel,
+        compileUiLabel
     ) {
         val ignoredTotal =
             streamStats.ignoredDelta + streamStats.ignoredEnd + streamStats.ignoredError + streamStats.ignoredCancel
@@ -303,7 +249,8 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 DebugRow("StreamLastKind", (streamStats.lastEventKind ?: "-")),
                 DebugRow("StreamLastSid", streamStats.lastEventSessionId.toString()),
                 DebugRow("StreamAgeMs", streamStats.lastEventAgeMs.toString()),
-                DebugRow("SLM Warmup", warmupUiLabel),
+                DebugRow("SLM Prefetch", prefetchUiLabel),
+                DebugRow("SLM Compile", compileUiLabel),
             )
         )
     }
@@ -320,7 +267,9 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                 val gh = runCatching {
                     if (GitHubLogUploadManager.isConfigured()) {
                         GitHubLogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
-                    } else null
+                    } else {
+                        null
+                    }
                 }.getOrNull()
 
                 val summary = "gh=" + (gh ?: "fail")
@@ -341,36 +290,69 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         sessionVm,
         startManualUpload,
         debugInfoState,
-        warmupStateState,
-        warmupUiLabelState
+        appContext
     ) {
         entryProvider {
             entry<Home> {
                 HomeScreen(
-                    onStartSurvey = { nav.startSurvey() },
+                    onStartSurvey = {
+                        // Keep it light. Warmup is managed at startup in SurveyAppRoot.
+                        nav.startSurvey()
+                    },
                     onExport = { nav.goExport() },
                     debugInfo = debugInfoState.value
                 )
             }
 
             entry<SurveyStart> {
+                CompileWarmupOnFirstNeedEffect(
+                    warmupKey = "SurveyStart",
+                    delayMsAfterFirstFrame = 250L,
+                    onRequested = {
+                        if (BuildConfig.DEBUG) {
+                            Log.d(TAG, "SLM Compile requested (surveyStart)")
+                            AppLog.d(TAG, "SLM Compile requested (surveyStart)")
+                        }
+                    },
+                    compileWarmup = { SlmWarmup.startCompileIfConfigured(appContext) }
+                )
+
                 SurveyStartScreen(
-                    onBegin = { nav.beginQuestions("Q1") },
+                    onBegin = {
+                        nav.beginQuestions("Q1")
+                    },
                     onBack = { nav.pop() },
                     debugInfo = debugInfoState.value
                 )
             }
 
             entry<Question> { key ->
+                CompileWarmupOnFirstNeedEffect(
+                    warmupKey = key.id,
+                    delayMsAfterFirstFrame = 150L,
+                    onRequested = {
+                        if (BuildConfig.DEBUG) {
+                            Log.d(TAG, "SLM Compile requested (question=${key.id})")
+                            AppLog.d(TAG, "SLM Compile requested (question=${key.id})")
+                        }
+                    },
+                    compileWarmup = { SlmWarmup.startCompileIfConfigured(appContext) }
+                )
+
                 val prompt = prompts[key.id] ?: "Question prompt for ${key.id} (placeholder)"
 
-                val wu = warmupStateState.value
-                val isWarmupBlocking = wu is SlmWarmup.PrefetchState.Running || wu is SlmWarmup.PrefetchState.Initializing
+                val ps: SlmWarmup.PrefetchState by SlmWarmup.prefetchState.collectAsStateWithLifecycle()
+                val cs: SlmWarmup.CompileState by SlmWarmup.compileState.collectAsStateWithLifecycle()
 
-                if (isWarmupBlocking) {
+                val isBlocking = ps is SlmWarmup.PrefetchState.Running ||
+                        cs is SlmWarmup.CompileState.Idle ||
+                        cs is SlmWarmup.CompileState.WaitingForPrefetch ||
+                        cs is SlmWarmup.CompileState.Compiling
+
+                if (isBlocking) {
                     SlmWarmupGateScreen(
-                        state = wu,
-                        label = warmupUiLabelState.value,
+                        prefetchState = ps,
+                        compileState = cs,
                         onBack = { nav.pop() }
                     )
                 } else {
@@ -440,10 +422,17 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
 
 @Composable
 private fun SlmWarmupGateScreen(
-    state: SlmWarmup.PrefetchState,
-    label: String,
+    prefetchState: SlmWarmup.PrefetchState,
+    compileState: SlmWarmup.CompileState,
     onBack: () -> Unit
 ) {
+    val labelText = rememberWarmupPrimaryUiLabel(
+        prefetchState = prefetchState,
+        compileState = compileState,
+        tickIntervalMs = 250L,
+        format = WARMUP_UI_FORMAT_GATE
+    )
+
     Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
         Column(
             modifier = Modifier
@@ -464,7 +453,7 @@ private fun SlmWarmupGateScreen(
             Spacer(modifier = Modifier.height(8.dp))
 
             Text(
-                text = label,
+                text = labelText,
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 textAlign = TextAlign.Center
@@ -472,9 +461,15 @@ private fun SlmWarmupGateScreen(
 
             Spacer(modifier = Modifier.height(18.dp))
 
-            val hint = when (state) {
-                is SlmWarmup.PrefetchState.Running -> "Downloading model files. This is a one-time cost per device."
-                is SlmWarmup.PrefetchState.Initializing -> "Initializing/compiling model. UI may stutter briefly."
+            val hint = when {
+                prefetchState is SlmWarmup.PrefetchState.Running ->
+                    "Prefetching model file (IO only). This is a one-time cost per device."
+                compileState is SlmWarmup.CompileState.WaitingForPrefetch ->
+                    "Waiting for prefetch to complete before compilation."
+                compileState is SlmWarmup.CompileState.Compiling ->
+                    "Compiling/initializing the model. UI may stutter briefly."
+                compileState is SlmWarmup.CompileState.Idle ->
+                    "Starting compilation soon (after the first frame)."
                 else -> ""
             }
 
@@ -564,81 +559,205 @@ private fun buildLabelSafe(): String {
     }.getOrElse { "debug" }
 }
 
-private fun warmupLabelFor(state: SlmWarmup.PrefetchState): String {
+// ---------------------------------------------------------------------
+// Warmup UI Formatting (Home vs Gate)
+// ---------------------------------------------------------------------
+
+private data class WarmupUiFormat(
+    val idleLabel: String,
+    val prefetchRunningPrefix: String,
+    val compileWaitingPrefix: String,
+    val compileCompilingPrefix: String,
+    val showFileNameInCompileWaiting: Boolean,
+    val showFileNameInCompiling: Boolean,
+)
+
+private val WARMUP_UI_FORMAT_HOME = WarmupUiFormat(
+    idleLabel = "Idle",
+    prefetchRunningPrefix = "Running",
+    compileWaitingPrefix = "WaitingForPrefetch",
+    compileCompilingPrefix = "Compiling",
+    showFileNameInCompileWaiting = true,
+    showFileNameInCompiling = true,
+)
+
+private val WARMUP_UI_FORMAT_GATE = WarmupUiFormat(
+    idleLabel = "Preparing…",
+    prefetchRunningPrefix = "Prefetch",
+    compileWaitingPrefix = "Compile waiting…",
+    compileCompilingPrefix = "Compiling",
+    showFileNameInCompileWaiting = false,
+    showFileNameInCompiling = true,
+)
+
+// ---------------------------------------------------------------------
+// Label Builders (Split: LOG vs UI)
+// ---------------------------------------------------------------------
+
+private fun prefetchLabelForLog(state: SlmWarmup.PrefetchState): String {
     return when (state) {
         is SlmWarmup.PrefetchState.Idle -> "Idle"
-
         is SlmWarmup.PrefetchState.Running -> {
             val total = state.total
             if (total != null && total > 0L) {
                 val pct = ((state.downloaded.toDouble() / total.toDouble()) * 100.0)
                     .toInt()
                     .coerceIn(0, 100)
-                "Downloading ${pct}% (${state.downloaded}/${total}B) ${state.elapsedMs}ms"
+                "Running ${pct}% (${state.downloaded}/${total}B) ${state.elapsedMs}ms"
             } else {
-                "Downloading ${state.downloaded}B ${state.elapsedMs}ms"
+                "Running ${state.downloaded}B ${state.elapsedMs}ms"
             }
         }
-
-        is SlmWarmup.PrefetchState.Initializing -> {
-            "Initializing (${state.file.name}) ${state.elapsedMs}ms"
-        }
-
-        is SlmWarmup.PrefetchState.Initialized -> {
-            "Initialized (${state.file.name})"
-        }
-
-        is SlmWarmup.PrefetchState.Failed -> "Failed (${state.message})"
-        is SlmWarmup.PrefetchState.Cancelled -> "Cancelled"
+        is SlmWarmup.PrefetchState.Prefetched -> "Prefetched (${state.file.name}) ${state.elapsedMs}ms"
+        is SlmWarmup.PrefetchState.Failed -> "Failed (${state.message}) ${state.elapsedMs}ms"
+        is SlmWarmup.PrefetchState.Cancelled -> "Cancelled ${state.elapsedMs}ms"
         is SlmWarmup.PrefetchState.SkippedNotConfigured -> "Skipped(${state.reason})"
     }
 }
 
-private fun extractElapsedMs(state: SlmWarmup.PrefetchState): Long? {
+private fun compileLabelForLog(state: SlmWarmup.CompileState): String {
     return when (state) {
-        is SlmWarmup.PrefetchState.Running -> state.elapsedMs
-        is SlmWarmup.PrefetchState.Initializing -> state.elapsedMs
-        else -> null
+        is SlmWarmup.CompileState.Idle -> "Idle"
+        is SlmWarmup.CompileState.WaitingForPrefetch ->
+            "WaitingForPrefetch (${state.file.name}) ${state.elapsedMs}ms"
+        is SlmWarmup.CompileState.Compiling ->
+            "Compiling (${state.file.name}) ${state.elapsedMs}ms"
+        is SlmWarmup.CompileState.Compiled ->
+            "Compiled (${state.file.name}) ${state.elapsedMs}ms"
+        is SlmWarmup.CompileState.Failed -> "Failed (${state.message}) ${state.elapsedMs}ms"
+        is SlmWarmup.CompileState.Cancelled -> "Cancelled ${state.elapsedMs}ms"
+        is SlmWarmup.CompileState.SkippedNotConfigured -> "Skipped(${state.reason})"
     }
 }
 
-private fun warmupLabelForUi(
+private fun prefetchLabelForUi(
     state: SlmWarmup.PrefetchState,
-    elapsedMs: Long,
-    finalElapsedMs: Long?,
+    nowMs: Long,
+    format: WarmupUiFormat,
 ): String {
-    fun suffix(prefix: String): String {
-        val ms = finalElapsedMs ?: elapsedMs
-        return if (ms > 0L) " $prefix ${formatElapsed(ms)}" else ""
-    }
-
     return when (state) {
-        is SlmWarmup.PrefetchState.Idle -> "Idle"
-
         is SlmWarmup.PrefetchState.Running -> {
             val total = state.total
-            val elapsed = formatElapsed(elapsedMs)
+            val elapsed = formatElapsed(nowMs - state.startedAtMs)
+            val prefix = format.prefetchRunningPrefix
             if (total != null && total > 0L) {
                 val pct = ((state.downloaded.toDouble() / total.toDouble()) * 100.0)
                     .toInt()
                     .coerceIn(0, 100)
-                "Downloading ${pct}% (${state.downloaded}/${total}B) $elapsed"
+                "$prefix ${pct}% (${state.downloaded}/${total}B) $elapsed"
             } else {
-                "Downloading ${state.downloaded}B $elapsed"
+                "$prefix ${state.downloaded}B $elapsed"
             }
         }
+        is SlmWarmup.PrefetchState.Idle -> format.idleLabel
+        else -> prefetchLabelForLog(state)
+    }
+}
 
-        is SlmWarmup.PrefetchState.Initializing -> {
-            "Initializing (${state.file.name}) ${formatElapsed(elapsedMs)}"
+private fun compileLabelForUi(
+    state: SlmWarmup.CompileState,
+    nowMs: Long,
+    format: WarmupUiFormat,
+): String {
+    return when (state) {
+        is SlmWarmup.CompileState.WaitingForPrefetch -> {
+            val elapsed = formatElapsed(nowMs - state.requestedAtMs)
+            val prefix = format.compileWaitingPrefix
+            if (format.showFileNameInCompileWaiting) {
+                "$prefix (${state.file.name}) $elapsed"
+            } else {
+                "$prefix $elapsed"
+            }
         }
-
-        is SlmWarmup.PrefetchState.Initialized -> {
-            "Initialized (${state.file.name})${suffix("in")}"
+        is SlmWarmup.CompileState.Compiling -> {
+            val elapsed = formatElapsed(nowMs - state.startedAtMs)
+            val prefix = format.compileCompilingPrefix
+            if (format.showFileNameInCompiling) {
+                "$prefix (${state.file.name}) $elapsed"
+            } else {
+                "$prefix $elapsed"
+            }
         }
+        is SlmWarmup.CompileState.Idle -> format.idleLabel
+        else -> compileLabelForLog(state)
+    }
+}
 
-        is SlmWarmup.PrefetchState.Failed -> "Failed (${state.message})${suffix("after")}"
-        is SlmWarmup.PrefetchState.Cancelled -> "Cancelled${suffix("after")}"
-        is SlmWarmup.PrefetchState.SkippedNotConfigured -> "Skipped(${state.reason})"
+// ---------------------------------------------------------------------
+// Shared "Ticking" Composables
+// ---------------------------------------------------------------------
+
+@Composable
+private fun rememberWarmupUiNowMs(
+    inProgress: Boolean,
+    tickIntervalMs: Long,
+): Long {
+    var uiNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+
+    LaunchedEffect(inProgress, tickIntervalMs) {
+        if (!inProgress) return@LaunchedEffect
+        while (coroutineContext.isActive) {
+            uiNowMs = SystemClock.elapsedRealtime()
+            delay(tickIntervalMs)
+        }
+    }
+
+    return uiNowMs
+}
+
+@Composable
+private fun rememberWarmupUiLabels(
+    prefetchState: SlmWarmup.PrefetchState,
+    compileState: SlmWarmup.CompileState,
+    tickIntervalMs: Long,
+    format: WarmupUiFormat,
+): Pair<String, String> {
+    val prefetchInProgress = prefetchState is SlmWarmup.PrefetchState.Running
+    val compileInProgress =
+        compileState is SlmWarmup.CompileState.WaitingForPrefetch ||
+                compileState is SlmWarmup.CompileState.Compiling
+
+    val inProgress = prefetchInProgress || compileInProgress
+    val nowMs = rememberWarmupUiNowMs(inProgress = inProgress, tickIntervalMs = tickIntervalMs)
+
+    val prefetchLabel = remember(prefetchState, nowMs, format) {
+        prefetchLabelForUi(prefetchState, nowMs = nowMs, format = format)
+    }
+    val compileLabel = remember(compileState, nowMs, format) {
+        compileLabelForUi(compileState, nowMs = nowMs, format = format)
+    }
+
+    return prefetchLabel to compileLabel
+}
+
+@Composable
+private fun rememberWarmupPrimaryUiLabel(
+    prefetchState: SlmWarmup.PrefetchState,
+    compileState: SlmWarmup.CompileState,
+    tickIntervalMs: Long,
+    format: WarmupUiFormat,
+): String {
+    val prefetchInProgress = prefetchState is SlmWarmup.PrefetchState.Running
+    val compileInProgress =
+        compileState is SlmWarmup.CompileState.WaitingForPrefetch ||
+                compileState is SlmWarmup.CompileState.Compiling
+
+    val inProgress = prefetchInProgress || compileInProgress
+    val nowMs = rememberWarmupUiNowMs(inProgress = inProgress, tickIntervalMs = tickIntervalMs)
+
+    return remember(prefetchState, compileState, nowMs, format) {
+        when {
+            prefetchState is SlmWarmup.PrefetchState.Running ->
+                prefetchLabelForUi(prefetchState, nowMs = nowMs, format = format)
+
+            compileState is SlmWarmup.CompileState.WaitingForPrefetch ->
+                compileLabelForUi(compileState, nowMs = nowMs, format = format)
+
+            compileState is SlmWarmup.CompileState.Compiling ->
+                compileLabelForUi(compileState, nowMs = nowMs, format = format)
+
+            else -> format.idleLabel
+        }
     }
 }
 

@@ -1,25 +1,11 @@
 /*
  * =====================================================================
- *  IshizukiTech LLC — SLM Integration Framework
+ *  IshizukiTech LLC — Survey App (SLM Warmup)
  *  ---------------------------------------------------------------------
  *  File: SlmWarmup.kt
  *  Author: Shu Ishizuki
  *  License: MIT License
  *  © 2026 IshizukiTech LLC. All rights reserved.
- * =====================================================================
- *
- *  Summary:
- *  ---------------------------------------------------------------------
- *  App-startup warmup coordinator:
- *   1) Load SurveyConfig (assets)
- *   2) Download model file (HeavyInitializer)
- *   3) Initialize LiteRT-LM (LiteRtLM.initializeIfNeeded)
- *   4) Best-effort compile warmup (first inference) to avoid jank on first user submit
- *
- *  Goals:
- *  - Idempotent per process
- *  - Never block UI thread
- *  - Expose state/progress for UI/debug
  * =====================================================================
  */
 
@@ -28,16 +14,18 @@
 package com.negi.surveys.slm
 
 import android.content.Context
+import android.os.Process
 import android.os.SystemClock
-import com.negi.surveys.BuildConfig
+import com.google.ai.edge.litertlm.Message
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
-import com.negi.surveys.utils.HeavyInitializer
 import java.io.File
+import java.io.FileInputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
+import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -47,332 +35,782 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withTimeout
-
-private const val TAG = "SlmWarmup"
 
 /**
- * Timeout for the best-effort "compile warmup" inference.
+ * Process-scoped warmup orchestrator for on-device SLM.
  *
- * Rationale:
- * - The first inference on GPU often triggers expensive delegate compilation / shader build.
- * - If we do it here (startup), we avoid a big jank spike when the user presses Submit.
- */
-private const val COMPILE_WARMUP_TIMEOUT_MS = 120_000L
-
-/**
- * Extra run time after receiving the first non-empty delta.
+ * Split design:
+ * - Prefetch phase: IO-only page-cache warming (safe to start while Home/SurveyStart is visible).
+ * - Compile phase: heavy GPU/driver/delegate compilation (start right before Question screen uses the model).
  *
- * Rationale:
- * - Cancelling immediately on the first token can be too early for some GPU backends:
- *   compilation/initialization may still be in-flight.
- * - Letting it run a bit more improves the chance that the heavy path completes during warmup.
- */
-private const val COMPILE_WARMUP_EXTRA_RUN_AFTER_FIRST_DELTA_MS = 2_500L
-
-/**
- * Force-cancel guard in case we never see any delta (TTFT too slow or stalled).
+ * Goals:
+ * - Reduce startup jank by avoiding compile work at app launch.
+ * - Keep both phases idempotent per process, even under concurrent call races.
+ * - Provide separate state flows for UI gating and debug.
  *
- * This prevents warmup from hogging the engine forever on problematic devices.
+ * Important:
+ * - Prefetch is a best-effort optimization. Compile must NOT be blocked by prefetch.
+ * - If compile is requested while prefetch is still running, prefetch is cancelled to avoid IO contention.
  */
-private const val COMPILE_WARMUP_FORCE_CANCEL_MS = 25_000L
-
 object SlmWarmup {
 
-    /**
-     * Warmup state for UI/debug.
-     *
-     * NOTE:
-     * - `startedAtMs` is elapsedRealtime() base.
-     * - `elapsedMs` exists on the base sealed type so callers can always reference it.
-     */
-    sealed class PrefetchState(open val startedAtMs: Long? = null) {
-        val elapsedMs: Long
-            get() = startedAtMs?.let { now -> (SystemClock.elapsedRealtime() - now).coerceAtLeast(0L) } ?: 0L
+    // ---------------------------------------------------------------------
+    // Internal state flows
+    // ---------------------------------------------------------------------
 
-        data object Idle : PrefetchState()
+    private val _prefetchState = MutableStateFlow<PrefetchState>(PrefetchState.Idle)
+    private val _compileState = MutableStateFlow<CompileState>(CompileState.Idle)
+
+    // ---------------------------------------------------------------------
+    // Public states
+    // ---------------------------------------------------------------------
+
+    sealed interface PrefetchState {
+        val elapsedMs: Long
+
+        data object Idle : PrefetchState {
+            override val elapsedMs: Long = 0L
+        }
 
         data class Running(
+            val file: File,
+            val startedAtMs: Long,
             val downloaded: Long,
             val total: Long?,
-            override val startedAtMs: Long
-        ) : PrefetchState(startedAtMs)
+            override val elapsedMs: Long,
+        ) : PrefetchState
 
-        data class Initializing(
+        data class Prefetched(
             val file: File,
-            override val startedAtMs: Long
-        ) : PrefetchState(startedAtMs)
+            val sizeBytes: Long,
+            val startedAtMs: Long,
+            override val elapsedMs: Long,
+        ) : PrefetchState
 
-        data class Initialized(
-            val file: File
-        ) : PrefetchState()
+        data class Failed(
+            val message: String,
+            val startedAtMs: Long?,
+            override val elapsedMs: Long,
+        ) : PrefetchState
 
-        data class Failed(val message: String) : PrefetchState()
-        data object Cancelled : PrefetchState()
-        data class SkippedNotConfigured(val reason: String) : PrefetchState()
+        data class Cancelled(
+            val startedAtMs: Long?,
+            override val elapsedMs: Long,
+        ) : PrefetchState
+
+        data class SkippedNotConfigured(
+            val reason: String,
+            override val elapsedMs: Long = 0L,
+        ) : PrefetchState
     }
+
+    sealed interface CompileState {
+        val elapsedMs: Long
+
+        data object Idle : CompileState {
+            override val elapsedMs: Long = 0L
+        }
+
+        data class WaitingForPrefetch(
+            val file: File,
+            val requestedAtMs: Long,
+            override val elapsedMs: Long,
+        ) : CompileState
+
+        data class Compiling(
+            val file: File,
+            val startedAtMs: Long,
+            override val elapsedMs: Long,
+        ) : CompileState
+
+        data class Compiled(
+            val file: File,
+            val startedAtMs: Long,
+            override val elapsedMs: Long,
+        ) : CompileState
+
+        data class Failed(
+            val message: String,
+            val startedAtMs: Long?,
+            override val elapsedMs: Long,
+        ) : CompileState
+
+        data class Cancelled(
+            val startedAtMs: Long?,
+            override val elapsedMs: Long,
+        ) : CompileState
+
+        data class SkippedNotConfigured(
+            val reason: String,
+            override val elapsedMs: Long = 0L,
+        ) : CompileState
+    }
+
+    val state: StateFlow<PrefetchState> get() = prefetchState
+    val prefetchState: StateFlow<PrefetchState> = _prefetchState.asStateFlow()
+    val compileState: StateFlow<CompileState> = _compileState.asStateFlow()
+
+    // ---------------------------------------------------------------------
+    // Warmup conversation options
+    // ---------------------------------------------------------------------
+
+    private val warmupSupportImage = AtomicBoolean(false)
+    private val warmupSupportAudio = AtomicBoolean(false)
+    private val warmupSystemMessageRef = AtomicReference<Message?>(null)
+    private val warmupToolsRef = AtomicReference<List<Any>>(emptyList())
+
+    /**
+     * Configure conversation options used during compile warmup.
+     */
+    fun setWarmupConversationOptions(
+        supportImage: Boolean = false,
+        supportAudio: Boolean = false,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+    ) {
+        warmupSupportImage.set(supportImage)
+        warmupSupportAudio.set(supportAudio)
+        warmupSystemMessageRef.set(systemMessage)
+        warmupToolsRef.set(tools.toList())
+        debugLog(
+            "warmupOptions: image=$supportImage audio=$supportAudio " +
+                    "system=${systemMessage != null} tools=${tools.size}"
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // Internals / guards
+    // ---------------------------------------------------------------------
+
+    private const val TAG = "SlmWarmup"
+
+    private const val CONFIG_ASSET_NAME = "survey.yaml"
+    private const val FALLBACK_MODEL_NAME = "Gemma3n4B"
+    private val FALLBACK_ACCEL = Accelerator.GPU
+    private const val FALLBACK_MAX_TOKENS = 4096
+    private const val FALLBACK_TOPK = 40
+    private const val FALLBACK_TOPP = 0.9
+    private const val FALLBACK_TEMPERATURE = 0.7
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
-    private val started = AtomicBoolean(false)
 
-    private val _state = MutableStateFlow<PrefetchState>(PrefetchState.Idle)
-    val state: StateFlow<PrefetchState> = _state.asStateFlow()
+    private val prefetchJobRef = AtomicReference<Job?>(null)
+    private val compileJobRef = AtomicReference<Job?>(null)
+    private val eglThreadRef = AtomicReference<EglPbufferThread?>(null)
 
-    private val modelRef = AtomicReference<Model?>(null)
-    private val modelFileRef = AtomicReference<File?>(null)
+    private val compileAfterPrefetchRequested = AtomicBoolean(false)
+    private val compileAfterPrefetchJobRef = AtomicReference<Job?>(null)
 
-    private const val DEFAULT_CONFIG_ASSET = "survey.yaml"
+    private val cachedConfigRef = AtomicReference<com.negi.surveys.config.SurveyConfig?>(null)
 
-    /**
-     * Start warmup once per process.
-     *
-     * This will:
-     * - Load SurveyConfig from assets
-     * - Download the model file if needed
-     * - Initialize LiteRT-LM
-     * - Trigger a tiny first inference (best-effort) to pre-compile GPU delegate
-     */
-    fun startWarmupIfConfigured(
-        context: Context,
-        configAssetName: String = DEFAULT_CONFIG_ASSET,
-        forceFresh: Boolean = false,
-    ) {
-        if (!started.compareAndSet(false, true)) return
+    private val prefetchRequested = AtomicBoolean(false)
+    private val compileRequested = AtomicBoolean(false)
 
-        val app = context.applicationContext
+    private val prefetchRunIdGen = AtomicLong(0L)
+    private val compileRunIdGen = AtomicLong(0L)
 
-        scope.launch {
+    private val activePrefetchRunId = AtomicLong(0L)
+
+    private data class PrefetchCancelRequest(
+        val runId: Long,
+        val reason: String,
+        val requestedAtMs: Long,
+    )
+
+    private val prefetchCancelRequestRef = AtomicReference<PrefetchCancelRequest?>(null)
+
+    // ---------------------------------------------------------------------
+    // Public API
+    // ---------------------------------------------------------------------
+
+    fun startPrefetchIfConfigured(appContext: Context) {
+        val file = resolveModelFileOrNull(appContext)
+        if (file == null) {
+            _prefetchState.value = PrefetchState.SkippedNotConfigured("model file not found")
+            debugLog("prefetch: skipped (no model file) pid=${Process.myPid()}")
+            return
+        }
+
+        when (_prefetchState.value) {
+            is PrefetchState.Prefetched,
+            is PrefetchState.Failed,
+            is PrefetchState.Cancelled,
+            is PrefetchState.SkippedNotConfigured -> return
+            else -> Unit
+        }
+
+        if (!prefetchRequested.compareAndSet(false, true)) {
+            debugLog("prefetch: ignored (already requested) pid=${Process.myPid()}")
+            return
+        }
+
+        val existing = prefetchJobRef.get()
+        if (existing != null && existing.isActive) {
+            debugLog("prefetch: ignored (job already active) pid=${Process.myPid()}")
+            return
+        }
+
+        val runId = prefetchRunIdGen.incrementAndGet()
+        activePrefetchRunId.set(runId)
+        prefetchCancelRequestRef.set(null)
+
+        val job = scope.launch(Dispatchers.IO) {
             try {
-                // Step 0: Load config (best-effort).
-                val cfg = runCatching {
-                    SurveyConfigLoader.fromAssetsValidated(app, configAssetName)
-                }.getOrElse { t ->
-                    val msg = "config load failed: ${t.message ?: t::class.java.simpleName}"
-                    AppLog.w(TAG, "Prefetch skipped: $msg", t)
-                    _state.value = PrefetchState.SkippedNotConfigured(msg)
-                    return@launch
-                }
-
-                val url = cfg.modelDefaults.defaultModelUrl?.trim().orEmpty()
-                val fileName = cfg.modelDefaults.defaultFileName?.trim().orEmpty()
-
-                if (url.isBlank() || fileName.isBlank()) {
-                    val msg = "model_defaults not set (default_model_url/default_file_name missing)"
-                    AppLog.w(TAG, "Prefetch skipped: $msg")
-                    _state.value = PrefetchState.SkippedNotConfigured(msg)
-                    return@launch
-                }
-
-                val token = readOptionalBuildConfigString("HF_TOKEN")?.takeIf { it.isNotBlank() }
-
-                // Step 1: Download/ensure file exists.
-                val downloadStart = SystemClock.elapsedRealtime()
-                _state.value = PrefetchState.Running(downloaded = 0L, total = null, startedAtMs = downloadStart)
-
-                val result = HeavyInitializer.ensureInitialized(
-                    context = app,
-                    modelUrl = url,
-                    hfToken = token,
-                    fileName = fileName,
-                    timeoutMs = cfg.modelDefaults.timeoutMs ?: (10 * 60_000L),
-                    forceFresh = forceFresh,
-                    onProgress = { downloaded, total ->
-                        _state.value = PrefetchState.Running(
-                            downloaded = downloaded,
-                            total = total,
-                            startedAtMs = downloadStart
-                        )
-                    }
-                )
-
-                val modelFile = result.getOrElse { t ->
-                    val msg = "download failed: ${t.message ?: t::class.java.simpleName}"
-                    AppLog.w(TAG, msg, t)
-                    _state.value = PrefetchState.Failed(msg)
-                    return@launch
-                }
-
-                modelFileRef.set(modelFile)
-                AppLog.i(TAG, "Prefetch completed: path='${modelFile.absolutePath}' size=${modelFile.length()}")
-
-                // Step 2: Initialize LiteRT-LM AFTER download completion.
-                val initStart = SystemClock.elapsedRealtime()
-                _state.value = PrefetchState.Initializing(file = modelFile, startedAtMs = initStart)
-
-                val modelName = cfg.modelDefaults.modelName?.takeIf { it.isNotBlank() }
-                    ?: modelFile.nameWithoutExtension.ifBlank { "SLM" }
-
-                val configMap = buildModelConfig(cfg.slm)
-
-                val model = Model(
-                    name = modelName,
-                    taskPath = modelFile.absolutePath,
-                    config = configMap
-                )
-                modelRef.set(model)
-
-                // Keep init off the UI thread.
-                // `initializeIfNeeded` is suspend and already guarded internally.
-                LiteRtLM.initializeIfNeeded(
-                    context = app,
-                    model = model,
-                    supportImage = false,
-                    supportAudio = false,
-                    systemMessage = null,
-                    tools = emptyList(),
-                )
-
-                // Step 3: Best-effort compile warmup.
-                // Non-fatal. If it fails, we still consider the engine initialized.
-                runCatching {
-                    compileWarmupInference(model)
-                }.onFailure { t ->
-                    val msg = t.message ?: t::class.java.simpleName
-                    AppLog.w(TAG, "compile warmup skipped/failed (non-fatal): $msg", t)
-                }
-
-                _state.value = PrefetchState.Initialized(file = modelFile)
-                AppLog.i(TAG, "LiteRT-LM warmup completed: model='${model.name}' file='${modelFile.name}'")
-
+                runPrefetch(file, runId = runId)
             } catch (ce: CancellationException) {
-                AppLog.w(TAG, "Warmup cancelled", ce)
-                _state.value = PrefetchState.Cancelled
+                // runPrefetch() already updates state on cancel; keep this as a safety net.
+                val now = SystemClock.elapsedRealtime()
+                val startedAt = startedAtForPrefetch(_prefetchState.value)
+                _prefetchState.value = PrefetchState.Cancelled(
+                    startedAtMs = startedAt,
+                    elapsedMs = elapsedSince(startedAt, now)
+                )
+                debugLog("prefetch: cancelled pid=${Process.myPid()} runId=$runId")
+                throw ce
             } catch (t: Throwable) {
-                val msg = t.message ?: t::class.java.simpleName
-                AppLog.w(TAG, "Warmup crashed: $msg", t)
-                _state.value = PrefetchState.Failed(msg)
+                val now = SystemClock.elapsedRealtime()
+                val startedAt = startedAtForPrefetch(_prefetchState.value)
+                _prefetchState.value = PrefetchState.Failed(
+                    message = "${t.javaClass.simpleName}(${t.message})",
+                    startedAtMs = startedAt,
+                    elapsedMs = elapsedSince(startedAt, now)
+                )
+                debugLog(
+                    "prefetch: failed pid=${Process.myPid()} runId=$runId " +
+                            "err=${t.javaClass.simpleName}(${t.message})"
+                )
             }
         }
+
+        prefetchJobRef.set(job)
+        debugLog(
+            "prefetch: started pid=${Process.myPid()} runId=$runId file='${file.name}' size=${file.length()}"
+        )
+    }
+
+    fun startCompileIfConfigured(appContext: Context) {
+        val file = resolveModelFileOrNull(appContext)
+        if (file == null) {
+            _compileState.value = CompileState.SkippedNotConfigured("model file not found")
+            debugLog("compile: skipped (no model file) pid=${Process.myPid()}")
+            return
+        }
+
+        when (_compileState.value) {
+            is CompileState.Compiled,
+            is CompileState.Failed,
+            is CompileState.Cancelled,
+            is CompileState.SkippedNotConfigured -> return
+            else -> Unit
+        }
+
+        if (!compileRequested.compareAndSet(false, true)) {
+            debugLog("compile: ignored (already requested) pid=${Process.myPid()}")
+            return
+        }
+
+        val existing = compileJobRef.get()
+        if (existing != null && existing.isActive) {
+            debugLog("compile: ignored (job already active) pid=${Process.myPid()}")
+            return
+        }
+
+        val runId = compileRunIdGen.incrementAndGet()
+
+        val job = scope.launch(Dispatchers.Default) {
+            try {
+                try {
+                    Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND)
+                } catch (_: Throwable) {
+                    // Best effort.
+                }
+
+                // Kick prefetch if it hasn't started yet (best-effort).
+                startPrefetchIfConfigured(appContext)
+
+                // Compile must not wait for prefetch.
+                runCompile(file, appContext, runId = runId)
+            } catch (ce: CancellationException) {
+                val now = SystemClock.elapsedRealtime()
+                val startedAt = startedAtForCompile(_compileState.value)
+                _compileState.value = CompileState.Cancelled(
+                    startedAtMs = startedAt,
+                    elapsedMs = elapsedSince(startedAt, now)
+                )
+                debugLog("compile: cancelled pid=${Process.myPid()} runId=$runId")
+                throw ce
+            } catch (t: Throwable) {
+                val now = SystemClock.elapsedRealtime()
+                val startedAt = startedAtForCompile(_compileState.value)
+                _compileState.value = CompileState.Failed(
+                    message = "${t.javaClass.simpleName}(${t.message})",
+                    startedAtMs = startedAt,
+                    elapsedMs = elapsedSince(startedAt, now)
+                )
+                debugLog(
+                    "compile: failed pid=${Process.myPid()} runId=$runId " +
+                            "err=${t.javaClass.simpleName}(${t.message})"
+                )
+            }
+        }
+
+        compileJobRef.set(job)
+        debugLog("compile: started pid=${Process.myPid()} runId=$runId file='${file.name}'")
+    }
+
+    fun startWarmupIfConfigured(appContext: Context) {
+        startPrefetchIfConfigured(appContext)
+        startCompileIfConfigured(appContext)
     }
 
     /**
-     * Wait until warmup reaches Initialized, then return the Model.
+     * Requests compile warmup to start right after prefetch reaches a terminal state.
      *
-     * Use this in repositories/services that must not run until the engine is ready.
+     * Design intent:
+     * - On the Home screen, we can prefetch early (IO-only).
+     * - As soon as prefetch finishes, we begin compile while the user is still on Home,
+     *   reducing the chance of jank during the Question flow.
+     *
+     * Notes:
+     * - This is idempotent per process.
+     * - If prefetch is already terminal, compile is requested immediately.
      */
-    suspend fun awaitInitializedModel(
-        context: Context,
-        timeoutMs: Long = 120_000L,
-        configAssetName: String = DEFAULT_CONFIG_ASSET,
-    ): Model {
-        startWarmupIfConfigured(context, configAssetName = configAssetName)
+    fun requestCompileAfterPrefetch(
+        appContext: Context,
+        reason: String = "autoAfterPrefetch",
+    ) {
+        if (!compileAfterPrefetchRequested.compareAndSet(false, true)) {
+            debugLog("autoCompileAfterPrefetch: ignored (already requested) reason='$reason'")
+            return
+        }
 
-        val ready = withTimeout(timeoutMs.coerceAtLeast(1L)) {
-            state.first {
-                it is PrefetchState.Initialized ||
-                        it is PrefetchState.Failed ||
-                        it is PrefetchState.Cancelled ||
-                        it is PrefetchState.SkippedNotConfigured
+        debugLog("autoCompileAfterPrefetch: requested reason='$reason'")
+
+        // Ensure prefetch is at least requested.
+        startPrefetchIfConfigured(appContext)
+
+        // If prefetch already finished (or cannot run), request compile right away.
+        val current = _prefetchState.value
+        if (isPrefetchTerminal(current)) {
+            scope.launch(Dispatchers.Default) {
+                delay(AUTO_COMPILE_DELAY_MS)
+                startCompileIfConfigured(appContext)
+                debugLog("autoCompileAfterPrefetch: triggered (prefetch already terminal) reason='$reason'")
+            }
+            return
+        }
+
+        val job = scope.launch(Dispatchers.Default) {
+            runCatching {
+                prefetchState.first { isPrefetchTerminal(it) }
+                delay(AUTO_COMPILE_DELAY_MS)
+                startCompileIfConfigured(appContext)
+                debugLog("autoCompileAfterPrefetch: triggered reason='$reason'")
+            }.onFailure { t ->
+                debugLog(
+                    "autoCompileAfterPrefetch: watcher failed reason='$reason' " +
+                            "err=${t.javaClass.simpleName}(${t.message})"
+                )
             }
         }
 
-        when (ready) {
-            is PrefetchState.Initialized -> {
-                return modelRef.get()
-                    ?: throw IllegalStateException("Warmup state is Initialized but modelRef is null (bug).")
-            }
-            is PrefetchState.Failed -> throw IllegalStateException("Warmup failed: ${ready.message}")
-            is PrefetchState.Cancelled -> throw CancellationException("Warmup cancelled")
-            is PrefetchState.SkippedNotConfigured -> throw IllegalStateException("Warmup skipped: ${ready.reason}")
-            else -> throw IllegalStateException("Unexpected warmup terminal state: ${ready::class.java.simpleName}")
-        }
+        compileAfterPrefetchJobRef.getAndSet(job)?.cancel()
     }
 
-    fun getInitializedModelOrNull(): Model? = modelRef.get()
-    fun getModelFileOrNull(): File? = modelFileRef.get()
+    fun cancelAll(reason: String = "cancelAll") {
+        debugLog("cancelAll: reason='$reason' pid=${Process.myPid()}")
 
-    private fun readOptionalBuildConfigString(fieldName: String): String? {
-        return runCatching {
-            val cls = BuildConfig::class.java
-            val f = cls.getDeclaredField(fieldName)
-            f.isAccessible = true
-            f.get(null) as? String
+        compileAfterPrefetchJobRef.getAndSet(null)?.cancel()
+        compileAfterPrefetchRequested.set(false)
+
+        prefetchCancelRequestRef.set(
+            PrefetchCancelRequest(
+                runId = activePrefetchRunId.get(),
+                reason = "cancelAll:$reason",
+                requestedAtMs = SystemClock.elapsedRealtime()
+            )
+        )
+        prefetchJobRef.getAndSet(null)?.cancel()
+        compileJobRef.getAndSet(null)?.cancel()
+
+        val now = SystemClock.elapsedRealtime()
+
+        val ps = _prefetchState.value
+        val prefetchTerminal =
+            ps is PrefetchState.Prefetched ||
+                    ps is PrefetchState.Failed ||
+                    ps is PrefetchState.Cancelled ||
+                    ps is PrefetchState.SkippedNotConfigured
+
+        if (!prefetchTerminal && (prefetchRequested.get() || ps is PrefetchState.Running || ps is PrefetchState.Idle)) {
+            val startedAt = startedAtForPrefetch(ps)
+            _prefetchState.value = PrefetchState.Cancelled(
+                startedAtMs = startedAt,
+                elapsedMs = elapsedSince(startedAt, now)
+            )
+        }
+
+        val cs = _compileState.value
+        val compileTerminal =
+            cs is CompileState.Compiled ||
+                    cs is CompileState.Failed ||
+                    cs is CompileState.Cancelled ||
+                    cs is CompileState.SkippedNotConfigured
+
+        if (!compileTerminal && (compileRequested.get() || cs is CompileState.Compiling || cs is CompileState.Idle)) {
+            val startedAt = startedAtForCompile(cs)
+            _compileState.value = CompileState.Cancelled(
+                startedAtMs = startedAt,
+                elapsedMs = elapsedSince(startedAt, now)
+            )
+        }
+
+        closeEglThread(reason = "cancelAll:$reason")
+    }
+
+    fun resetForRetry(reason: String = "resetForRetry") {
+        cancelAll(reason = "resetForRetry:$reason")
+
+        compileAfterPrefetchJobRef.getAndSet(null)?.cancel()
+        compileAfterPrefetchRequested.set(false)
+
+        prefetchRequested.set(false)
+        compileRequested.set(false)
+
+        prefetchRunIdGen.set(0L)
+        compileRunIdGen.set(0L)
+        activePrefetchRunId.set(0L)
+
+        cachedConfigRef.set(null)
+        prefetchCancelRequestRef.set(null)
+
+        _prefetchState.value = PrefetchState.Idle
+        _compileState.value = CompileState.Idle
+
+        debugLog("resetForRetry: done reason='$reason' pid=${Process.myPid()}")
+    }
+
+    // ---------------------------------------------------------------------
+    // Prefetch / Compile implementations
+    // ---------------------------------------------------------------------
+
+    private fun getConfigBestEffort(appContext: Context): com.negi.surveys.config.SurveyConfig? {
+        val existing = cachedConfigRef.get()
+        if (existing != null) return existing
+
+        val loaded = runCatching {
+            SurveyConfigLoader.fromAssetsValidated(appContext.applicationContext, CONFIG_ASSET_NAME)
         }.getOrNull()
+
+        if (loaded != null) cachedConfigRef.compareAndSet(null, loaded)
+        return cachedConfigRef.get()
+    }
+
+    private fun buildWarmupModel(appContext: Context, file: File): Model {
+        val cfg = getConfigBestEffort(appContext)
+
+        val modelName = cfg?.modelDefaults?.modelName
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: FALLBACK_MODEL_NAME
+
+        val accel = cfg?.slm?.accelerator
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: FALLBACK_ACCEL.label
+
+        val maxTokens = cfg?.slm?.maxTokens ?: FALLBACK_MAX_TOKENS
+        val topK = cfg?.slm?.topK ?: FALLBACK_TOPK
+        val topP = (cfg?.slm?.topP ?: FALLBACK_TOPP).toFloat()
+        val temp = (cfg?.slm?.temperature ?: FALLBACK_TEMPERATURE).toFloat()
+
+        val config: Map<ConfigKey, Any> = mapOf(
+            ConfigKey.ACCELERATOR to accel,
+            ConfigKey.MAX_TOKENS to maxTokens,
+            ConfigKey.TOP_K to topK,
+            ConfigKey.TOP_P to topP,
+            ConfigKey.TEMPERATURE to temp
+        )
+
+        return Model(
+            name = modelName,
+            taskPath = file.absolutePath,
+            config = config
+        )
     }
 
     /**
-     * Trigger the "first decode" path to pre-compile GPU delegate/shaders.
+     * Prefetch implementation: sequentially read the model file to warm OS page cache.
      *
-     * Implementation details:
-     * - Runs a tiny inference.
-     * - Instead of cancelling immediately on the first token, let it run briefly,
-     *   then cancel to finish heavy initialization on more devices.
-     * - Always resets the conversation afterwards to avoid polluting user context.
+     * Cancellation:
+     * - If this coroutine is cancelled (e.g., compile requested), it must NOT report Prefetched.
+     * - State/logging must reflect the actual bytes read.
      */
-    private suspend fun compileWarmupInference(model: Model) {
-        val startMs = SystemClock.elapsedRealtime()
-        AppLog.i(TAG, "compile warmup: begin model='${model.name}'")
+    private suspend fun runPrefetch(file: File, runId: Long) {
+        val startedAtMs = SystemClock.elapsedRealtime()
+        val total = file.length().takeIf { it > 0L }
 
-        val done = CompletableDeferred<Unit>()
-        val cancelIssued = AtomicBoolean(false)
-        val firstDeltaSeen = AtomicBoolean(false)
+        _prefetchState.value = PrefetchState.Running(
+            file = file,
+            startedAtMs = startedAtMs,
+            downloaded = 0L,
+            total = total,
+            elapsedMs = 0L
+        )
 
-        var delayedCancelJob: Job? = null
-        var forceCancelJob: Job? = null
+        val buf = ByteArray(PREFETCH_BUF_SIZE)
+        var readTotal = 0L
+        var lastEmitAt = startedAtMs
 
-        try {
-            // Safety: if TTFT is too slow (or stalled), force-cancel.
-            forceCancelJob = scope.launch {
-                delay(COMPILE_WARMUP_FORCE_CANCEL_MS)
-                if (cancelIssued.compareAndSet(false, true)) {
-                    AppLog.w(TAG, "compile warmup: force cancel after ${COMPILE_WARMUP_FORCE_CANCEL_MS}ms")
-                    LiteRtLM.cancel(model)
+        FileInputStream(file).use { fis ->
+            while (coroutineContext.isActive) {
+                val n = fis.read(buf)
+                if (n <= 0) break
+                readTotal += n.toLong()
+
+                val now = SystemClock.elapsedRealtime()
+                if (now - lastEmitAt >= PREFETCH_EMIT_INTERVAL_MS) {
+                    _prefetchState.value = PrefetchState.Running(
+                        file = file,
+                        startedAtMs = startedAtMs,
+                        downloaded = readTotal,
+                        total = total,
+                        elapsedMs = now - startedAtMs
+                    )
+                    lastEmitAt = now
                 }
             }
+        }
 
-            LiteRtLM.runInference(
-                model = model,
-                input = "Warmup.",
-                resultListener = { delta, isDone ->
-                    if (delta.isNotEmpty() && firstDeltaSeen.compareAndSet(false, true)) {
-                        AppLog.d(TAG, "compile warmup: first delta received")
+        val end = SystemClock.elapsedRealtime()
 
-                        // Let it run a bit longer to increase the chance that GPU compilation completes.
-                        delayedCancelJob = scope.launch {
-                            delay(COMPILE_WARMUP_EXTRA_RUN_AFTER_FIRST_DELTA_MS)
-                            if (cancelIssued.compareAndSet(false, true)) {
-                                AppLog.d(TAG, "compile warmup: delayed cancel after first delta")
-                                LiteRtLM.cancel(model)
-                            }
-                        }
-                    }
+        if (!coroutineContext.isActive) {
+            val req = prefetchCancelRequestRef.get()
+            val reason = if (req != null && req.runId == runId) req.reason else "unknown"
 
-                    if (isDone && !done.isCompleted) {
-                        done.complete(Unit)
-                    }
-                },
-                cleanUpListener = {
-                    if (!done.isCompleted) done.complete(Unit)
-                },
-                onError = {
-                    if (!done.isCompleted) done.complete(Unit)
-                },
-                images = emptyList(),
-                audioClips = emptyList(),
-                notifyCancelToOnError = false
+            _prefetchState.value = PrefetchState.Cancelled(
+                startedAtMs = startedAtMs,
+                elapsedMs = end - startedAtMs
             )
 
-            withTimeout(COMPILE_WARMUP_TIMEOUT_MS) {
-                done.await()
+            if (req != null && req.runId == runId) {
+                prefetchCancelRequestRef.compareAndSet(req, null)
             }
+
+            debugLog(
+                "prefetch: cancelled(pid=${Process.myPid()} runId=$runId) " +
+                        "reason='$reason' readBytes=$readTotal total=${total ?: -1} elapsedMs=${end - startedAtMs}"
+            )
+            return
+        }
+
+        _prefetchState.value = PrefetchState.Prefetched(
+            file = file,
+            sizeBytes = readTotal,
+            startedAtMs = startedAtMs,
+            elapsedMs = end - startedAtMs
+        )
+
+        debugLog(
+            "prefetch: completed pid=${Process.myPid()} runId=$runId file='${file.name}' " +
+                    "readBytes=$readTotal total=${total ?: -1} elapsedMs=${end - startedAtMs}"
+        )
+    }
+
+    /**
+     * Cancel prefetch if it is running, to avoid IO contention with compile.
+     *
+     * Important:
+     * - Do NOT update state/log here. Let runPrefetch() be the single source of truth.
+     */
+    private fun cancelPrefetchIfRunning(reason: String) {
+        val st = _prefetchState.value
+        if (st !is PrefetchState.Running) return
+
+        val runId = activePrefetchRunId.get()
+        prefetchCancelRequestRef.set(
+            PrefetchCancelRequest(
+                runId = runId,
+                reason = reason,
+                requestedAtMs = SystemClock.elapsedRealtime()
+            )
+        )
+
+        prefetchJobRef.getAndSet(null)?.cancel()
+    }
+
+    private suspend fun runCompile(file: File, appContext: Context, runId: Long) {
+        cancelPrefetchIfRunning(reason = "compile-start")
+
+        val startedAtMs = SystemClock.elapsedRealtime()
+        _compileState.value = CompileState.Compiling(
+            file = file,
+            startedAtMs = startedAtMs,
+            elapsedMs = 0L
+        )
+        debugLog("compile: begin pid=${Process.myPid()} runId=$runId file='${file.name}'")
+
+        val ticker = scope.launch(Dispatchers.Default) {
+            while (isActive) {
+                delay(COMPILE_EMIT_INTERVAL_MS)
+                val now = SystemClock.elapsedRealtime()
+                val st = _compileState.value
+                if (st is CompileState.Compiling && st.startedAtMs == startedAtMs) {
+                    _compileState.value = st.copy(elapsedMs = now - startedAtMs)
+                } else {
+                    break
+                }
+            }
+        }
+
+        try {
+            val model = buildWarmupModel(appContext, file)
+            runCompileViaEglIfPossible(appContext = appContext, model = model, runId = runId)
+
+            val end = SystemClock.elapsedRealtime()
+            _compileState.value = CompileState.Compiled(
+                file = file,
+                startedAtMs = startedAtMs,
+                elapsedMs = end - startedAtMs
+            )
+            debugLog(
+                "compile: end pid=${Process.myPid()} runId=$runId elapsedMs=${end - startedAtMs} file='${file.name}'"
+            )
         } finally {
-            runCatching { delayedCancelJob?.cancel() }
-            runCatching { forceCancelJob?.cancel() }
-
-            // Ensure the next real request starts clean.
-            runCatching {
-                LiteRtLM.resetConversation(
-                    model = model,
-                    supportImage = false,
-                    supportAudio = false,
-                    systemMessage = null,
-                    tools = emptyList()
-                )
-            }
-
-            val elapsed = (SystemClock.elapsedRealtime() - startMs).coerceAtLeast(0L)
-            AppLog.i(TAG, "compile warmup: end elapsedMs=$elapsed firstDeltaSeen=${firstDeltaSeen.get()} cancelIssued=${cancelIssued.get()}")
+            runCatching { ticker.cancel() }
+            closeEglThread(reason = "compileDone")
         }
     }
+
+    private suspend fun runCompileViaEglIfPossible(
+        appContext: Context,
+        model: Model,
+        runId: Long,
+    ) {
+        val thread = eglThreadRef.get() ?: run {
+            val created = runCatching { EglPbufferThread(threadName = "SlmWarmupEgl") }.getOrNull()
+            if (created != null && eglThreadRef.compareAndSet(null, created)) {
+                created
+            } else {
+                eglThreadRef.get()
+            }
+        }
+
+        LiteRtLM.setApplicationContext(appContext.applicationContext)
+
+        val supportImage = warmupSupportImage.get()
+        val supportAudio = warmupSupportAudio.get()
+        val systemMessage = warmupSystemMessageRef.get()
+        val tools = warmupToolsRef.get()
+
+        debugLog(
+            "compile: init options pid=${Process.myPid()} runId=$runId " +
+                    "image=$supportImage audio=$supportAudio system=${systemMessage != null} tools=${tools.size}"
+        )
+
+        if (thread == null) {
+            debugLog(
+                "compile: egl thread unavailable; running initializeIfNeeded directly " +
+                        "pid=${Process.myPid()} runId=$runId"
+            )
+            LiteRtLM.initializeIfNeeded(
+                context = appContext.applicationContext,
+                model = model,
+                supportImage = supportImage,
+                supportAudio = supportAudio,
+                systemMessage = systemMessage,
+                tools = tools
+            )
+            return
+        }
+
+        try {
+            debugLog("compile: entering egl context pid=${Process.myPid()} runId=$runId")
+            thread.withEglContext {
+                LiteRtLM.initializeIfNeeded(
+                    context = appContext.applicationContext,
+                    model = model,
+                    supportImage = supportImage,
+                    supportAudio = supportAudio,
+                    systemMessage = systemMessage,
+                    tools = tools
+                )
+            }
+        } catch (t: Throwable) {
+            debugLog(
+                "compile: egl warmup failed; retrying direct pid=${Process.myPid()} runId=$runId " +
+                        "err=${t.javaClass.simpleName}(${t.message})"
+            )
+            LiteRtLM.initializeIfNeeded(
+                context = appContext.applicationContext,
+                model = model,
+                supportImage = supportImage,
+                supportAudio = supportAudio,
+                systemMessage = systemMessage,
+                tools = tools
+            )
+        }
+    }
+
+    private fun resolveModelFileOrNull(appContext: Context): File? {
+        val dir = appContext.filesDir ?: return null
+        val files = runCatching { dir.listFiles() }.getOrNull() ?: return null
+        val candidates = files.filter { it.isFile && it.name.endsWith(".litertlm", ignoreCase = true) }
+        if (candidates.isEmpty()) return null
+        return candidates.maxByOrNull { it.length() }
+    }
+
+    private fun closeEglThread(reason: String) {
+        val thread = eglThreadRef.getAndSet(null) ?: return
+        runCatching { thread.close() }
+            .onFailure { t ->
+                AppLog.w(TAG, "eglThread close failed: reason='$reason' err=${t.message}", t)
+            }
+        debugLog("eglThread closed: reason='$reason'")
+    }
+
+    private fun startedAtForPrefetch(state: PrefetchState): Long? {
+        return when (state) {
+            is PrefetchState.Running -> state.startedAtMs
+            is PrefetchState.Prefetched -> state.startedAtMs
+            is PrefetchState.Failed -> state.startedAtMs
+            is PrefetchState.Cancelled -> state.startedAtMs
+            else -> null
+        }
+    }
+
+    private fun isPrefetchTerminal(state: PrefetchState): Boolean {
+        return when (state) {
+            is PrefetchState.Prefetched,
+            is PrefetchState.Failed,
+            is PrefetchState.Cancelled,
+            is PrefetchState.SkippedNotConfigured -> true
+            else -> false
+        }
+    }
+
+    private fun startedAtForCompile(state: CompileState): Long? {
+        return when (state) {
+            is CompileState.Compiling -> state.startedAtMs
+            is CompileState.Compiled -> state.startedAtMs
+            is CompileState.Failed -> state.startedAtMs
+            is CompileState.Cancelled -> state.startedAtMs
+            else -> null
+        }
+    }
+
+    private fun elapsedSince(startedAtMs: Long?, nowMs: Long): Long {
+        return if (startedAtMs == null) 0L else (nowMs - startedAtMs).coerceAtLeast(0L)
+    }
+
+    private fun debugLog(msg: String) {
+        AppLog.d(TAG, msg)
+    }
+
+    private const val PREFETCH_BUF_SIZE = 4 * 1024 * 1024
+    private const val PREFETCH_EMIT_INTERVAL_MS = 250L
+    private const val COMPILE_EMIT_INTERVAL_MS = 250L
+    private const val AUTO_COMPILE_DELAY_MS = 120L
 }
