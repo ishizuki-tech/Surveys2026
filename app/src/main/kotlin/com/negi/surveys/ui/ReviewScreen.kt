@@ -13,7 +13,6 @@
 
 package com.negi.surveys.ui
 
-import android.util.Log
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -57,6 +56,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.negi.surveys.BuildConfig
+import com.negi.surveys.logging.AppLog
 import java.nio.charset.StandardCharsets
 import java.security.MessageDigest
 import kotlinx.coroutines.Dispatchers
@@ -103,9 +103,9 @@ fun ReviewScreen(
         }
 
         if (dupes.isNotEmpty()) {
-            Log.e(TAG, "Timeline LazyColumn keys DUPLICATED. count=${dupes.size} sample=${dupes.take(5)}")
+            AppLog.e(TAG, "Timeline LazyColumn keys DUPLICATED. count=${dupes.size} sample=${dupes.take(5)}")
         } else {
-            Log.d(TAG, "Timeline LazyColumn keys OK. size=${resolvedTimeline.size}")
+            AppLog.d(TAG, "Timeline LazyColumn keys OK. size=${resolvedTimeline.size}")
         }
     }
 
@@ -120,12 +120,12 @@ fun ReviewScreen(
 
     LaunchedEffect(metrics.questionCount, metrics.totalLines, metrics.totalChars, metrics.sha256) {
         if (metrics.sha256 != SHA_COMPUTING) {
-            Log.d(
+            AppLog.d(
                 TAG,
                 "ReviewScreen: q=${metrics.questionCount} lines=${metrics.totalLines} chars=${metrics.totalChars} sha256=${metrics.sha256}"
             )
         } else {
-            Log.d(
+            AppLog.d(
                 TAG,
                 "ReviewScreen: q=${metrics.questionCount} lines=${metrics.totalLines} chars=${metrics.totalChars} sha256=(computing)"
             )
@@ -153,7 +153,7 @@ fun ReviewScreen(
             if (toRemove.isNotEmpty()) {
                 val before = rawExpanded.size
                 for (k in toRemove) rawExpanded.remove(k)
-                Log.d(TAG, "rawExpanded pruned. before=$before after=${rawExpanded.size} removed=${toRemove.size}")
+                AppLog.d(TAG, "rawExpanded pruned. before=$before after=${rawExpanded.size} removed=${toRemove.size}")
             }
         }
     }
@@ -266,7 +266,7 @@ fun ReviewScreen(
         ) {
             OutlinedButton(
                 onClick = {
-                    Log.d(TAG, "ReviewScreen: back clicked")
+                    AppLog.d(TAG, "ReviewScreen: back clicked")
                     onBack()
                 },
                 modifier = Modifier.weight(1f)
@@ -274,7 +274,7 @@ fun ReviewScreen(
 
             OutlinedButton(
                 onClick = {
-                    Log.d(TAG, "ReviewScreen: upload logs clicked")
+                    AppLog.d(TAG, "ReviewScreen: upload logs clicked")
                     onUploadLogs?.invoke()
                 },
                 enabled = onUploadLogs != null,
@@ -283,7 +283,7 @@ fun ReviewScreen(
 
             Button(
                 onClick = {
-                    Log.d(TAG, "ReviewScreen: export clicked")
+                    AppLog.d(TAG, "ReviewScreen: export clicked")
                     onExport()
                 },
                 modifier = Modifier.weight(1f)
@@ -335,7 +335,7 @@ private fun DebugCrashCard(
  * - The goal is to test crash capture + pending upload flow on next launch.
  */
 private fun triggerTestCrash(reason: String): Nothing {
-    Log.e(TAG, "TEST_CRASH triggered: $reason")
+    AppLog.e(TAG, "TEST_CRASH triggered: $reason")
     throw RuntimeException("TEST_CRASH: $reason")
 }
 

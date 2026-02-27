@@ -13,7 +13,6 @@ package com.negi.surveys
 
 import android.os.Build
 import android.os.SystemClock
-import android.util.Log
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
@@ -108,9 +107,6 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     }
 
     BackHandler(enabled = canPop) {
-        if (BuildConfig.DEBUG) {
-            Log.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
-        }
         AppLog.d(TAG, "BackHandler: pop requested. stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
         nav.pop()
     }
@@ -128,7 +124,6 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
     val streamBridge: ChatStreamBridge = remember {
         ChatStreamBridge(
             logger = { msg ->
-                if (BuildConfig.DEBUG) Log.d("StreamBridge", msg)
                 AppLog.d("StreamBridge", msg)
             }
         )
@@ -173,45 +168,34 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
         },
         delayMsAfterFirstFrame = 150L,
         onRequested = {
-            if (BuildConfig.DEBUG) {
-                Log.d(TAG, "SLM Warmup requested (prefetch -> compile) (startup)")
-                AppLog.d(TAG, "SLM Warmup requested (prefetch -> compile) (startup)")
-            }
+            AppLog.d(TAG, "SLM Warmup requested (prefetch -> compile) (startup)")
         }
     )
 
-    // NOTE:
-    // - Keep logs based on state-only labels (no UI ticking).
-    // - Do NOT log UI labels to avoid spam.
-    if (BuildConfig.DEBUG) {
-        LaunchedEffect(prefetchLogLabel) {
-            Log.d(TAG, "SLM Prefetch: $prefetchLogLabel")
-            AppLog.d(TAG, "SLM Prefetch: $prefetchLogLabel")
-        }
-        LaunchedEffect(compileLogLabel) {
-            Log.d(TAG, "SLM Compile: $compileLogLabel")
-            AppLog.d(TAG, "SLM Compile: $compileLogLabel")
-        }
+    LaunchedEffect(prefetchLogLabel) {
+        AppLog.d(TAG, "SLM Prefetch: $prefetchLogLabel")
     }
 
-    if (BuildConfig.DEBUG) {
-        LaunchedEffect(
-            currentKey,
-            canPop,
-            logs.size,
-            exportText.length,
-            streamStats.activeSessionId,
-            streamStats.droppedEvents,
-            prefetchLogLabel,
-            compileLogLabel
-        ) {
-            Log.d(
-                TAG,
-                "NavState: size=${backStack.size} canPop=$canPop current=${currentKey.javaClass.simpleName} " +
-                        "logs=${logs.size} exportLen=${exportText.length} streamActive=${streamStats.activeSessionId} " +
-                        "dropped=${streamStats.droppedEvents} prefetch=$prefetchLogLabel compile=$compileLogLabel"
-            )
-        }
+    LaunchedEffect(compileLogLabel) {
+        AppLog.d(TAG, "SLM Compile: $compileLogLabel")
+    }
+
+    LaunchedEffect(
+        currentKey,
+        canPop,
+        logs.size,
+        exportText.length,
+        streamStats.activeSessionId,
+        streamStats.droppedEvents,
+        prefetchLogLabel,
+        compileLogLabel
+    ) {
+        AppLog.d(
+            TAG,
+            "NavState: size=${backStack.size} canPop=$canPop current=${currentKey.javaClass.simpleName} " +
+                    "logs=${logs.size} exportLen=${exportText.length} streamActive=${streamStats.activeSessionId} " +
+                    "dropped=${streamStats.droppedEvents} prefetch=$prefetchLogLabel compile=$compileLogLabel"
+        )
     }
 
     val buildLabel = remember { buildLabelSafe() }
@@ -274,7 +258,6 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
 
                 val summary = "gh=" + (gh ?: "fail")
                 AppLog.i(TAG, "manual upload: $summary")
-                if (BuildConfig.DEBUG) Log.d(TAG, "manual upload: $summary")
 
                 withContext(Dispatchers.Main) {
                     uploadStatus = summary
@@ -309,10 +292,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                     warmupKey = "SurveyStart",
                     delayMsAfterFirstFrame = 250L,
                     onRequested = {
-                        if (BuildConfig.DEBUG) {
-                            Log.d(TAG, "SLM Compile requested (surveyStart)")
-                            AppLog.d(TAG, "SLM Compile requested (surveyStart)")
-                        }
+                        AppLog.d(TAG, "SLM Compile requested (surveyStart)")
                     },
                     compileWarmup = { SlmWarmup.startCompileIfConfigured(appContext) }
                 )
@@ -331,10 +311,7 @@ fun SurveyAppRoot(modifier: Modifier = Modifier) {
                     warmupKey = key.id,
                     delayMsAfterFirstFrame = 150L,
                     onRequested = {
-                        if (BuildConfig.DEBUG) {
-                            Log.d(TAG, "SLM Compile requested (question=${key.id})")
-                            AppLog.d(TAG, "SLM Compile requested (question=${key.id})")
-                        }
+                        AppLog.d(TAG, "SLM Compile requested (question=${key.id})")
                     },
                     compileWarmup = { SlmWarmup.startCompileIfConfigured(appContext) }
                 )

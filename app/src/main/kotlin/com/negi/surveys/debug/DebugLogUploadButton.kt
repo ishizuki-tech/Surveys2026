@@ -13,7 +13,6 @@
 
 package com.negi.surveys.debug
 
-import android.util.Log
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.height
@@ -28,6 +27,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.negi.surveys.logging.AppLog
 import kotlinx.coroutines.launch
 
 /**
@@ -57,7 +57,7 @@ fun DebugLogUploadButton() {
                     val result = runCatching {
                         DebugLogUploader.collectAndUpload(context)
                     }.getOrElse { e ->
-                        Log.e("DebugLogUploadButton", "collectAndUpload failed: ${e.message}", e)
+                        AppLog.e("DebugLogUploadButton", "collectAndUpload failed: ${e.message}", e)
                         DebugLogUploader.UploadResult(
                             ok = false,
                             destination = "error",

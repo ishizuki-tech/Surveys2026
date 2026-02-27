@@ -13,7 +13,6 @@
 
 package com.negi.surveys.ui
 
-import android.util.Log
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -99,29 +98,23 @@ fun SurveyStartScreen(
         delayMsAfterFirstFrame = COMPILE_REQUEST_DELAY_MS,
         onRequested = {
             AppLog.d(TAG, "compile warmup requested")
-            if (BuildConfig.DEBUG) Log.d(TAG, "compile warmup requested")
         }
     )
 
     fun proceedBegin(source: String) {
         beginLocked = true
         AppLog.i(TAG, "begin proceed: source=$source state=${compileState.javaClass.simpleName}")
-        if (BuildConfig.DEBUG) Log.d(TAG, "begin proceed: source=$source state=${compileState.javaClass.simpleName}")
 
         runCatching { latestOnBegin() }
             .onFailure { t ->
                 // If begin throws synchronously, unlock immediately to avoid trapping the UI.
                 beginLocked = false
                 AppLog.w(TAG, "begin callback failed (unlocked): ${t.javaClass.simpleName}")
-                if (BuildConfig.DEBUG) Log.w(TAG, "begin callback failed (unlocked)", t)
             }
     }
 
-    if (BuildConfig.DEBUG) {
-        LaunchedEffect(Unit) {
-            AppLog.d(TAG, "composed")
-            Log.d(TAG, "composed")
-        }
+    LaunchedEffect(Unit) {
+        AppLog.d(TAG, "composed")
     }
 
     // If the user requested Begin early, proceed automatically once warmup is ready.
@@ -146,7 +139,6 @@ fun SurveyStartScreen(
         if (beginLocked) {
             beginLocked = false
             AppLog.w(TAG, "begin auto-unlocked after timeout")
-            if (BuildConfig.DEBUG) Log.d(TAG, "begin auto-unlocked after timeout")
         }
     }
 
@@ -181,7 +173,6 @@ fun SurveyStartScreen(
                 compileState = compileState,
                 onRetry = {
                     AppLog.w(TAG, "warmup retry requested")
-                    if (BuildConfig.DEBUG) Log.d(TAG, "warmup retry requested")
                     SlmWarmup.resetForRetry(reason = "uiRetry")
                     SlmWarmup.startCompileIfConfigured(appContext)
                 }
@@ -200,15 +191,12 @@ fun SurveyStartScreen(
                         // Cancel "pending begin" and return.
                         beginPendingWarmup = false
                         AppLog.d(TAG, "begin pending cancelled by back")
-                        if (BuildConfig.DEBUG) Log.d(TAG, "begin pending cancelled by back")
                     }
 
                     AppLog.d(TAG, "click: back")
-                    if (BuildConfig.DEBUG) Log.d(TAG, "click: back")
                     runCatching { latestOnBack() }
                         .onFailure { t ->
                             AppLog.w(TAG, "back callback failed (non-fatal): ${t.javaClass.simpleName}")
-                            if (BuildConfig.DEBUG) Log.w(TAG, "back callback failed (non-fatal)", t)
                         }
                 },
                 enabled = !beginLocked,
@@ -223,18 +211,15 @@ fun SurveyStartScreen(
                 onClick = {
                     if (beginLocked) {
                         AppLog.w(TAG, "begin ignored (locked)")
-                        if (BuildConfig.DEBUG) Log.d(TAG, "begin ignored (locked)")
                         return@Button
                     }
                     if (beginPendingWarmup) {
                         AppLog.w(TAG, "begin ignored (pendingWarmup)")
-                        if (BuildConfig.DEBUG) Log.d(TAG, "begin ignored (pendingWarmup)")
                         return@Button
                     }
 
                     if (isWarmupReady(compileState)) {
                         AppLog.i(TAG, "click: begin")
-                        if (BuildConfig.DEBUG) Log.d(TAG, "click: begin")
                         proceedBegin(source = "immediate")
                         return@Button
                     }
@@ -242,7 +227,6 @@ fun SurveyStartScreen(
                     // Not ready yet: request warmup (idempotent) and wait on this screen.
                     beginPendingWarmup = true
                     AppLog.i(TAG, "click: begin (waiting for warmup)")
-                    if (BuildConfig.DEBUG) Log.d(TAG, "click: begin (waiting for warmup)")
                     SlmWarmup.startCompileIfConfigured(appContext)
                 },
                 enabled = !beginLocked && !beginPendingWarmup,

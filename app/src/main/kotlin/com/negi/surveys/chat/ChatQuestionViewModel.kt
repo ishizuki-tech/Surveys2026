@@ -13,16 +13,16 @@
 
 package com.negi.surveys.chat
 
-import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.negi.surveys.logging.AppLog
 import java.security.MessageDigest
+import java.util.Collections
 import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
@@ -32,9 +32,11 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
-import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+
+import com.negi.surveys.logging.AppLog
 
 /**
  * ViewModel that drives a chat-style Q/A with validation + multi follow-up support,
@@ -48,7 +50,7 @@ import kotlinx.coroutines.launch
  * Robustness policy:
  * - Show TTFT by creating a placeholder MODEL bubble immediately on submit.
  * - Adopt the placeholder once a real stream session id appears (Begin/Delta).
- * - Close the "stream window" after validation completes to ignore late Begin/Delta events.
+ * - Close the "stream window" after validation completes to ignore late Begin/Delta.
  * - Gate late validator returns via attempt id to prevent transcript corruption after cancel.
  * - Synchronize mutable state snapshots for draft persistence (avoid ConcurrentModificationException).
  */
@@ -66,7 +68,105 @@ class ChatQuestionViewModel(
 
     private val qid: String = questionId.trim()
 
-    private val _messages = MutableStateFlow<List<ChatMessage>>(emptyList())
+    // ---------------------------------------------------------------------
+    // Message storage (avoid O(N) list rebuild on streaming deltas)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Backing store for chat messages.
+     *
+     * Why:
+     * - Streaming emits frequent tail updates.
+     * - Rebuilding a new List on every delta is O(N) and gets expensive as history grows.
+     *
+     * Threading:
+     * - All mutations are performed on Main (see startStreamCollector()).
+     * - The emitted list is a lightweight wrapper that changes identity via a version bump.
+     */
+    private val messagesBacking: ArrayList<ChatMessage> = ArrayList(128)
+    private val messageIndexById: HashMap<String, Int> = HashMap(128)
+    private var messagesVersion: Long = 0L
+
+    private class VersionedChatMessageList(
+        private val version: Long,
+        private val delegate: List<ChatMessage>
+    ) : List<ChatMessage> by delegate {
+        override fun equals(other: Any?): Boolean {
+            return other is VersionedChatMessageList && version == other.version
+        }
+
+        override fun hashCode(): Int = version.hashCode()
+    }
+
+    private fun rebuildMessageIndex() {
+        messageIndexById.clear()
+        for (i in messagesBacking.indices) {
+            messageIndexById[messagesBacking[i].id] = i
+        }
+    }
+
+    private fun emitMessages(reason: String) {
+        // Avoid noisy logs here; this runs frequently during streaming.
+        messagesVersion += 1
+        val view: List<ChatMessage> = Collections.unmodifiableList(messagesBacking)
+        _messages.value = VersionedChatMessageList(version = messagesVersion, delegate = view)
+    }
+
+    private fun setMessagesInternal(list: List<ChatMessage>, reason: String) {
+        messagesBacking.clear()
+        messagesBacking.addAll(list)
+        rebuildMessageIndex()
+        emitMessages(reason)
+    }
+
+    private fun appendMessageInternal(msg: ChatMessage, reason: String) {
+        messageIndexById[msg.id] = messagesBacking.size
+        messagesBacking.add(msg)
+        emitMessages(reason)
+    }
+
+    private fun removeMessageInternal(id: String, reason: String) {
+        val idx = messageIndexById[id] ?: -1
+        if (idx < 0) return
+
+        if (idx == messagesBacking.lastIndex) {
+            messagesBacking.removeAt(idx)
+            messageIndexById.remove(id)
+            emitMessages(reason)
+            return
+        }
+
+        messagesBacking.removeAt(idx)
+        rebuildMessageIndex()
+        emitMessages(reason)
+    }
+
+    private fun updateMessageInternal(id: String, transform: (ChatMessage) -> ChatMessage, reason: String) {
+        if (messagesBacking.isEmpty()) return
+
+        // Fast path: streaming updates almost always target the tail message.
+        val tailIndex = messagesBacking.lastIndex
+        val idx = if (messagesBacking[tailIndex].id == id) {
+            tailIndex
+        } else {
+            messageIndexById[id] ?: -1
+        }
+        if (idx < 0) return
+
+        val old = messagesBacking[idx]
+        val updated = transform(old)
+        if (updated == old) return
+
+        messagesBacking[idx] = updated
+        emitMessages(reason)
+    }
+
+    private fun containsMessageInternal(id: String): Boolean {
+        return messageIndexById.containsKey(id)
+    }
+
+    private val _messages =
+        MutableStateFlow<List<ChatMessage>>(VersionedChatMessageList(version = 0L, delegate = emptyList()))
     val messages: StateFlow<List<ChatMessage>> = _messages.asStateFlow()
 
     private val _input = MutableStateFlow("")
@@ -143,7 +243,6 @@ class ChatQuestionViewModel(
         restoreOrSeed()
         startStreamCollector()
         AppLog.d(TAG, "init qid=$qid draftKey=$draftKey stage=${withStateLock { stage }}")
-        Log.d(TAG, "VM init qid=$qid draftKey=$draftKey stage=${withStateLock { stage }}")
     }
 
     override fun onCleared() {
@@ -209,7 +308,6 @@ class ChatQuestionViewModel(
      */
     fun cancelValidation(reason: String) {
         AppLog.d(TAG, "cancelValidation qid=$qid reason=$reason")
-        Log.d(TAG, "cancelValidation qid=$qid reason=$reason")
 
         // Invalidate current attempt so late validator returns can't mutate state.
         activeAttemptId = attemptCounter.incrementAndGet()
@@ -403,13 +501,11 @@ class ChatQuestionViewModel(
     private fun openStreamWindow(reason: String) {
         streamWindowOpen = true
         AppLog.d(TAG, "stream window OPEN reason=$reason")
-        Log.d(TAG, "Stream window OPEN reason=$reason")
     }
 
     private fun closeStreamWindow(reason: String) {
         streamWindowOpen = false
         AppLog.d(TAG, "stream window CLOSED reason=$reason")
-        Log.d(TAG, "Stream window CLOSED reason=$reason")
     }
 
     /**
@@ -455,7 +551,7 @@ class ChatQuestionViewModel(
             text = "Validating…"
         )
 
-        _messages.update { it + bubble }
+        appendMessageInternal(bubble, "stream.placeholder:$reason")
         safePersistDraft("stream.placeholder:$reason")
     }
 
@@ -523,7 +619,7 @@ class ChatQuestionViewModel(
             id = UUID.randomUUID().toString(),
             text = text
         )
-        _messages.update { it + msg }
+        appendMessageInternal(msg, "appendUser")
         safePersistDraft("appendUser")
     }
 
@@ -534,7 +630,7 @@ class ChatQuestionViewModel(
             followUpQuestion = null,
             textFallback = text
         )
-        _messages.update { it + msg }
+        appendMessageInternal(msg, "appendAssistantText")
         safePersistDraft("appendAssistantText")
     }
 
@@ -578,7 +674,7 @@ class ChatQuestionViewModel(
             )
         }
 
-        _messages.update { it + msg }
+        appendMessageInternal(msg, "appendAssistantOutcome")
         lastOutcomeAssistantMsgId = id
 
         if (pending != null) {
@@ -589,17 +685,15 @@ class ChatQuestionViewModel(
     }
 
     private fun removeMessage(id: String) {
-        _messages.update { it.filterNot { m -> m.id == id } }
+        removeMessageInternal(id, "removeMessage")
     }
 
     private fun updateMessage(id: String, transform: (ChatMessage) -> ChatMessage) {
-        _messages.update { list ->
-            list.map { m -> if (m.id == id) transform(m) else m }
-        }
+        updateMessageInternal(id, transform, "updateMessage")
     }
 
     private fun containsMessage(id: String): Boolean {
-        return _messages.value.any { it.id == id }
+        return containsMessageInternal(id)
     }
 
     // ---------------------------------------------------------------------
@@ -640,7 +734,6 @@ class ChatQuestionViewModel(
         pendingModelOutput = null
         pendingModelState = ChatStreamState.NONE
         AppLog.d(TAG, "pending model embed cleared reason=$reason")
-        Log.d(TAG, "Pending model embed cleared. reason=$reason")
     }
 
     // ---------------------------------------------------------------------
@@ -648,7 +741,7 @@ class ChatQuestionViewModel(
     // ---------------------------------------------------------------------
 
     private fun startStreamCollector() {
-        viewModelScope.launch {
+        viewModelScope.launch(context = Dispatchers.Default) {
             var localActiveSession = 0L
             var localStreamMsgId: String? = null
             val buf = StringBuilder()
@@ -664,7 +757,7 @@ class ChatQuestionViewModel(
                 lastRenderedLen = 0
             }
 
-            fun adoptOrCreateModelBubble(sessionId: Long) {
+            suspend fun adoptOrCreateModelBubble(sessionId: Long) {
                 if (localActiveSession == sessionId && localStreamMsgId != null) return
 
                 localActiveSession = sessionId
@@ -672,38 +765,40 @@ class ChatQuestionViewModel(
                 lastUiUpdateNs = 0L
                 lastRenderedLen = 0
 
-                lastOutcomeAssistantMsgId = null
-                clearPendingModelEmbed("beginSession")
+                withContext(Dispatchers.Main.immediate) {
+                    lastOutcomeAssistantMsgId = null
+                    clearPendingModelEmbed("beginSession")
 
-                val existingId = activeStreamMsgId?.takeIf { containsMessage(it) }
-                val id = existingId ?: UUID.randomUUID().toString()
-                localStreamMsgId = id
+                    val existingId = activeStreamMsgId?.takeIf { containsMessage(it) }
+                    val id = existingId ?: UUID.randomUUID().toString()
+                    localStreamMsgId = id
 
-                activeStreamSessionId = sessionId
-                activeStreamMsgId = id
+                    activeStreamSessionId = sessionId
+                    activeStreamMsgId = id
 
-                if (existingId != null) {
-                    updateMessage(existingId) { m ->
-                        m.copy(
-                            role = ChatRole.MODEL,
-                            text = if (m.text.isBlank()) "Validating…" else m.text,
-                            streamText = m.streamText ?: "",
-                            streamState = ChatStreamState.STREAMING,
-                            streamCollapsed = false,
-                            streamSessionId = sessionId
+                    if (existingId != null) {
+                        updateMessage(existingId) { m ->
+                            m.copy(
+                                role = ChatRole.MODEL,
+                                text = if (m.text.isBlank()) "Validating…" else m.text,
+                                streamText = m.streamText ?: "",
+                                streamState = ChatStreamState.STREAMING,
+                                streamCollapsed = false,
+                                streamSessionId = sessionId
+                            )
+                        }
+                    } else {
+                        val bubble = ChatMessage.modelStreaming(id, streamSessionId = sessionId).copy(
+                            text = "Validating…"
                         )
+                        appendMessageInternal(bubble, "stream.begin")
                     }
-                } else {
-                    val bubble = ChatMessage.modelStreaming(id, streamSessionId = sessionId).copy(
-                        text = "Validating…"
-                    )
-                    _messages.update { it + bubble }
-                }
 
-                safePersistDraft("stream.begin")
+                    safePersistDraft("stream.begin")
+                }
             }
 
-            fun maybeUpdateUi(force: Boolean = false) {
+            suspend fun maybeUpdateUi(force: Boolean = false) {
                 val id = localStreamMsgId ?: return
                 val now = System.nanoTime()
                 val deltaChars = buf.length - lastRenderedLen
@@ -717,50 +812,49 @@ class ChatQuestionViewModel(
 
                 val rendered = buf.toString()
 
-                updateMessage(id) { m ->
-                    m.copy(
-                        role = ChatRole.MODEL,
-                        text = rendered.ifBlank { "Validating…" },
-                        streamText = rendered,
-                        streamState = ChatStreamState.STREAMING,
-                        streamCollapsed = false,
-                        streamSessionId = localActiveSession
-                    )
+                withContext(Dispatchers.Main.immediate) {
+                    updateMessage(id) { m ->
+                        m.copy(
+                            role = ChatRole.MODEL,
+                            text = rendered.ifBlank { "Validating…" },
+                            streamText = rendered,
+                            streamState = ChatStreamState.STREAMING,
+                            streamCollapsed = false,
+                            streamSessionId = localActiveSession
+                        )
+                    }
                 }
 
                 lastUiUpdateNs = now
                 lastRenderedLen = buf.length
             }
 
-            fun finalizeAndRemoveModelBubble(state: ChatStreamState, errorMessage: String? = null) {
+            suspend fun finalizeAndRemoveModelBubble(state: ChatStreamState, errorMessage: String? = null) {
                 val id = localStreamMsgId ?: return
                 val raw = buf.toString().ifBlank { errorMessage.orEmpty() }
 
-                removeMessage(id)
+                withContext(Dispatchers.Main.immediate) {
+                    removeMessage(id)
 
-                attachOrPendModelOutput(
-                    sessionId = localActiveSession,
-                    output = raw,
-                    state = state
-                )
+                    attachOrPendModelOutput(
+                        sessionId = localActiveSession,
+                        output = raw,
+                        state = state
+                    )
+                }
             }
 
             try {
                 streamBridge.events.collect { ev ->
                     when (ev) {
                         is ChatStreamEvent.Begin -> {
-                            if (!streamWindowOpen && localActiveSession == 0L) {
-                                return@collect
-                            }
+                            if (!streamWindowOpen && localActiveSession == 0L) return@collect
 
                             val cancelledId = lastCancelledStreamSessionId
-                            if (cancelledId > 0L && ev.sessionId == cancelledId) {
-                                return@collect
-                            }
+                            if (cancelledId > 0L && ev.sessionId == cancelledId) return@collect
 
                             if (localActiveSession != 0L && ev.sessionId != localActiveSession) {
                                 AppLog.d(TAG, "stream Begin ignored (overlap) local=$localActiveSession new=${ev.sessionId}")
-                                Log.d(TAG, "Stream Begin ignored (overlap). local=$localActiveSession new=${ev.sessionId}")
                                 return@collect
                             }
 
@@ -769,14 +863,10 @@ class ChatQuestionViewModel(
 
                         is ChatStreamEvent.Delta -> {
                             if (ev.text.isEmpty()) return@collect
-                            if (!streamWindowOpen && localActiveSession == 0L) {
-                                return@collect
-                            }
+                            if (!streamWindowOpen && localActiveSession == 0L) return@collect
 
                             val cancelledId = lastCancelledStreamSessionId
-                            if (cancelledId > 0L && ev.sessionId == cancelledId) {
-                                return@collect
-                            }
+                            if (cancelledId > 0L && ev.sessionId == cancelledId) return@collect
 
                             val sessionMismatch = ev.sessionId != localActiveSession || localStreamMsgId == null
                             if (sessionMismatch) {
@@ -806,16 +896,18 @@ class ChatQuestionViewModel(
 
                             val cancelledId = lastCancelledStreamSessionId
                             if (cancelledId > 0L && ev.sessionId == cancelledId) {
-                                suppressNextCancelledError.set(false)
+                                withContext(Dispatchers.Main.immediate) {
+                                    suppressNextCancelledError.set(false)
 
-                                localStreamMsgId?.let { removeMessage(it) }
-                                clearPendingModelEmbed("stream.end_ignored_cancelled")
-                                resetLocalStreamState()
-                                activeStreamSessionId = 0L
-                                activeStreamMsgId = null
-                                lastCancelledStreamSessionId = 0L
-                                closeStreamWindow("stream.end_ignored_cancelled")
-                                safePersistDraft("stream.end_ignored_cancelled")
+                                    localStreamMsgId?.let { removeMessage(it) }
+                                    clearPendingModelEmbed("stream.end_ignored_cancelled")
+                                    resetLocalStreamState()
+                                    activeStreamSessionId = 0L
+                                    activeStreamMsgId = null
+                                    lastCancelledStreamSessionId = 0L
+                                    closeStreamWindow("stream.end_ignored_cancelled")
+                                    safePersistDraft("stream.end_ignored_cancelled")
+                                }
                                 return@collect
                             }
 
@@ -823,10 +915,12 @@ class ChatQuestionViewModel(
                             finalizeAndRemoveModelBubble(state = ChatStreamState.ENDED)
 
                             resetLocalStreamState()
-                            activeStreamSessionId = 0L
-                            activeStreamMsgId = null
-                            closeStreamWindow("stream.end")
-                            safePersistDraft("stream.end")
+                            withContext(Dispatchers.Main.immediate) {
+                                activeStreamSessionId = 0L
+                                activeStreamMsgId = null
+                                closeStreamWindow("stream.end")
+                                safePersistDraft("stream.end")
+                            }
                         }
 
                         is ChatStreamEvent.Error -> {
@@ -843,13 +937,15 @@ class ChatQuestionViewModel(
                             val isCancelledSession = cancelledId > 0L && ev.sessionId == cancelledId
 
                             if (suppressedCancel || isCancelledSession || isReplaced) {
-                                localStreamMsgId?.let { removeMessage(it) }
-                                clearPendingModelEmbed("stream.error_suppressed")
+                                withContext(Dispatchers.Main.immediate) {
+                                    localStreamMsgId?.let { removeMessage(it) }
+                                    clearPendingModelEmbed("stream.error_suppressed")
 
-                                if (isCancelledSession) {
-                                    lastCancelledStreamSessionId = 0L
+                                    if (isCancelledSession) {
+                                        lastCancelledStreamSessionId = 0L
+                                    }
+                                    suppressNextCancelledError.set(false)
                                 }
-                                suppressNextCancelledError.set(false)
                             } else {
                                 maybeUpdateUi(force = true)
                                 finalizeAndRemoveModelBubble(
@@ -859,17 +955,18 @@ class ChatQuestionViewModel(
                             }
 
                             resetLocalStreamState()
-                            activeStreamSessionId = 0L
-                            activeStreamMsgId = null
-                            closeStreamWindow("stream.error")
-                            safePersistDraft("stream.error")
+                            withContext(Dispatchers.Main.immediate) {
+                                activeStreamSessionId = 0L
+                                activeStreamMsgId = null
+                                closeStreamWindow("stream.error")
+                                safePersistDraft("stream.error")
+                            }
                         }
                     }
                 }
             } catch (t: CancellationException) {
                 throw t
             } catch (t: Throwable) {
-                Log.w(TAG, "Stream collector crashed (non-fatal). ${t.javaClass.simpleName}", t)
                 AppLog.w(TAG, "stream collector crashed (non-fatal) err=${t.javaClass.simpleName}")
             }
         }
@@ -907,7 +1004,7 @@ class ChatQuestionViewModel(
                 currentFollowUpQuestion = draft.currentFollowUpQuestion
             }
 
-            _messages.value = sanitized
+            setMessagesInternal(sanitized, "restoreOrSeed")
             _completionPayload.value = draft.completionPayload
             _input.value = draft.inputDraft
             _isBusy.value = false
@@ -919,7 +1016,6 @@ class ChatQuestionViewModel(
             closeStreamWindow("restoreOrSeed")
 
             AppLog.i(TAG, "draft restored qid=$qid stage=${withStateLock { stage }} msgs=${sanitized.size}")
-            Log.d(TAG, "Draft restored. qid=$qid stage=${withStateLock { stage }} msgs=${sanitized.size}")
 
             if (sanitized.size != draft.messages.size) {
                 safePersistDraft("restore.sanitized")
@@ -934,7 +1030,7 @@ class ChatQuestionViewModel(
             textFallback = "Question: $qid\n$prompt"
         )
 
-        _messages.value = listOf(seeded)
+        setMessagesInternal(listOf(seeded), "seed")
 
         withStateLock {
             stage = ChatStage.AWAIT_MAIN
@@ -993,10 +1089,12 @@ class ChatQuestionViewModel(
     }
 
     private fun persistDraft() {
+        // Persist an immutable snapshot to avoid leaking the live backing list into storage.
+        val messagesSnapshot = messagesBacking.toList()
         val snapshot = synchronized(stateLock) {
             ChatDraft(
                 stage = stage,
-                messages = _messages.value,
+                messages = messagesSnapshot,
                 mainAnswer = mainAnswer,
                 followUps = followUps.toList(),
                 currentFollowUpQuestion = currentFollowUpQuestion,
@@ -1010,7 +1108,6 @@ class ChatQuestionViewModel(
     private fun safePersistDraft(reason: String) {
         runCatching { persistDraft() }
             .onFailure { t ->
-                Log.w(TAG, "persistDraft failed (non-fatal). reason=$reason err=${t.javaClass.simpleName}", t)
                 AppLog.w(TAG, "persistDraft failed (non-fatal) reason=$reason err=${t.javaClass.simpleName}")
             }
     }
@@ -1031,14 +1128,12 @@ class ChatQuestionViewModel(
         val t = text.trim()
         val sha8 = sha256Hex(t).take(8)
         AppLog.d(TAG, "answer[$label] q=$qid len=${t.length} sha8=$sha8")
-        Log.d(TAG, "answer[$label] q=$qid len=${t.length} sha8=$sha8")
     }
 
     private fun logFollowUpPayloadDigest(turns: Int, payload: String) {
         val t = payload.trim()
         val sha8 = sha256Hex(t).take(8)
         AppLog.d(TAG, "followUpPayload q=$qid turns=$turns len=${t.length} sha8=$sha8")
-        Log.d(TAG, "followUpPayload q=$qid turns=$turns len=${t.length} sha8=$sha8")
     }
 
     private fun sha256Hex(text: String): String {

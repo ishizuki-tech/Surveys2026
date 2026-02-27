@@ -18,7 +18,6 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -59,7 +58,6 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         val startup = buildStartupLog(savedInstanceState)
-        if (BuildConfig.DEBUG) Log.d(TAG, startup)
         AppLog.i(TAG, startup)
 
         setContent {
@@ -105,14 +103,14 @@ private object AppBootstrap {
             AppLog.init(appCtx)
         }.onFailure { t ->
             // Fall back to Logcat only; do not crash.
-            Log.w(BOOT_TAG, "AppLog.init failed (non-fatal): ${t.javaClass.simpleName}", t)
+            AppLog.w(BOOT_TAG, "AppLog.init failed (non-fatal): ${t.javaClass.simpleName}", t)
         }
 
         // Install crash capture as early as possible (still best-effort).
         runCatching {
             CrashCapture.install(appCtx)
         }.onFailure { t ->
-            Log.w(BOOT_TAG, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}", t)
+            AppLog.w(BOOT_TAG, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}", t)
             // If AppLog is partially available, record it too.
             runCatching { AppLog.w(BOOT_TAG, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}") }
         }
@@ -122,7 +120,6 @@ private object AppBootstrap {
 
         val dt = SystemClock.elapsedRealtime() - t0
         runCatching { AppLog.i(BOOT_TAG, "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()}") }
-        if (BuildConfig.DEBUG) Log.d(BOOT_TAG, "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()}")
     }
 }
 
@@ -201,18 +198,16 @@ private fun kickOffPendingCrashUpload(context: Context) {
                                 "result=${r.getOrNull()} err=${err?.javaClass?.simpleName} msg=${if (errMsg.isBlank()) "-" else errMsg}"
                     )
 
-                    if (err != null && BuildConfig.DEBUG) {
-                        Log.e(TAG, "pending crash upload (GitHub) failed", err)
+                    if (err != null) {
+                        AppLog.e(TAG, "pending crash upload (GitHub) failed", err)
                     }
                 }.onFailure { t ->
-                    if (BuildConfig.DEBUG) Log.e(TAG, "pending crash upload (GitHub) failed", t)
                     AppLog.e(TAG, "pending crash upload (GitHub) failed", t)
                 }
 
                 val pendingAfter = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
                 AppLog.i(TAG, "pending crash upload: end pendingAfter=$pendingAfter")
             } catch (t: Throwable) {
-                if (BuildConfig.DEBUG) Log.e(TAG, "kickOffPendingCrashUpload: unexpected failure", t)
                 AppLog.e(TAG, "kickOffPendingCrashUpload: unexpected failure", t)
             } finally {
                 val dt = SystemClock.elapsedRealtime() - t0
@@ -220,7 +215,6 @@ private fun kickOffPendingCrashUpload(context: Context) {
             }
         }
     }.onFailure { t ->
-        if (BuildConfig.DEBUG) Log.w(TAG, "Failed to start PendingCrashUpload thread (non-fatal)", t)
         AppLog.w(TAG, "Failed to start PendingCrashUpload thread (non-fatal): ${t.javaClass.simpleName}")
     }
 }
