@@ -14,6 +14,7 @@
 package com.negi.surveys.chat
 
 import android.os.SystemClock
+import java.security.MessageDigest
 import java.util.Locale
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
@@ -120,16 +121,40 @@ class AdvancedAnswerValidator(
         val hasFollowUp = fuRaw.isNotBlank()
         val treatAsHistory = hasFollowUp && looksLikeFollowUpHistory(fuRaw)
 
-        val followUpBlock = if (!hasFollowUp) {
-            "FOLLOW_UP_ANSWER:\n"
-        } else if (treatAsHistory) {
-            "FOLLOW_UP_HISTORY:\n$fuRaw\n"
-        } else {
-            "FOLLOW_UP_ANSWER:\n$fuRaw\n"
+        val extracted = if (hasFollowUp) extractLatestFollowUpTurn(fuRaw) else null
+        val latestA = extracted?.answer?.trim().orEmpty()
+        val latestQ = extracted?.question?.trim().orEmpty()
+
+        if (hasFollowUp) {
+            // Do NOT log raw answers. Only a short digest for debugging correctness.
+            val sha8 = sha256Hex(latestA).take(8)
+            log(
+                "followUpDetected: treatAsHistory=$treatAsHistory " +
+                        "latestQlen=${latestQ.length} latestAlen=${latestA.length} latestAsha8=$sha8"
+            )
         }
 
-        // Keep this prompt short to reduce prefill cost on CPU.
-        // Also explicitly forbid backticks to avoid ```json fences.
+        val followUpBlock = buildString {
+            append("FOLLOW_UP_ANSWER:\n")
+            if (latestA.isNotBlank()) {
+                append(latestA).append('\n')
+            }
+            append('\n')
+
+            append("FOLLOW_UP_QUESTION:\n")
+            if (latestQ.isNotBlank()) {
+                append(latestQ).append('\n')
+            }
+            append('\n')
+
+            if (treatAsHistory) {
+                append("FOLLOW_UP_HISTORY:\n")
+                append(fuRaw).append('\n')
+            }
+        }.trimEnd() + "\n"
+
+        // IMPORTANT:
+        // The Rules section MUST explicitly allow the model to use follow-up answers.
         return """
 Return exactly ONE JSON object and nothing else.
 - No markdown, no code fences, no backticks.
@@ -141,8 +166,12 @@ Valid shapes:
 2) {"status":"NEED_FOLLOW_UP","assistantMessage":"...","followUpQuestion":"..."}
 
 Rules:
-- If MAIN_ANSWER is sufficient: ACCEPTED.
+- Evaluate sufficiency using the COMBINED information:
+  MAIN_ANSWER plus FOLLOW_UP_ANSWER (and FOLLOW_UP_HISTORY if present).
+- If the combined information is sufficient: ACCEPTED.
 - Else: NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
+- If FOLLOW_UP_ANSWER is non-empty, do NOT repeat the same follow-up question again.
+  Either ACCEPTED, or ask a DIFFERENT and more specific follow-up question.
 
 QUESTION_ID: $qid
 MAIN_ANSWER:
@@ -171,9 +200,6 @@ $followUpBlock
         )
 
         return try {
-            // NOTE:
-            // - validateMain/validateFollowUp already run on Dispatchers.Default.
-            // - Avoid nested withContext(Dispatchers.Default) here to reduce dispatcher churn.
             val result = flowProvider().collectToTextSafely(
                 timeoutMs = timeoutMsSafe,
                 maxChars = maxCharsSafe,
@@ -187,7 +213,6 @@ $followUpBlock
                 }
             )
 
-            // Flush buffered text BEFORE emitting End/Error to avoid "missing last chunk" in UI.
             coalescer.flush(force = true)?.let { tail ->
                 if (tail.isNotEmpty()) {
                     streamBridge.emitChunk(sessionId, tail)
@@ -418,16 +443,110 @@ $followUpBlock
         return raw.lineSequence().any { line -> re.matches(line.trim()) }
     }
 
-    /**
-     * Coalesces streaming chunks to reduce UI churn.
-     *
-     * Rationale:
-     * - Token-level updates can trigger frequent Compose recompositions + autoscroll.
-     * - Coalescing makes the UI smoother, especially during CPU/XNNPack execution.
-     *
-     * Notes:
-     * - Intended for sequential use by a single collector coroutine.
-     */
+    private fun extractLatestFollowUpTurn(payload: String): FollowUpTurnExtract? {
+        val lines = payload.replace("\u0000", "").split('\n')
+        if (lines.isEmpty()) return null
+
+        val currentQRe = Regex("""^CURRENT_FOLLOW_UP_Q:\s*(.*)$""")
+        val currentARe = Regex("""^CURRENT_FOLLOW_UP_A:\s*(.*)$""")
+
+        val qRe = Regex("""^FOLLOW_UP_(\d+)_Q:\s*(.*)$""")
+        val aRe = Regex("""^FOLLOW_UP_(\d+)_A:\s*(.*)$""")
+        val anyMarkerRe = Regex("""^(CURRENT_FOLLOW_UP_[QA]|FOLLOW_UP_\d+_[QA]|FOLLOW_UP_TURNS:)\s*:?.*$""")
+
+        var currentQ: String? = null
+        var currentA: String? = null
+
+        var latestQ: String? = null
+        var latestA: String? = null
+        var latestIdx = -1
+
+        var i = 0
+        while (i < lines.size) {
+            val line = lines[i]
+
+            currentQRe.matchEntire(line.trim())?.let { m ->
+                currentQ = m.groupValues[1]
+                i += 1
+                continue
+            }
+            currentARe.matchEntire(line.trim())?.let { m ->
+                currentA = m.groupValues[1]
+                i += 1
+                continue
+            }
+
+            val qm = qRe.matchEntire(line.trim())
+            if (qm != null) {
+                val idx = qm.groupValues[1].toIntOrNull() ?: -1
+                val buf = StringBuilder()
+                buf.append(qm.groupValues[2])
+
+                var j = i + 1
+                while (j < lines.size && !anyMarkerRe.matches(lines[j].trim())) {
+                    buf.append('\n').append(lines[j])
+                    j++
+                }
+
+                if (idx >= latestIdx) {
+                    latestIdx = idx
+                    latestQ = buf.toString()
+                }
+
+                i = j
+                continue
+            }
+
+            val am = aRe.matchEntire(line.trim())
+            if (am != null) {
+                val idx = am.groupValues[1].toIntOrNull() ?: -1
+                val buf = StringBuilder()
+                buf.append(am.groupValues[2])
+
+                var j = i + 1
+                while (j < lines.size && !anyMarkerRe.matches(lines[j].trim())) {
+                    buf.append('\n').append(lines[j])
+                    j++
+                }
+
+                if (idx >= latestIdx) {
+                    latestIdx = idx
+                    latestA = buf.toString()
+                }
+
+                i = j
+                continue
+            }
+
+            i += 1
+        }
+
+        val q = (currentQ ?: latestQ).orEmpty().trim()
+        val a = (currentA ?: latestA).orEmpty().trim()
+
+        if (q.isBlank() && a.isBlank()) return null
+        return FollowUpTurnExtract(question = q, answer = a)
+    }
+
+    private data class FollowUpTurnExtract(
+        val question: String,
+        val answer: String
+    )
+
+    private fun sha256Hex(text: String): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        val bytes = digest.digest(text.toByteArray(Charsets.UTF_8))
+
+        val hex = "0123456789abcdef"
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) {
+            val v = b.toInt()
+            sb.append(hex[(v ushr 4) and 0xF])
+            sb.append(hex[v and 0xF])
+        }
+        return sb.toString()
+    }
+
     private class StreamChunkCoalescer(
         private val minEmitChars: Int,
         private val maxEmitIntervalMs: Long,
@@ -439,7 +558,6 @@ $followUpBlock
         fun onChunk(chunk: String): String? {
             buffer.append(chunk)
 
-            // Guard: avoid producing a single massive UI update chunk.
             if (maxBufferedChars > 0 && buffer.length >= maxBufferedChars) {
                 return flushInternal(SystemClock.uptimeMillis())
             }

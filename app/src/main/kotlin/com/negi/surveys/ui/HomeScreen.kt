@@ -56,9 +56,7 @@ private const val TAG = "HomeScreen"
  * - Keep the screen UI-only: it should emit intents via callbacks and not mutate nav state.
  *
  * Notes:
- * - The app shell (TopAppBar) and Nav3 back stack are managed outside this composable.
- * - In later steps, you can add "Resume last session" and "Settings" without changing
- *   the basic event contract.
+ * - Warmup is handled at the app root (SurveyAppRoot) to avoid duplication.
  */
 @Composable
 fun HomeScreen(

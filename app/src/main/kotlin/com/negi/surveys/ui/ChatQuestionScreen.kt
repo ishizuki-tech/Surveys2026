@@ -204,12 +204,23 @@ fun ChatQuestionScreen(
 
                 val lastIndex = messages.size - 1
                 val lastMsg = messages[lastIndex]
-                val streaming = lastMsg.role == ChatRole.MODEL && lastMsg.streamState == ChatStreamState.STREAMING
+                val streaming = lastMsg.role == ChatRole.MODEL &&
+                        lastMsg.streamState == ChatStreamState.STREAMING
+
+                // Avoid scroll priority fights: only auto-scroll when we're already near the bottom
+                // and the list isn't currently being dragged/flung by the user.
+                val lastVisible = listState.layoutInfo.visibleItemsInfo.lastOrNull()?.index
+                val isNearBottom = lastVisible == null || (lastIndex - lastVisible) <= 2
+
+                if (!isNearBottom) return@collect
+                if (listState.isScrollInProgress) return@collect
 
                 runCatching {
-                    if (streaming) listState.scrollToItem(lastIndex) else listState.animateScrollToItem(lastIndex)
-                }.onFailure { e ->
-                    Log.w(TAG, "Auto-scroll failed (non-fatal). size=${messages.size}", e)
+                    if (streaming) {
+                        listState.scrollToItem(lastIndex)
+                    } else {
+                        listState.animateScrollToItem(lastIndex)
+                    }
                 }
             }
     }

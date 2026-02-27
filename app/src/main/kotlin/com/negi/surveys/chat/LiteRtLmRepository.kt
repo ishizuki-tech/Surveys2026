@@ -19,14 +19,15 @@ import com.negi.surveys.logging.AppLog
 import com.negi.surveys.slm.Accelerator
 import com.negi.surveys.slm.ConfigKey
 import com.negi.surveys.slm.LiteRtLM
-import com.negi.surveys.slm.SlmWarmup
 import com.negi.surveys.slm.Model
+import com.negi.surveys.slm.SlmWarmup
 import java.io.File
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withContext
 
 private const val TAG = "LiteRtLmRepository"
@@ -47,7 +48,6 @@ class LiteRtLmRepository(
 ) : Repository {
 
     private val appContext: Context = context.applicationContext
-
     private val cachedConfig = AtomicReference<com.negi.surveys.config.SurveyConfig?>(null)
 
     /**
@@ -75,9 +75,7 @@ $u
     override suspend fun request(prompt: String): Flow<String> {
         val p = prompt.trim()
         if (p.isBlank()) {
-            return callbackFlow {
-                close()
-            }
+            return callbackFlow { close() }
         }
 
         val file = resolveModelFile()
@@ -85,18 +83,13 @@ $u
             throw ModelNotReadyException("Model file missing or empty: ${file.name}")
         }
 
-        val warmModel: Model? = runCatching {
-            // Prefer the warmup model to keep runtimeKey and config stable across the app.
-            SlmWarmup.getInitializedModelOrNull()
-                ?: SlmWarmup.awaitInitializedModel(appContext)
-        }.getOrNull()
+        // Split warmup design:
+        // - Prefetch may already be running/finished from Home/SurveyStart.
+        // - Compile is expected right before Question usage; we enforce a barrier here as well.
+        SlmWarmup.startCompileIfConfigured(appContext)
+        awaitCompileBarrierBestEffort()
 
-        val model = if (warmModel != null && warmModel.taskPath == file.absolutePath) {
-            warmModel
-        } else {
-            buildModel(file)
-        }
-
+        val model = buildModel(file)
         awaitInitializedModel(model)
 
         if (resetConversationEachRequest) {
@@ -203,7 +196,7 @@ $u
     }
 
     private suspend fun awaitInitializedModel(model: Model) {
-        withContext(Dispatchers.IO) {
+        withContext(Dispatchers.Default) {
             runCatching {
                 LiteRtLM.setApplicationContext(appContext)
             }
@@ -217,6 +210,115 @@ $u
                 systemMessage = null,
                 tools = emptyList()
             )
+        }
+    }
+
+    /**
+     * Best-effort barrier: waits until compile state reaches a terminal state.
+     *
+     * Note:
+     * - If compile warmup is skipped/failed, we still proceed because initializeIfNeeded()
+     *   is the real source of truth (it may still succeed).
+     */
+    private suspend fun awaitCompileBarrierBestEffort() {
+        val terminal = SlmWarmup.compileState.first { st ->
+            st is SlmWarmup.CompileState.Compiled ||
+                    st is SlmWarmup.CompileState.Failed ||
+                    st is SlmWarmup.CompileState.Cancelled ||
+                    st is SlmWarmup.CompileState.SkippedNotConfigured
+        }
+
+        when (terminal) {
+            is SlmWarmup.CompileState.Compiled -> {
+                AppLog.d(TAG, "compile barrier: compiled in ${terminal.elapsedMs}ms")
+            }
+            is SlmWarmup.CompileState.Failed -> {
+                AppLog.d(TAG, "compile barrier: failed: ${terminal.message} elapsed=${terminal.elapsedMs}ms")
+            }
+            is SlmWarmup.CompileState.Cancelled -> {
+                AppLog.d(TAG, "compile barrier: cancelled elapsed=${terminal.elapsedMs}ms")
+            }
+            is SlmWarmup.CompileState.SkippedNotConfigured -> {
+                AppLog.d(TAG, "compile barrier: skipped: ${terminal.reason} elapsed=${terminal.elapsedMs}ms")
+            }
+            else -> Unit
+        }
+    }
+
+    companion object {
+        private const val DEFAULT_WARMUP_CONFIG_ASSET = "survey.yaml"
+        private const val DEFAULT_WARMUP_MODEL_NAME = "Gemma3n4B"
+
+        /**
+         * Stable reflection entrypoint for [SlmWarmup].
+         *
+         * Design:
+         * - This intentionally performs a best-effort initialization via LiteRtLM.initializeIfNeeded().
+         * - The goal is to front-load delegate/shader/kernel initialization before the first real request.
+         *
+         * Notes:
+         * - This method must be non-suspending to be callable from reflection.
+         * - It is expected to run on a background thread (SlmWarmup does that).
+         */
+        @JvmStatic
+        suspend fun runCompileWarmup(context: Context, file: File) {
+            val appContext = context.applicationContext
+
+            val cfg = runCatching {
+                SurveyConfigLoader.fromAssetsValidated(appContext, DEFAULT_WARMUP_CONFIG_ASSET)
+            }.getOrNull()
+
+            val modelName = cfg?.modelDefaults?.modelName?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: DEFAULT_WARMUP_MODEL_NAME
+
+            val accel = cfg?.slm?.accelerator?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?: Accelerator.GPU.label
+
+            val maxTokens = cfg?.slm?.maxTokens ?: 4096
+            val topK = cfg?.slm?.topK ?: 40
+            val topP = (cfg?.slm?.topP ?: 0.9).toFloat()
+            val temp = (cfg?.slm?.temperature ?: 0.7).toFloat()
+
+            val config: Map<ConfigKey, Any> = mapOf(
+                ConfigKey.ACCELERATOR to accel,
+                ConfigKey.MAX_TOKENS to maxTokens,
+                ConfigKey.TOP_K to topK,
+                ConfigKey.TOP_P to topP,
+                ConfigKey.TEMPERATURE to temp
+            )
+
+            val model = Model(
+                name = modelName,
+                taskPath = file.absolutePath,
+                config = config
+            )
+
+            runCatching { LiteRtLM.setApplicationContext(appContext) }
+
+            AppLog.d(TAG, "runCompileWarmup: initializeIfNeeded model='${model.name}' file='${file.name}'")
+            runCatching {
+                LiteRtLM.initializeIfNeeded(
+                    context = appContext,
+                    model = model,
+                    supportImage = false,
+                    supportAudio = false,
+                    systemMessage = null,
+                    tools = emptyList()
+                )
+            }.onFailure { t ->
+                // Best-effort warmup must never crash the process.
+                AppLog.d(TAG, "runCompileWarmup: failed: ${t.javaClass.simpleName}(${t.message})")
+            }
+        }
+
+        /**
+         * Compatibility alias for older reflection method lists.
+         */
+        @JvmStatic
+        suspend fun compileWarmup(context: Context, file: File) {
+            runCompileWarmup(context, file)
         }
     }
 }

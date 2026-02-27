@@ -326,14 +326,23 @@ class ChatQuestionViewModel(
         }
         logAnswerDigest("followup#${withStateLock { followUps.size }}", userAnswer)
 
-        val followUpContext = withStateLock {
-            buildFollowUpContext(followUps)
+        // IMPORTANT:
+        // Always pass a follow-up payload that explicitly contains the current Q/A,
+        // in addition to any historical context. This prevents prompt templates that
+        // expect "the answer" from missing the latest user input.
+        val followUpPayloadForValidator = withStateLock {
+            buildFollowUpContextForValidator(
+                currentQuestion = q,
+                currentAnswer = userAnswer,
+                turns = followUps
+            )
         }
+        logFollowUpPayloadDigest(turns = withStateLock { followUps.size }, payload = followUpPayloadForValidator)
 
         val out = validator.validateFollowUp(
             questionId = qid,
             mainAnswer = withStateLock { mainAnswer }.trim(),
-            followUpAnswer = followUpContext
+            followUpAnswer = followUpPayloadForValidator
         )
 
         if (!isAttemptActive(attemptId)) return
@@ -460,6 +469,34 @@ class ChatQuestionViewModel(
             turns.forEachIndexed { idx, t ->
                 append("FOLLOW_UP_${idx + 1}_Q: ").append(t.question.trim()).append('\n')
                 append("FOLLOW_UP_${idx + 1}_A: ").append(t.answer.trim()).append('\n')
+            }
+        }.trim()
+    }
+
+    /**
+     * Build a validator-friendly follow-up payload.
+     *
+     * Design:
+     * - Always includes CURRENT_FOLLOW_UP_Q/A at the top.
+     * - Also includes the full follow-up turn history using the legacy keys (FOLLOW_UP_1_Q/A...),
+     *   so older prompt templates can continue to work.
+     */
+    private fun buildFollowUpContextForValidator(
+        currentQuestion: String,
+        currentAnswer: String,
+        turns: List<FollowUpTurn>
+    ): String {
+        val q = currentQuestion.trim()
+        val a = currentAnswer.trim()
+        val history = buildFollowUpContext(turns)
+
+        return buildString {
+            append("CURRENT_FOLLOW_UP_Q: ").append(q).append('\n')
+            append("CURRENT_FOLLOW_UP_A: ").append(a).append('\n')
+            if (history.isNotBlank()) {
+                append('\n')
+                append("FOLLOW_UP_TURNS:\n")
+                append(history)
             }
         }.trim()
     }
@@ -995,6 +1032,13 @@ class ChatQuestionViewModel(
         val sha8 = sha256Hex(t).take(8)
         AppLog.d(TAG, "answer[$label] q=$qid len=${t.length} sha8=$sha8")
         Log.d(TAG, "answer[$label] q=$qid len=${t.length} sha8=$sha8")
+    }
+
+    private fun logFollowUpPayloadDigest(turns: Int, payload: String) {
+        val t = payload.trim()
+        val sha8 = sha256Hex(t).take(8)
+        AppLog.d(TAG, "followUpPayload q=$qid turns=$turns len=${t.length} sha8=$sha8")
+        Log.d(TAG, "followUpPayload q=$qid turns=$turns len=${t.length} sha8=$sha8")
     }
 
     private fun sha256Hex(text: String): String {
