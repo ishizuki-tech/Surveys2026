@@ -19,35 +19,6 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.flow
 
 /**
- * Prompt phases used by [Repository.buildPrompt] for validation flows.
- *
- * NOTE:
- * - Keep this enum consistent across the validator/repository stack.
- * - If you already have this enum in another file, remove the duplicate from here.
- */
-enum class PromptPhase {
-    VALIDATE_MAIN,
-    VALIDATE_FOLLOW_UP
-}
-
-/**
- * Repository interface used by [SlmAnswerValidator].
- *
- * NOTE:
- * - If you already have this interface in another file, remove the duplicate from here.
- */
-interface Repository {
-    /** Execute a single streaming inference for the given [prompt]. */
-    suspend fun request(prompt: String): Flow<String>
-
-    /** Build the full model-ready prompt string from a user-level [userPrompt]. */
-    fun buildPrompt(userPrompt: String): String
-
-    /** Phase-aware prompt building. */
-    fun buildPrompt(userPrompt: String, phase: PromptPhase): String = buildPrompt(userPrompt)
-}
-
-/**
  * A minimal fake "SLM" repository that returns streaming chunks as Flow<String>.
  *
  * Goals:
@@ -68,9 +39,7 @@ interface Repository {
  * Privacy:
  * - Do NOT log raw prompts/answers. If you pass [logger], keep it metadata-only.
  */
-class BaseSlmRepository(
-    private val config: Config = Config()
-) : Repository {
+class FakeSlmRepository(config: Config = Config()) : RepositoryI {
 
     data class Config(
         /** Delay before returning the Flow to simulate request preparation latency. */

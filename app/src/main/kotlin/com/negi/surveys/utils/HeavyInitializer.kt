@@ -18,10 +18,11 @@
  *  ---------------------------------------------------------------------
  *  - Single-flight:
  *      Concurrent callers share the same in-flight Deferred<Result<File>>.
- *  - Resume:
- *      Partial files are preserved across cancellations/timeouts when forceFresh=false.
+ *  - Resume (safe):
+ *      Partial files are preserved across cancellations/timeouts and many IO failures
+ *      when forceFresh=false, but only if meta matches the current URL/expected length.
  *  - Integrity:
- *      If Content-Length is known, final size must match exactly.
+ *      If Content-Length (or meta expectedLen) is known, final size must match exactly.
  *  - Replacement:
  *      Uses rename within the same directory when possible; falls back to
  *      a stream copy if rename fails.
@@ -166,6 +167,18 @@ object HeavyInitializer {
                 runCatching { finalFile.delete() }
             }
 
+            // Read meta first (best-effort) to validate resume safety.
+            val meta = readMetaIfPresent(tmpMetaFile)
+            if (!forceFresh) {
+                // If meta exists but does not match the current URL, discard partial.
+                if (meta != null && meta.url != modelUrl) {
+                    AppLog.w(TAG, "meta url mismatch -> discard part/meta (metaUrl=${meta.url}, url=$modelUrl)")
+                    runCatching { tmpPartFile.delete() }
+                    runCatching { tmpMetaFile.delete() }
+                }
+            }
+
+            // HEAD probe (best-effort). If it fails, fall back to meta expectedLen.
             val remoteLen: Long? = withContext(Dispatchers.IO) {
                 runCatching { headContentLength(modelUrl, token) }
                     .onFailure { e -> AppLog.w(TAG, "HEAD content-length failed (non-fatal)", e) }
@@ -173,24 +186,27 @@ object HeavyInitializer {
                     ?.takeIf { it > 0L }
             }
 
+            val meta2 = readMetaIfPresent(tmpMetaFile)
+            val expectedLen: Long? = (remoteLen ?: meta2?.expectedLen)?.takeIf { it > 0L }
+
             if (!forceFresh && finalFile.exists() && finalFile.length() > 0L) {
                 val ok = when {
-                    remoteLen != null -> finalFile.length() == remoteLen
+                    expectedLen != null -> finalFile.length() == expectedLen
                     else -> true
                 }
                 if (ok) {
                     val len = finalFile.length()
-                    runCatching { onProgress(len, remoteLen ?: len) }
+                    runCatching { onProgress(len, expectedLen ?: len) }
                     deferred.complete(Result.success(finalFile))
                     return deferred.await()
                 }
             }
 
             if (!forceFresh && tmpPartFile.exists() && tmpPartFile.length() > 0L) {
-                if (remoteLen != null && tmpPartFile.length() > remoteLen) {
+                if (expectedLen != null && tmpPartFile.length() > expectedLen) {
                     AppLog.w(
                         TAG,
-                        "part is larger than remoteLen -> discarding part (part=${tmpPartFile.length()}, remote=$remoteLen)"
+                        "part is larger than expectedLen -> discarding part/meta (part=${tmpPartFile.length()}, expected=$expectedLen)"
                     )
                     runCatching { tmpPartFile.delete() }
                     runCatching { tmpMetaFile.delete() }
@@ -199,8 +215,8 @@ object HeavyInitializer {
 
             val existingPartial = tmpPartFile.takeIf { it.exists() }?.length() ?: 0L
 
-            if (remoteLen != null) {
-                val remaining = max(0L, remoteLen - existingPartial)
+            if (expectedLen != null) {
+                val remaining = max(0L, expectedLen - existingPartial)
                 val needed = remaining + FREE_SPACE_MARGIN_BYTES
                 if (dir.usableSpace < needed) {
                     val msg =
@@ -219,13 +235,14 @@ object HeavyInitializer {
             val runDownload: suspend () -> Unit = {
                 currentCoroutineContext().ensureActive()
 
-                runCatching { writeMeta(tmpMetaFile, modelUrl, remoteLen) }
+                // Write meta that binds the partial to this URL and expected length.
+                runCatching { writeMeta(tmpMetaFile, modelUrl, expectedLen) }
 
                 downloadToPartFile(
                     url = modelUrl,
                     hfToken = token,
                     partFile = tmpPartFile,
-                    expectedTotalLen = remoteLen,
+                    expectedTotalLen = expectedLen,
                     onProgress = safeProgressBridge
                 )
 
@@ -236,6 +253,7 @@ object HeavyInitializer {
                     tmpPartFile.inputStream().use { input ->
                         tmpFile.outputStream().use { output ->
                             input.copyTo(output, BUFFER_BYTES)
+                            trySync(output)
                         }
                     }
                     runCatching { tmpPartFile.delete() }
@@ -250,10 +268,10 @@ object HeavyInitializer {
                 runDownload()
             }
 
-            if (remoteLen != null) {
+            if (expectedLen != null) {
                 val got = tmpFile.length()
-                if (got != remoteLen) {
-                    throw IOException("Downloaded size mismatch. expected=$remoteLen, got=$got")
+                if (got != expectedLen) {
+                    throw IOException("Downloaded size mismatch. expected=$expectedLen, got=$got")
                 }
             }
 
@@ -261,7 +279,7 @@ object HeavyInitializer {
             runCatching { tmpMetaFile.delete() }
 
             val outLen = finalFile.length()
-            runCatching { onProgress(outLen, remoteLen ?: outLen) }
+            runCatching { onProgress(outLen, expectedLen ?: outLen) }
 
             deferred.complete(Result.success(finalFile))
 
@@ -272,6 +290,7 @@ object HeavyInitializer {
                 runCatching { tmpPartFile.delete() }
                 runCatching { tmpMetaFile.delete() }
             }
+            // Keep partial/meta for resume when forceFresh=false.
             deferred.complete(Result.failure(IOException("Canceled", ce)))
 
         } catch (ie: InterruptedIOException) {
@@ -290,15 +309,24 @@ object HeavyInitializer {
                 runCatching { tmpPartFile.delete() }
                 runCatching { tmpMetaFile.delete() }
             }
+            // Keep partial/meta for resume when forceFresh=false.
             deferred.complete(Result.failure(IOException("Timeout ($timeoutMs ms)", te)))
 
         } catch (t: Throwable) {
             val msg = userFriendlyMessage(t)
             AppLog.w(TAG, "Initialization error: $msg", t)
 
+            val keepPartial = !forceFresh && shouldKeepPartialForResume(t)
+
+            // If we want to resume, keep .part and .meta; otherwise purge.
             runCatching { tmpFile.delete() }
-            runCatching { tmpPartFile.delete() }
-            runCatching { tmpMetaFile.delete() }
+
+            if (!keepPartial) {
+                runCatching { tmpPartFile.delete() }
+                runCatching { tmpMetaFile.delete() }
+            } else {
+                AppLog.w(TAG, "Keeping partial for resume (forceFresh=false)")
+            }
 
             deferred.complete(Result.failure(IOException(msg, t)))
 
@@ -324,10 +352,41 @@ object HeavyInitializer {
      * Clears all in-flight and debug state.
      */
     fun resetForDebug() {
-        inFlight.get()?.complete(Result.failure(IOException("resetForDebug")))
+        val cur = inFlight.get()
+        cur?.complete(Result.failure(IOException("resetForDebug")))
+        inFlight.compareAndSet(cur, null)
+
         runningJob?.cancel(CancellationException("resetForDebug"))
         runningJob = null
         AppLog.w(TAG, "resetForDebug(): cleared in-flight state")
+    }
+
+    // ---------------------------------------------------------------------
+    // Resume keep/discard policy
+    // ---------------------------------------------------------------------
+
+    /**
+     * Decide whether we should keep the partial file on failure to allow resume.
+     *
+     * Policy:
+     * - Keep on transient/network IO errors.
+     * - Discard on "integrity" errors (size mismatch, resume refused, etc.).
+     */
+    private fun shouldKeepPartialForResume(t: Throwable): Boolean {
+        val msg = (t.message ?: "").lowercase()
+        if (t is InterruptedIOException) return true
+
+        // Integrity-ish failures -> discard to avoid reusing corrupt partial.
+        if ("size mismatch" in msg) return false
+        if ("downloaded size mismatch" in msg) return false
+        if ("resume failed" in msg) return false
+        if ("refused range" in msg) return false
+        if ("416" in msg) return false
+
+        // HTTP failures can be transient; keep partial (resume later) unless integrity-specific.
+        if (t is IOException) return true
+
+        return false
     }
 
     // ---------------------------------------------------------------------
@@ -352,6 +411,42 @@ object HeavyInitializer {
         require(ok) { "resolved path escapes baseDir: $p" }
 
         return canon
+    }
+
+    // ---------------------------------------------------------------------
+    // Meta (bind partial to URL + expectedLen)
+    // ---------------------------------------------------------------------
+
+    private data class Meta(
+        val url: String,
+        val expectedLen: Long?
+    )
+
+    private fun readMetaIfPresent(metaFile: File): Meta? {
+        if (!metaFile.exists() || !metaFile.isFile) return null
+        return runCatching {
+            val text = metaFile.readText()
+            var url: String? = null
+            var expectedLen: Long? = null
+
+            val lines = text.split('\n')
+            for (line in lines) {
+                val t = line.trim()
+                if (t.isEmpty()) continue
+                val idx = t.indexOf('=')
+                if (idx <= 0) continue
+                val k = t.substring(0, idx).trim()
+                val v = t.substring(idx + 1).trim()
+
+                when (k) {
+                    "url" -> url = v
+                    "expectedLen" -> expectedLen = v.toLongOrNull()
+                }
+            }
+
+            val u = url?.takeIf { it.isNotBlank() } ?: return@runCatching null
+            Meta(url = u, expectedLen = expectedLen?.takeIf { it > 0L })
+        }.getOrNull()
     }
 
     // ---------------------------------------------------------------------
@@ -453,6 +548,7 @@ object HeavyInitializer {
                 }
 
                 if (code == 416) {
+                    // Server refused the range. Discard partial to allow a clean restart next time.
                     runCatching { partFile.delete() }
                     throw IOException("Resume failed (server refused range).")
                 }
@@ -488,6 +584,7 @@ object HeavyInitializer {
                             onProgressSafe(onProgress, written, total)
                         }
                         fos.flush()
+                        trySync(fos)
                     }
                 }
 
@@ -531,6 +628,14 @@ object HeavyInitializer {
         metaFile.writeText(lines)
     }
 
+    private fun trySync(fos: FileOutputStream) {
+        runCatching { fos.fd.sync() }
+    }
+
+    private fun trySync(output: java.io.OutputStream) {
+        // Best-effort. Most streams won't support fd sync.
+    }
+
     // ---------------------------------------------------------------------
     // Error messaging
     // ---------------------------------------------------------------------
@@ -544,7 +649,7 @@ object HeavyInitializer {
             "forbidden" in s || "403" in s -> "Access denied (token/permissions?)"
             "timeout" in s -> "Network timeout"
             "space" in s -> "Not enough free space"
-            "content-range" in s || "416" in s || "range" in s -> "Resume failed (server refused range)"
+            "content-range" in s || "416" in s || "refused range" in s -> "Resume failed (server refused range)"
             "unknown host" in s || "dns" in s -> "Unknown host (check connectivity)"
             else -> raw
         }

@@ -432,3 +432,36 @@ object AppLog {
         return File(dir, "app-$stamp-$seq-${System.nanoTime().toString(16)}.log")
     }
 }
+
+/**
+ * Minimal safe logger wrapper.
+ *
+ * Why:
+ * - If AppLog init fails, calling AppLog.* may itself throw or no-op depending on implementation.
+ * - Always ensure logs land in Logcat as a fallback.
+ */
+object SafeLog {
+    fun d(tag: String, msg: String) {
+        runCatching { AppLog.d(tag, msg) }.onFailure { Log.d(tag, msg) }
+    }
+
+    fun i(tag: String, msg: String) {
+        runCatching { AppLog.i(tag, msg) }.onFailure { Log.i(tag, msg) }
+    }
+
+    fun w(tag: String, msg: String, t: Throwable? = null) {
+        runCatching {
+            if (t != null) AppLog.w(tag, msg, t) else AppLog.w(tag, msg)
+        }.onFailure {
+            if (t != null) Log.w(tag, msg, t) else Log.w(tag, msg)
+        }
+    }
+
+    fun e(tag: String, msg: String, t: Throwable? = null) {
+        runCatching {
+            if (t != null) AppLog.e(tag, msg, t) else AppLog.e(tag, msg)
+        }.onFailure {
+            if (t != null) Log.e(tag, msg, t) else Log.e(tag, msg)
+        }
+    }
+}

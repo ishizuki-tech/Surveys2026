@@ -57,7 +57,7 @@ import com.negi.surveys.logging.AppLog
 class ChatQuestionViewModel(
     private val questionId: String,
     private val prompt: String,
-    private val validator: AnswerValidator,
+    private val validator: AnswerValidatorI,
     private val streamBridge: ChatStreamBridge,
     private val draftStore: ChatDraftStore,
     private val draftKey: DraftKey,

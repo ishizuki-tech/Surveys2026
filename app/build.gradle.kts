@@ -258,7 +258,6 @@ android {
     val ghPathPrefix = gradlePropAny("github.pathPrefix", "gh.pathPrefix") ?: ""
     val ghLogPrefix = gradlePropAny("github.logPrefix", "gh.logPrefix") ?: "surveyapp"
     val ghToken = gradlePropAny("github.token", "gh.token") ?: ""
-
     val hfToken = gradlePropAny("hf.token", "HF_TOKEN") ?: ""
 
     /**
@@ -268,9 +267,6 @@ android {
      * or in gradle.properties.local:
      *   release.allowSecrets=true
      */
-    val allowSecretsInRelease = (gradlePropAny("release.allowSecrets", "release.allowTokens") ?: "")
-        .equals("true", ignoreCase = true)
-
     defaultConfig {
         applicationId = "com.negi.surveys"
 
@@ -328,8 +324,8 @@ android {
              */
             signingConfig = signingConfigs.getByName("debug")
 
-            val ghTokenRelease = if (allowSecretsInRelease) ghToken else ""
-            val hfTokenRelease = if (allowSecretsInRelease) hfToken else ""
+            val ghTokenRelease = ghToken
+            val hfTokenRelease = hfToken
 
             buildConfigField("String", "GH_TOKEN", quote(ghTokenRelease))
             buildConfigField("String", "GITHUB_TOKEN", quote(ghTokenRelease))

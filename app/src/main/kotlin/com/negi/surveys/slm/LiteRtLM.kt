@@ -1,6 +1,6 @@
 /*
  * =====================================================================
- *  IshizukiTech LLC — SLM Integration Framework
+ *  IshizukiTech LLC — LiteRtLM Integration
  *  ---------------------------------------------------------------------
  *  File: LiteRtLM.kt
  *  Author: Shu Ishizuki (石附 支)
