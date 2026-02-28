@@ -13,7 +13,7 @@
 
 package com.negi.surveys.ui
 
-import androidx.compose.animation.animateContentSize
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
@@ -21,6 +21,9 @@ import androidx.compose.animation.core.animateFloat
 import androidx.compose.animation.core.infiniteRepeatable
 import androidx.compose.animation.core.rememberInfiniteTransition
 import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -61,6 +64,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.Immutable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
@@ -89,8 +93,8 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
-import com.negi.surveys.chat.AdvancedAnswerValidator
 import com.negi.surveys.chat.AnswerValidator
+import com.negi.surveys.chat.AnswerValidatorI
 import com.negi.surveys.chat.ChatDraftStore
 import com.negi.surveys.chat.ChatMessage
 import com.negi.surveys.chat.ChatQuestionViewModel
@@ -99,21 +103,18 @@ import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatStreamState
 import com.negi.surveys.chat.DraftKey
 import com.negi.surveys.chat.InMemoryChatDraftStore
-import com.negi.surveys.chat.LiteRtLmRepository
-import com.negi.surveys.chat.Repository
+import com.negi.surveys.chat.RepositoryI
 import com.negi.surveys.logging.AppLog
+import com.negi.surveys.slm.SlmRepository
 import java.util.Locale
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 
-@OptIn(FlowPreview::class)
 @Composable
 fun ChatQuestionScreen(
     questionId: String,
     prompt: String = "Question prompt for $questionId (placeholder)",
-    repository: Repository? = null,
     onNext: (log: ReviewQuestionLog) -> Unit,
     onBack: () -> Unit
 ) {
@@ -130,16 +131,16 @@ fun ChatQuestionScreen(
 
     val appContext = LocalContext.current.applicationContext
 
-    val repo: Repository = remember(repository, appContext) {
-        // Use the provided repository if present; otherwise use the LiteRT-LM backed implementation.
-        repository ?: LiteRtLmRepository(appContext)
+    val repo: RepositoryI = remember(appContext) {
+        SlmRepository(appContext)
+        // FakeSlmRepository()
     }
 
-    val validator: AnswerValidator = remember(questionId, promptHash, repo, streamBridge) {
-        AdvancedAnswerValidator(
+    val validator: AnswerValidatorI = remember(questionId, promptHash, repo, streamBridge) {
+        AnswerValidator(
             repository = repo,
             streamBridge = streamBridge,
-            logger = { AppLog.d("AdvancedValidator", it) }
+            logger = { AppLog.d("AnswerValidator", it) }
         )
     }
 
@@ -184,6 +185,15 @@ fun ChatQuestionScreen(
 
     LaunchedEffect(vmKey) {
         AppLog.d(TAG, "Using shared streamBridge identity=${System.identityHashCode(streamBridge)} qid=$questionId")
+    }
+
+    // Prevent state map from growing forever across long sessions.
+    LaunchedEffect(vmKey, messages.size) {
+        val keep = messages.asSequence().map { it.id }.toHashSet()
+        val keys = detailsExpanded.keys.toList()
+        for (k in keys) {
+            if (!keep.contains(k)) detailsExpanded.remove(k)
+        }
     }
 
     LaunchedEffect(vmKey) {
@@ -283,7 +293,10 @@ fun ChatQuestionScreen(
                             detailsExpanded = detailsExpanded[msg.id] ?: false,
                             onToggleDetailsExpand = { expand ->
                                 detailsExpanded[msg.id] = expand
-                                AppLog.d(TAG, "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}")
+                                AppLog.d(
+                                    TAG,
+                                    "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}"
+                                )
                             }
                         )
                     }
@@ -336,7 +349,10 @@ fun ChatQuestionScreen(
                             messagesSnapshot = messagesNow
                         )
 
-                        AppLog.d(TAG, "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}")
+                        AppLog.d(
+                            TAG,
+                            "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}"
+                        )
                         onNextLatest(log)
                     } finally {
                         nextInFlight = false
@@ -575,7 +591,6 @@ private fun ChatBubbleStructured(
             modifier = Modifier
                 .widthIn(max = maxWidth)
                 .border(1.dp, outline, shape)
-                .animateContentSize()
         ) {
             val basePaddingH = if (isCompactPill) 10.dp else 12.dp
             val basePaddingV = if (isCompactPill) 8.dp else 10.dp
@@ -678,67 +693,12 @@ private fun ChatBubbleStructured(
                                 Modifier
                             }
 
-                            if (!expanded) {
-                                val pillShape = RoundedCornerShape(12.dp)
-                                Row(
-                                    modifier = Modifier
-                                        .then(clickMod)
-                                        .clip(pillShape)
-                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
-                                        .border(1.dp, outline, pillShape)
-                                        .padding(horizontal = 10.dp, vertical = 6.dp),
-                                    verticalAlignment = Alignment.CenterVertically
-                                ) {
-                                    Text(
-                                        text = "Model output",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                        fontWeight = FontWeight.SemiBold
-                                    )
-                                    Spacer(Modifier.width(8.dp))
-                                    Text(
-                                        text = "(${raw.length} chars)",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                    Spacer(Modifier.weight(1f))
-                                    Text(
-                                        text = "Expand",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            } else {
-                                val blockShape = RoundedCornerShape(14.dp)
-                                Column(
-                                    modifier = Modifier
-                                        .fillMaxWidth()
-                                        .then(clickMod)
-                                ) {
-                                    Box(
-                                        modifier = Modifier
-                                            .fillMaxWidth()
-                                            .clip(blockShape)
-                                            .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
-                                            .border(1.dp, outline, blockShape)
-                                            .padding(horizontal = 10.dp, vertical = 10.dp)
-                                    ) {
-                                        Text(
-                                            text = raw,
-                                            style = MaterialTheme.typography.bodySmall,
-                                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                                        )
-                                    }
-
-                                    Spacer(Modifier.height(6.dp))
-
-                                    Text(
-                                        text = "Tap to collapse",
-                                        style = MaterialTheme.typography.labelSmall,
-                                        color = MaterialTheme.colorScheme.onSurfaceVariant
-                                    )
-                                }
-                            }
+                            StreamDetailsAnimated(
+                                expanded = expanded,
+                                raw = raw,
+                                outline = outline,
+                                modifier = Modifier.then(clickMod)
+                            )
                         }
                     }
 
@@ -838,15 +798,100 @@ private fun ChatBubbleStructured(
 }
 
 @Composable
-private fun FancyStreamingModelBlock(
-    shape: RoundedCornerShape,
-    ttftActive: Boolean,
+private fun StreamDetailsAnimated(
+    expanded: Boolean,
     raw: String,
-    onOutline: androidx.compose.ui.graphics.Color
+    outline: androidx.compose.ui.graphics.Color,
+    modifier: Modifier = Modifier,
 ) {
-    val infinite = rememberInfiniteTransition(label = "streamFancy")
+    AnimatedContent(
+        targetState = expanded,
+        transitionSpec = {
+            fadeIn(animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing)) togetherWith
+                    fadeOut(animationSpec = tween(durationMillis = 90, easing = LinearEasing))
+        },
+        label = "streamDetails"
+    ) { isExpanded ->
+        if (!isExpanded) {
+            val pillShape = RoundedCornerShape(12.dp)
+            Row(
+                modifier = modifier
+                    .clip(pillShape)
+                    .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.45f))
+                    .border(1.dp, outline, pillShape)
+                    .padding(horizontal = 10.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Model output",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(Modifier.width(8.dp))
+                Text(
+                    text = "(${raw.length} chars)",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = "Expand",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        } else {
+            val blockShape = RoundedCornerShape(14.dp)
+            Column(
+                modifier = modifier.fillMaxWidth()
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(blockShape)
+                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                        .border(1.dp, outline, blockShape)
+                        .padding(horizontal = 10.dp, vertical = 10.dp)
+                ) {
+                    Text(
+                        text = raw,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
 
-    val borderPulse by infinite.animateFloat(
+                Spacer(Modifier.height(6.dp))
+
+                Text(
+                    text = "Tap to collapse",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Immutable
+private data class StreamAnimPhases(
+    val borderPulse: Float,
+    val bgPulse: Float,
+    val shimmerPhase: Float,
+    val headerDotAlpha: Float,
+    val cursorAlpha: Float,
+    val miniBarPhase: Float,
+    val ttftDot1: Float,
+    val ttftDot2: Float,
+    val ttftDot3: Float,
+    val ttftShimmerPhase: Float,
+)
+
+@Composable
+private fun rememberStreamAnimPhases(): StreamAnimPhases {
+    val t = rememberInfiniteTransition(label = "streamAnim")
+
+    val borderPulse by t.animateFloat(
         initialValue = 0.25f,
         targetValue = 0.85f,
         animationSpec = infiniteRepeatable(
@@ -856,7 +901,7 @@ private fun FancyStreamingModelBlock(
         label = "borderPulse"
     )
 
-    val bgPulse by infinite.animateFloat(
+    val bgPulse by t.animateFloat(
         initialValue = 0.10f,
         targetValue = 0.22f,
         animationSpec = infiniteRepeatable(
@@ -866,7 +911,7 @@ private fun FancyStreamingModelBlock(
         label = "bgPulse"
     )
 
-    val shimmerPhase by infinite.animateFloat(
+    val shimmerPhase by t.animateFloat(
         initialValue = 0f,
         targetValue = 1f,
         animationSpec = infiniteRepeatable(
@@ -876,8 +921,101 @@ private fun FancyStreamingModelBlock(
         label = "shimmerPhase"
     )
 
-    val borderColor = MaterialTheme.colorScheme.primary.copy(alpha = borderPulse * 0.9f)
-    val baseBg = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f + bgPulse)
+    val headerDotAlpha by t.animateFloat(
+        initialValue = 0.25f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 650, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "headerDotAlpha"
+    )
+
+    val cursorAlpha by t.animateFloat(
+        initialValue = 0.0f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 650, easing = LinearEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "cursorAlpha"
+    )
+
+    val miniBarPhase by t.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 900, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "miniBarPhase"
+    )
+
+    val ttftDot1 by t.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 520, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "ttftDot1"
+    )
+
+    val ttftDot2 by t.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 520, delayMillis = 140, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "ttftDot2"
+    )
+
+    val ttftDot3 by t.animateFloat(
+        initialValue = 0.35f,
+        targetValue = 1.0f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 520, delayMillis = 280, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "ttftDot3"
+    )
+
+    val ttftShimmerPhase by t.animateFloat(
+        initialValue = 0f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(durationMillis = 1050, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "ttftShimmerPhase"
+    )
+
+    return StreamAnimPhases(
+        borderPulse = borderPulse,
+        bgPulse = bgPulse,
+        shimmerPhase = shimmerPhase,
+        headerDotAlpha = headerDotAlpha,
+        cursorAlpha = cursorAlpha,
+        miniBarPhase = miniBarPhase,
+        ttftDot1 = ttftDot1,
+        ttftDot2 = ttftDot2,
+        ttftDot3 = ttftDot3,
+        ttftShimmerPhase = ttftShimmerPhase,
+    )
+}
+
+@Composable
+private fun FancyStreamingModelBlock(
+    shape: RoundedCornerShape,
+    ttftActive: Boolean,
+    raw: String,
+    onOutline: androidx.compose.ui.graphics.Color
+) {
+    val phases = rememberStreamAnimPhases()
+
+    val borderColor = MaterialTheme.colorScheme.primary.copy(alpha = phases.borderPulse * 0.9f)
+    val baseBg = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f + phases.bgPulse)
 
     val brush = androidx.compose.ui.graphics.Brush.linearGradient(
         colors = listOf(
@@ -885,8 +1023,8 @@ private fun FancyStreamingModelBlock(
             MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.22f),
             baseBg
         ),
-        start = Offset(x = -400f + shimmerPhase * 800f, y = 0f),
-        end = Offset(x = 400f + shimmerPhase * 800f, y = 220f)
+        start = Offset(x = -400f + phases.shimmerPhase * 800f, y = 0f),
+        end = Offset(x = 400f + phases.shimmerPhase * 800f, y = 220f)
     )
 
     Box(
@@ -902,21 +1040,27 @@ private fun FancyStreamingModelBlock(
             .padding(horizontal = 10.dp, vertical = 10.dp)
     ) {
         Column {
-            FancyStreamingHeader(ttftActive = ttftActive, outline = onOutline)
+            FancyStreamingHeader(ttftActive = ttftActive, outline = onOutline, dotAlpha = phases.headerDotAlpha)
 
             Spacer(Modifier.height(10.dp))
 
             if (ttftActive) {
-                TtftIndicator()
+                TtftIndicator(
+                    dot1 = phases.ttftDot1,
+                    dot2 = phases.ttftDot2,
+                    dot3 = phases.ttftDot3,
+                    shimmerPhase = phases.ttftShimmerPhase
+                )
             } else {
                 StreamingMonospaceTextWithCursor(
-                    raw = raw.ifBlank { "Validating…" }
+                    raw = raw.ifBlank { "Validating…" },
+                    cursorAlpha = phases.cursorAlpha
                 )
             }
 
             Spacer(Modifier.height(12.dp))
 
-            StreamingMiniShimmerBar()
+            StreamingMiniShimmerBar(phase = phases.miniBarPhase)
         }
     }
 }
@@ -924,24 +1068,14 @@ private fun FancyStreamingModelBlock(
 @Composable
 private fun StreamingMonospaceTextWithCursor(
     raw: String,
+    cursorAlpha: Float,
     modifier: Modifier = Modifier
 ) {
-    val infinite = rememberInfiniteTransition(label = "cursor")
-    val a by infinite.animateFloat(
-        initialValue = 0.0f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 650, easing = LinearEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "cursorAlpha"
-    )
-
     var layoutResult by remember { mutableStateOf<TextLayoutResult?>(null) }
     val textToRender = raw
 
     val baseColor = MaterialTheme.colorScheme.onSurfaceVariant
-    val cursorColor = baseColor.copy(alpha = a)
+    val cursorColor = baseColor.copy(alpha = cursorAlpha)
 
     Text(
         text = textToRender,
@@ -970,20 +1104,9 @@ private fun StreamingMonospaceTextWithCursor(
 @Composable
 private fun FancyStreamingHeader(
     ttftActive: Boolean,
-    outline: androidx.compose.ui.graphics.Color
+    outline: androidx.compose.ui.graphics.Color,
+    dotAlpha: Float
 ) {
-    val infinite = rememberInfiniteTransition(label = "streamHeader")
-
-    val dotAlpha by infinite.animateFloat(
-        initialValue = 0.25f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 650, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "dotAlpha"
-    )
-
     val chipShape = RoundedCornerShape(999.dp)
 
     Row(
@@ -1037,18 +1160,7 @@ private fun FancyStreamingHeader(
 }
 
 @Composable
-private fun StreamingMiniShimmerBar() {
-    val infinite = rememberInfiniteTransition(label = "miniBar")
-    val phase by infinite.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 900, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "miniPhase"
-    )
-
+private fun StreamingMiniShimmerBar(phase: Float) {
     val barShape = RoundedCornerShape(999.dp)
 
     BoxWithConstraints(
@@ -1080,48 +1192,13 @@ private fun StreamingMiniShimmerBar() {
 }
 
 @Composable
-private fun TtftIndicator(modifier: Modifier = Modifier) {
-
-    val infinite = rememberInfiniteTransition(label = "ttft")
-
-    val dot1 by infinite.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 520, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "dot1"
-    )
-    val dot2 by infinite.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 520, delayMillis = 140, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "dot2"
-    )
-    val dot3 by infinite.animateFloat(
-        initialValue = 0.35f,
-        targetValue = 1.0f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 520, delayMillis = 280, easing = FastOutSlowInEasing),
-            repeatMode = RepeatMode.Reverse
-        ),
-        label = "dot3"
-    )
-
-    val shimmerPhase by infinite.animateFloat(
-        initialValue = 0f,
-        targetValue = 1f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(durationMillis = 1050, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        ),
-        label = "shimmer"
-    )
-
+private fun TtftIndicator(
+    dot1: Float,
+    dot2: Float,
+    dot3: Float,
+    shimmerPhase: Float,
+    modifier: Modifier = Modifier
+) {
     val base = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.35f)
 
     Column(modifier = modifier.fillMaxWidth()) {
@@ -1156,7 +1233,6 @@ private fun TtftIndicator(modifier: Modifier = Modifier) {
                 .clip(barShape)
                 .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.35f))
         ) {
-
             val wPx = with(androidx.compose.ui.platform.LocalDensity.current) { maxWidth.toPx() }.coerceAtLeast(1f)
             val x = (shimmerPhase * 2f - 1f) * wPx
 
@@ -1339,7 +1415,7 @@ private fun normalizeFollowUp(text: String?): String? {
 private class ChatQuestionViewModelFactory(
     private val questionId: String,
     private val prompt: String,
-    private val validator: AnswerValidator,
+    private val validator: AnswerValidatorI,
     private val streamBridge: ChatStreamBridge,
     private val draftStore: ChatDraftStore,
     private val draftKey: DraftKey

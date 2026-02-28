@@ -17,6 +17,8 @@ import android.content.Context
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
+import android.os.SystemClock
+import androidx.annotation.RequiresApi
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
@@ -54,6 +56,9 @@ object CrashCapture {
     /** Keep at most this many pending crash reports. */
     private const val MAX_PENDING_CRASH_FILES: Int = 16
 
+    /** Delete stale tmp crash files older than this. */
+    private const val STALE_TMP_AGE_MS: Long = 24L * 60L * 60L * 1000L // 24h
+
     private val installed = AtomicBoolean(false)
     private val handlingCrash = AtomicBoolean(false)
 
@@ -79,12 +84,12 @@ object CrashCapture {
 
     /** key[:=]value patterns (keeps separator). */
     private val reKeyValue = Regex(
-        "(?i)\\b(token|secret|apikey|api_key|password|access_token|refresh_token)\\b\\s*([:=])\\s*([^\\s\"']+)"
+        "(?i)\\b(token|secret|apikey|api_key|password|access_token|refresh_token|session|cookie)\\b\\s*([:=])\\s*([^\\s\"']+)"
     )
 
     /** JSON-ish: "key": "value" for sensitive keys. */
     private val reKeyValueJson = Regex(
-        "(?i)\"\\s*(token|secret|apikey|api_key|password|access_token|refresh_token)\\s*\"\\s*:\\s*\"\\s*[^\"]+\\s*\""
+        "(?i)\"\\s*(token|secret|apikey|api_key|password|access_token|refresh_token|session|cookie)\\s*\"\\s*:\\s*\"\\s*[^\"]+\\s*\""
     )
 
     /** GitHub tokens. */
@@ -93,6 +98,9 @@ object CrashCapture {
 
     /** Google API keys. */
     private val reGcpApiKey = Regex("\\bAIza[0-9A-Za-z\\-_]{35}\\b")
+
+    /** JWT-like token (best-effort). */
+    private val reJwt = Regex("\\beyJ[A-Za-z0-9_\\-]{10,}\\.[A-Za-z0-9_\\-]{10,}\\.[A-Za-z0-9_\\-]{10,}\\b")
 
     /** Email addresses (common PII). */
     private val reEmail = Regex("(?i)\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b")
@@ -104,6 +112,7 @@ object CrashCapture {
      * - Safe to call multiple times.
      * - Uses applicationContext to avoid leaking an Activity.
      */
+    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
     fun install(context: Context) {
         if (!installed.compareAndSet(false, true)) return
 
@@ -124,7 +133,7 @@ object CrashCapture {
 
             try {
                 runCatching {
-                    AppLog.e(TAG, "uncaught: thread=${thread.name} pid=${Process.myPid()}", throwable)
+                    AppLog.e(TAG, "uncaught: thread=${thread.name} tid=${thread.threadId()} pid=${Process.myPid()}", throwable)
                 }
                 runCatching {
                     writeCrashFile(appContext, thread, throwable)
@@ -146,13 +155,14 @@ object CrashCapture {
     fun pendingCrashFiles(context: Context): List<File> =
         LogFiles.listPendingCrashLogs(context.applicationContext)
 
+    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
     private fun writeCrashFile(context: Context, thread: Thread, t: Throwable) {
         val appContext = context.applicationContext
 
         val dir = LogFiles.crashPendingDir(appContext)
         if (!dir.exists()) runCatching { dir.mkdirs() }
 
-        // Prevent unbounded growth.
+        // Prevent unbounded growth (including tmp leftovers).
         pruneOldPendingCrashes(dir)
 
         val utcCompact = LogFiles.utcCompactNow()
@@ -168,6 +178,8 @@ object CrashCapture {
         val versionCode = safeVersionCode(appContext)
         val safeInstallId = runCatching { LogFiles.installId(appContext).take(8) }.getOrDefault("unknown")
 
+        val uptimeMs = runCatching { SystemClock.elapsedRealtime() }.getOrDefault(-1L)
+
         // Best-effort: write to tmp then rename into place.
         FileOutputStream(tmp, false).use { fos ->
             val limited = LimitedOutputStream(fos, MAX_REPORT_BYTES)
@@ -177,9 +189,12 @@ object CrashCapture {
                     pw.println("===== Survey App Crash Report =====")
                     pw.println("utcCompact=$utcCompact")
                     pw.println("thread=${thread.name}")
+                    pw.println("threadId=${thread.threadId()}")
                     pw.println("pid=$pid")
+                    pw.println("uptimeMs=$uptimeMs")
                     pw.println("sdk=${Build.VERSION.SDK_INT}")
                     pw.println("device=${Build.MANUFACTURER}/${Build.MODEL}")
+                    pw.println("fingerprint=${Build.FINGERPRINT}")
                     pw.println("abis=${Build.SUPPORTED_ABIS.joinToString(",")}")
                     pw.println("appId=$pkg")
                     pw.println("versionName=$versionName")
@@ -209,9 +224,12 @@ object CrashCapture {
                         pw.println("===== Survey App Crash Report =====")
                         pw.println("utcCompact=$utcCompact")
                         pw.println("thread=${thread.name}")
+                        pw.println("threadId=${thread.threadId()}")
                         pw.println("pid=$pid")
+                        pw.println("uptimeMs=$uptimeMs")
                         pw.println("sdk=${Build.VERSION.SDK_INT}")
                         pw.println("device=${Build.MANUFACTURER}/${Build.MODEL}")
+                        pw.println("fingerprint=${Build.FINGERPRINT}")
                         pw.println("abis=${Build.SUPPORTED_ABIS.joinToString(",")}")
                         pw.println("appId=$pkg")
                         pw.println("versionName=$versionName")
@@ -227,6 +245,9 @@ object CrashCapture {
                 }
                 runCatching { fos.fd.sync() }
             }
+            runCatching { tmp.delete() }
+        } else {
+            // Best-effort cleanup (should already be gone after rename).
             runCatching { tmp.delete() }
         }
     }
@@ -258,15 +279,29 @@ object CrashCapture {
         s = s.replace(reGitHubClassic, "<REDACTED_GH_TOKEN>")
         s = s.replace(reGitHubPat, "<REDACTED_GH_TOKEN>")
         s = s.replace(reGcpApiKey, "<REDACTED_GCP_KEY>")
+        s = s.replace(reJwt, "<REDACTED_JWT>")
         s = s.replace(reEmail, "<REDACTED_EMAIL>")
 
         return s
     }
 
     private fun pruneOldPendingCrashes(dir: File) {
+        val now = System.currentTimeMillis()
+
+        // 1) Remove stale tmp leftovers.
+        dir.listFiles()
+            ?.filter { it.isFile && it.name.startsWith("crash-") && it.name.endsWith(".tmp") }
+            ?.forEach { f ->
+                val age = now - (f.lastModified().takeIf { it > 0L } ?: now)
+                if (age >= STALE_TMP_AGE_MS) {
+                    runCatching { f.delete() }
+                }
+            }
+
+        // 2) Keep only the newest N crash reports.
         val files = dir.listFiles()
             ?.filter { it.isFile && it.name.startsWith("crash-") && it.name.endsWith(".txt") }
-            ?.sortedByDescending { it.lastModified() }
+            ?.sortedWith(compareByDescending<File> { it.name }.thenByDescending { it.lastModified() })
             .orEmpty()
 
         if (files.size <= MAX_PENDING_CRASH_FILES) return

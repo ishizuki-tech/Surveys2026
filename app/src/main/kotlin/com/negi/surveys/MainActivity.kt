@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
+import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -28,6 +29,7 @@ import androidx.compose.ui.Modifier
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.logging.CrashCapture
 import com.negi.surveys.logging.GitHubLogUploadManager
+import com.negi.surveys.logging.SafeLog
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 
@@ -57,8 +59,7 @@ class MainActivity : ComponentActivity() {
         // Enable edge-to-edge layout so the app shell can correctly handle system insets.
         enableEdgeToEdge()
 
-        val startup = buildStartupLog(savedInstanceState)
-        AppLog.i(TAG, startup)
+        SafeLog.i(TAG_MAIN, buildStartupLog(savedInstanceState))
 
         setContent {
             MaterialTheme {
@@ -73,8 +74,10 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private const val TAG = "MainActivity"
-private const val BOOT_TAG = "AppBootstrap"
+private const val TAG_MAIN = "MainActivity"
+private const val TAG_BOOT = "AppBootstrap"
+private const val TAG_UPLOAD = "PendingCrashUpload"
+
 private const val THREAD_NAME = "PendingCrashUpload"
 private const val ERR_MSG_MAX = 220
 
@@ -92,7 +95,7 @@ private object AppBootstrap {
         val appCtx = context.applicationContext
         if (!started.compareAndSet(false, true)) {
             // Already initialized in this process.
-            AppLog.d(BOOT_TAG, "bootstrap: already initialized (skip)")
+            SafeLog.d(TAG_BOOT, "bootstrap: already initialized (skip)")
             return
         }
 
@@ -103,23 +106,25 @@ private object AppBootstrap {
             AppLog.init(appCtx)
         }.onFailure { t ->
             // Fall back to Logcat only; do not crash.
-            AppLog.w(BOOT_TAG, "AppLog.init failed (non-fatal): ${t.javaClass.simpleName}", t)
+            SafeLog.w(TAG_BOOT, "AppLog.init failed (non-fatal): ${t.javaClass.simpleName}", t)
         }
 
         // Install crash capture as early as possible (still best-effort).
         runCatching {
             CrashCapture.install(appCtx)
         }.onFailure { t ->
-            AppLog.w(BOOT_TAG, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}", t)
-            // If AppLog is partially available, record it too.
-            runCatching { AppLog.w(BOOT_TAG, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}") }
+            SafeLog.w(TAG_BOOT, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}", t)
         }
 
         // Attempt to upload any pending crash logs from a previous session (best-effort).
         PendingCrashUploadKickoff.tryStart(appCtx)
 
         val dt = SystemClock.elapsedRealtime() - t0
-        runCatching { AppLog.i(BOOT_TAG, "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()}") }
+        SafeLog.i(
+            TAG_BOOT,
+            "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()} " +
+                    "build=${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
+        )
     }
 }
 
@@ -136,7 +141,7 @@ private object PendingCrashUploadKickoff {
     fun tryStart(context: Context) {
         val appCtx = context.applicationContext
         if (!started.compareAndSet(false, true)) {
-            AppLog.d(TAG, "pending crash upload: already started in this process (skip)")
+            SafeLog.d(TAG_UPLOAD, "pending crash upload: already started in this process (skip)")
             return
         }
         kickOffPendingCrashUpload(appCtx)
@@ -161,29 +166,39 @@ private fun kickOffPendingCrashUpload(context: Context) {
             val appCtx = context.applicationContext
             val t0 = SystemClock.elapsedRealtime()
 
+            // Ensure we see unexpected crashes inside this worker thread.
+            Thread.currentThread().uncaughtExceptionHandler =
+                Thread.UncaughtExceptionHandler { _, e ->
+                    SafeLog.e(TAG_UPLOAD, "pending crash upload: uncaught exception", e)
+                }
+
+            // Lower priority: this should never compete with first-frame UI.
+            runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND) }
+
             try {
                 // Snapshot configuration early for deterministic logs.
                 val ghConfigured = runCatching { GitHubLogUploadManager.isConfigured() }.getOrDefault(false)
                 val pending0 = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
 
-                AppLog.i(
-                    TAG,
+                SafeLog.i(
+                    TAG_UPLOAD,
                     "pending crash upload: start pending=$pending0 " +
                             "ghConfigured=$ghConfigured " +
                             "pid=${Process.myPid()} " +
                             "build=${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
                 )
 
-                if (pending0 <= 0) {
-                    AppLog.i(TAG, "pending crash upload: none")
+                if (pending0 == 0) {
+                    SafeLog.i(TAG_UPLOAD, "pending crash upload: none")
                     return@thread
                 }
 
                 if (!ghConfigured) {
-                    AppLog.w(TAG, "pending crash upload: GitHub not configured; skip")
+                    SafeLog.w(TAG_UPLOAD, "pending crash upload: GitHub not configured; skip")
                     return@thread
                 }
 
+                // If pending0 < 0, the count failed; still attempt upload best-effort.
                 runCatching {
                     val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
 
@@ -192,30 +207,31 @@ private fun kickOffPendingCrashUpload(context: Context) {
                     val err = r.exceptionOrNull()
                     val errMsg = err?.message?.replace('\n', ' ')?.take(ERR_MSG_MAX).orEmpty()
 
-                    AppLog.i(
-                        TAG,
+                    SafeLog.i(
+                        TAG_UPLOAD,
                         "pending crash upload (GitHub): pendingBefore=$pendingBefore ok=${r.isSuccess} " +
-                                "result=${r.getOrNull()} err=${err?.javaClass?.simpleName} msg=${if (errMsg.isBlank()) "-" else errMsg}"
+                                "result=${r.getOrNull()} err=${err?.javaClass?.simpleName} " +
+                                "msg=${if (errMsg.isBlank()) "-" else errMsg}"
                     )
 
                     if (err != null) {
-                        AppLog.e(TAG, "pending crash upload (GitHub) failed", err)
+                        SafeLog.e(TAG_UPLOAD, "pending crash upload (GitHub) failed", err)
                     }
                 }.onFailure { t ->
-                    AppLog.e(TAG, "pending crash upload (GitHub) failed", t)
+                    SafeLog.e(TAG_UPLOAD, "pending crash upload (GitHub) failed", t)
                 }
 
                 val pendingAfter = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
-                AppLog.i(TAG, "pending crash upload: end pendingAfter=$pendingAfter")
+                SafeLog.i(TAG_UPLOAD, "pending crash upload: end pendingAfter=$pendingAfter")
             } catch (t: Throwable) {
-                AppLog.e(TAG, "kickOffPendingCrashUpload: unexpected failure", t)
+                SafeLog.e(TAG_UPLOAD, "kickOffPendingCrashUpload: unexpected failure", t)
             } finally {
                 val dt = SystemClock.elapsedRealtime() - t0
-                AppLog.i(TAG, "pending crash upload: done in ${dt}ms")
+                SafeLog.i(TAG_UPLOAD, "pending crash upload: done in ${dt}ms")
             }
         }
     }.onFailure { t ->
-        AppLog.w(TAG, "Failed to start PendingCrashUpload thread (non-fatal): ${t.javaClass.simpleName}")
+        SafeLog.w(TAG_UPLOAD, "Failed to start PendingCrashUpload thread (non-fatal): ${t.javaClass.simpleName}", t)
     }
 }
 
@@ -228,12 +244,10 @@ private fun kickOffPendingCrashUpload(context: Context) {
  */
 private fun buildStartupLog(savedInstanceState: Bundle?): String {
     val recreation = savedInstanceState != null
-
     // Keep log content non-sensitive.
     val buildLabel =
         "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
                 "${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
-
     return "onCreate: sdk=${Build.VERSION.SDK_INT} " +
             "device=${Build.MANUFACTURER}/${Build.MODEL} " +
             "pid=${Process.myPid()} uid=${Process.myUid()} " +

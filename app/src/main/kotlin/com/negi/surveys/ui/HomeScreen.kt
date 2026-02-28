@@ -13,6 +13,7 @@
 
 package com.negi.surveys.ui
 
+import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
@@ -32,20 +33,17 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
-import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.AppLog
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 private const val TAG = "HomeScreen"
+private const val CLICK_COOLDOWN_MS = 350L
 
 /**
  * Home screen (frame-ready).
@@ -57,6 +55,7 @@ private const val TAG = "HomeScreen"
  *
  * Notes:
  * - Warmup is handled at the app root (SurveyAppRoot) to avoid duplication.
+ * - Click guard is time-based (elapsedRealtime) to stay deterministic and avoid coroutine cancellation edge cases.
  */
 @Composable
 fun HomeScreen(
@@ -69,32 +68,31 @@ fun HomeScreen(
     val latestOnStartSurvey by rememberUpdatedState(onStartSurvey)
     val latestOnExport by rememberUpdatedState(onExport)
 
-    val scope = rememberCoroutineScope()
-
-    // Simple click guard to prevent double navigation due to rapid taps.
-    var clickLocked by remember { mutableStateOf(false) }
+    // Simple click cooldown to prevent double navigation due to rapid taps.
+    var lastClickAtMs by remember { mutableLongStateOf(0L) }
 
     fun runGuardedClick(actionName: String, block: () -> Unit) {
-        if (clickLocked) {
-            AppLog.w(TAG, "click: ignored (locked) action=$actionName")
+        val now = SystemClock.elapsedRealtime()
+        val delta = now - lastClickAtMs
+
+        if (delta in 0 until CLICK_COOLDOWN_MS) {
+            AppLog.w(TAG, "click: ignored (cooldown ${delta}ms) action=$actionName")
             return
         }
-        clickLocked = true
-        AppLog.i(TAG, "click: $actionName")
-        block()
 
-        // Unlock shortly after to avoid accidental double triggers.
-        scope.launch {
-            delay(350L)
-            clickLocked = false
-        }
+        lastClickAtMs = now
+        AppLog.i(TAG, "click: $actionName")
+
+        runCatching { block() }
+            .onFailure { t ->
+                // If a callback throws, allow retry immediately by resetting the guard.
+                lastClickAtMs = 0L
+                AppLog.w(TAG, "click handler failed (guard reset): ${t.javaClass.simpleName}(${t.message})", t)
+            }
     }
 
-    // Debug-only "composed" trace (PII-safe).
-    if (BuildConfig.DEBUG) {
-        LaunchedEffect(Unit) {
-            AppLog.d(TAG, "composed")
-        }
+    LaunchedEffect(Unit) {
+        AppLog.d(TAG, "composed")
     }
 
     Column(

@@ -14,6 +14,7 @@
 package com.negi.surveys.logging
 
 import android.content.Context
+import android.os.SystemClock
 import android.util.Base64
 import com.negi.surveys.BuildConfig
 import java.io.File
@@ -22,6 +23,7 @@ import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
+import java.util.concurrent.ThreadLocalRandom
 import kotlin.math.min
 import org.json.JSONObject
 
@@ -43,11 +45,15 @@ import org.json.JSONObject
  * - BuildConfig fields are resolved via reflection (supports both GH_* and GITHUB_* without compile-time coupling).
  * - Size cap is conservative to reduce memory spikes (base64 + JSON).
  * - Retries for transient failures (5xx/429), and conflict retry (409) by re-fetching sha.
+ * - Retry-After header support (best-effort) for 429/secondary rate limiting.
  */
 object GitHubLogUploadManager {
     private const val TAG = "GitHubLogUpload"
     private const val API_BASE = "https://api.github.com"
     private const val API_VERSION = "2022-11-28"
+
+    private const val CONNECT_TIMEOUT_MS: Int = 25_000
+    private const val READ_TIMEOUT_MS: Int = 45_000
 
     /**
      * Soft safety cap.
@@ -57,6 +63,14 @@ object GitHubLogUploadManager {
      * - Keep this conservative for field stability; raise only if you truly need it.
      */
     private const val SOFT_MAX_BYTES: Long = 16L * 1024L * 1024L // 16 MiB
+
+    /**
+     * Additional sanity cap on Base64 character count (roughly 4/3 expansion).
+     *
+     * Notes:
+     * - Helps avoid large transient allocations from Base64 + JSON + UTF-8 encoding.
+     */
+    private const val SOFT_MAX_B64_CHARS: Int = 24 * 1024 * 1024 // 24M chars
 
     /** Retry count for transient HTTP failures. */
     private const val MAX_RETRIES: Int = 3
@@ -156,7 +170,7 @@ object GitHubLogUploadManager {
      *
      * Call this on a background thread. Intended to be invoked at app start.
      *
-     * @return Result.success(uploadedCrashCount) on success
+     * @return Result.success(movedCrashCount) on success
      */
     fun tryUploadPendingCrashesBlocking(context: Context): Result<Int> {
         val cfg = cfgOrNull()
@@ -187,7 +201,7 @@ object GitHubLogUploadManager {
         val result = uploadZipAsRepoContent(cfg = cfg, zipFile = zip, repoPath = remotePath, commitHint = "crash logs")
         runCatching { zip.delete() }
 
-        return result.map {
+        return result.map { uploadedRepoPath ->
             // Move crash files to uploaded/ only if upload succeeded.
             val uploadedDir = LogFiles.crashUploadedDir(context)
             if (!uploadedDir.exists()) runCatching { uploadedDir.mkdirs() }
@@ -220,8 +234,8 @@ object GitHubLogUploadManager {
                 }
             }
 
-            AppLog.i(TAG, "uploadCrash: ok path=$it moved=$moved")
-            pending.size
+            AppLog.i(TAG, "uploadCrash: ok path=$uploadedRepoPath pending=${pending.size} moved=$moved")
+            moved
         }.onFailure { t ->
             AppLog.e(TAG, "uploadCrash: failed", t)
         }
@@ -247,6 +261,8 @@ object GitHubLogUploadManager {
             )
         }
 
+        val uploadStartMs = SystemClock.elapsedRealtime()
+
         // Read bytes (kept conservative by SOFT_MAX_BYTES).
         val bytes = runCatching { zipFile.readBytes() }.getOrElse { return Result.failure(it) }
 
@@ -254,6 +270,14 @@ object GitHubLogUploadManager {
         val estimatedB64Chars = estimateBase64Chars(bytes.size)
         if (estimatedB64Chars <= 0) {
             return Result.failure(IllegalStateException("Invalid Base64 size estimation."))
+        }
+        if (estimatedB64Chars > SOFT_MAX_B64_CHARS) {
+            return Result.failure(
+                IllegalStateException(
+                    "Bundle too large after Base64 expansion (estimatedB64Chars=$estimatedB64Chars). " +
+                            "Reduce bundle size; Contents API JSON payload becomes unstable."
+                )
+            )
         }
 
         val contentB64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
@@ -263,17 +287,29 @@ object GitHubLogUploadManager {
         val endpoint = "$API_BASE/repos/${cfg.owner}/${cfg.repo}/contents/$encodedPath"
 
         return runCatching {
-            var existingSha: String? = null
+            val uploadId = LogFiles.utcCompactNow()
+            AppLog.i(
+                TAG,
+                "upload: begin uploadId=$uploadId path=$repoPath rawBytes=${bytes.size} b64Chars=${contentB64.length} branch=${cfg.branch}"
+            )
 
             // Try to get SHA (non-fatal if missing).
-            existingSha = runCatching {
+            var existingSha: String? = runCatching {
                 getExistingShaIfAny(endpoint = endpoint, branch = cfg.branch, token = cfg.token)
             }.getOrNull()
 
-            // PUT with retry/backoff; on 409 refetch sha and retry.
+            if (existingSha != null) {
+                AppLog.d(TAG, "upload: existing sha detected uploadId=$uploadId path=$repoPath")
+            } else {
+                AppLog.d(TAG, "upload: no existing sha (new file) uploadId=$uploadId path=$repoPath")
+            }
+
             var lastError: Throwable? = null
             for (attempt in 0 until MAX_RETRIES) {
+                val attemptNo = attempt + 1
                 try {
+                    AppLog.d(TAG, "upload: attempt=$attemptNo/$MAX_RETRIES uploadId=$uploadId path=$repoPath")
+
                     val body = JSONObject().apply {
                         put("message", buildCommitMessage(commitHint, repoPath))
                         put("content", contentB64)
@@ -286,39 +322,58 @@ object GitHubLogUploadManager {
                             }
                         )
                         if (existingSha != null) put("sha", existingSha)
-                    }
+                    }.toString()
 
                     httpPutJson(
                         url = endpoint,
                         token = cfg.token,
-                        bodyJson = body.toString()
+                        bodyJson = body
                     )
 
-                    // Success
+                    val elapsed = SystemClock.elapsedRealtime() - uploadStartMs
+                    AppLog.i(TAG, "upload: success uploadId=$uploadId path=$repoPath elapsedMs=$elapsed")
                     return@runCatching repoPath
                 } catch (e: GitHubHttpException) {
                     lastError = e
 
-                    // 409 often indicates sha mismatch / conflict; refetch sha and retry once.
-                    if (e.code == 409) {
+                    // 409 often indicates sha mismatch / conflict; refetch sha and retry.
+                    if (e.code == 409 && attempt < MAX_RETRIES - 1) {
+                        AppLog.w(TAG, "upload: conflict(409) refetch sha uploadId=$uploadId path=$repoPath")
                         existingSha = runCatching {
                             getExistingShaIfAny(endpoint = endpoint, branch = cfg.branch, token = cfg.token)
                         }.getOrNull()
-                        backoff(attempt)
+                        sleepBackoffMs(
+                            attempt = attempt,
+                            retryAfterMs = e.retryAfterMs,
+                            hint = "409-conflict"
+                        )
                         continue
                     }
 
                     // Retry transient issues only.
-                    if (isRetryable(e.code) && attempt < MAX_RETRIES - 1) {
-                        backoff(attempt)
+                    if (isRetryable(code = e.code, body = e.body) && attempt < MAX_RETRIES - 1) {
+                        AppLog.w(
+                            TAG,
+                            "upload: retryable http=${e.code} uploadId=$uploadId path=$repoPath " +
+                                    "retryAfterMs=${e.retryAfterMs ?: -1} rateRemaining=${e.rateLimitRemaining ?: "?"}"
+                        )
+                        sleepBackoffMs(
+                            attempt = attempt,
+                            retryAfterMs = e.retryAfterMs,
+                            hint = "http-${e.code}"
+                        )
                         continue
                     }
 
-                    throw IOException("HTTP ${e.code}: ${summarizeGitHubError(e.body)}")
+                    throw IOException(
+                        "HTTP ${e.code}: ${summarizeGitHubError(e.body)}" +
+                                (e.rateLimitRemaining?.let { " | rateRemaining=$it" } ?: "")
+                    )
                 } catch (e: IOException) {
                     lastError = e
                     if (attempt < MAX_RETRIES - 1) {
-                        backoff(attempt)
+                        AppLog.w(TAG, "upload: io retry uploadId=$uploadId path=$repoPath err=${e.message}")
+                        sleepBackoffMs(attempt = attempt, retryAfterMs = null, hint = "io")
                         continue
                     }
                     throw e
@@ -346,8 +401,8 @@ object GitHubLogUploadManager {
         val conn = (URL(url).openConnection() as HttpURLConnection)
         try {
             conn.requestMethod = "GET"
-            conn.connectTimeout = 20_000
-            conn.readTimeout = 30_000
+            conn.connectTimeout = CONNECT_TIMEOUT_MS
+            conn.readTimeout = READ_TIMEOUT_MS
             conn.useCaches = false
             conn.instanceFollowRedirects = true
             conn.setRequestProperty("Accept", "application/vnd.github+json")
@@ -362,7 +417,13 @@ object GitHubLogUploadManager {
             val resp = readResponseBody(conn, ok)
 
             if (!ok) {
-                throw GitHubHttpException(code = code, body = resp)
+                throw GitHubHttpException(
+                    code = code,
+                    body = resp,
+                    retryAfterMs = parseRetryAfterMs(conn),
+                    rateLimitRemaining = conn.getHeaderField("X-RateLimit-Remaining"),
+                    rateLimitReset = conn.getHeaderField("X-RateLimit-Reset")
+                )
             }
             return resp
         } finally {
@@ -375,8 +436,8 @@ object GitHubLogUploadManager {
         try {
             conn.requestMethod = "PUT"
             conn.doOutput = true
-            conn.connectTimeout = 25_000
-            conn.readTimeout = 40_000
+            conn.connectTimeout = CONNECT_TIMEOUT_MS
+            conn.readTimeout = READ_TIMEOUT_MS
             conn.useCaches = false
             conn.instanceFollowRedirects = true
             conn.setRequestProperty("Accept", "application/vnd.github+json")
@@ -384,6 +445,9 @@ object GitHubLogUploadManager {
             conn.setRequestProperty("Authorization", "Bearer $token")
             conn.setRequestProperty("User-Agent", "SurveyApp-LogUploader")
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+
+            // Best-effort: avoid internal buffering of the entire request body in some stacks.
+            runCatching { conn.setFixedLengthStreamingMode(bodyJson.toByteArray(Charsets.UTF_8).size) }
 
             conn.outputStream.use { os ->
                 os.write(bodyJson.toByteArray(Charsets.UTF_8))
@@ -395,7 +459,13 @@ object GitHubLogUploadManager {
             val resp = readResponseBody(conn, ok)
 
             if (!ok) {
-                throw GitHubHttpException(code = code, body = resp)
+                throw GitHubHttpException(
+                    code = code,
+                    body = resp,
+                    retryAfterMs = parseRetryAfterMs(conn),
+                    rateLimitRemaining = conn.getHeaderField("X-RateLimit-Remaining"),
+                    rateLimitReset = conn.getHeaderField("X-RateLimit-Reset")
+                )
             }
         } finally {
             runCatching { conn.disconnect() }
@@ -453,14 +523,36 @@ object GitHubLogUploadManager {
         }
     }
 
-    private fun isRetryable(code: Int): Boolean {
+    private fun isRetryable(code: Int, body: String): Boolean {
         // 429: rate/secondary limit; 5xx: transient server errors.
-        return code == 429 || code in 500..599
+        if (code == 429) return true
+        if (code in 500..599) return true
+
+        // GitHub may return 403 for secondary rate limits in some cases.
+        if (code == 403) {
+            val b = body.lowercase()
+            if (b.contains("rate limit") || b.contains("secondary rate") || b.contains("abuse detection")) {
+                return true
+            }
+        }
+        return false
     }
 
-    private fun backoff(attempt: Int) {
-        val ms = BACKOFF_BASE_MS * (attempt + 1)
-        runCatching { Thread.sleep(ms) }
+    private fun parseRetryAfterMs(conn: HttpURLConnection): Long? {
+        val raw = conn.getHeaderField("Retry-After")?.trim().orEmpty()
+        val sec = raw.toLongOrNull() ?: return null
+        if (sec <= 0L) return null
+        return sec * 1000L
+    }
+
+    private fun sleepBackoffMs(attempt: Int, retryAfterMs: Long?, hint: String) {
+        val jitter = ThreadLocalRandom.current().nextLong(0L, 250L)
+        val exp = (attempt + 1).toLong()
+        val base = BACKOFF_BASE_MS * exp * exp
+        val ms = (retryAfterMs ?: base) + jitter
+        val clamped = ms.coerceIn(200L, 30_000L)
+        AppLog.d(TAG, "backoff: hint=$hint attempt=${attempt + 1} sleepMs=$clamped")
+        runCatching { Thread.sleep(clamped) }
     }
 
     private fun estimateBase64Chars(byteCount: Int): Int {
@@ -493,6 +585,9 @@ object GitHubLogUploadManager {
 
     private class GitHubHttpException(
         val code: Int,
-        val body: String
+        val body: String,
+        val retryAfterMs: Long?,
+        val rateLimitRemaining: String?,
+        val rateLimitReset: String?
     ) : IOException("HTTP $code")
 }

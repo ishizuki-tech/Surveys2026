@@ -15,7 +15,7 @@ package com.negi.surveys
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.negi.surveys.logging.AppLog
+import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.ui.ReviewChatLine
 import com.negi.surveys.ui.ReviewQuestionLog
 import com.negi.surveys.ui.ReviewTimelineItem
@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.flow.updateAndGet
 
 /**
@@ -115,11 +116,12 @@ class SurveySessionViewModel : ViewModel() {
     fun upsertLog(log: ReviewQuestionLog) {
         val key = log.questionId.trim()
         if (key.isEmpty()) {
-            AppLog.w(TAG, "upsertLog: ignored (blank questionId)")
+            SafeLog.w(TAG, "upsertLog: ignored (blank questionId)")
             return
         }
 
-        val normalized = if (key == log.questionId) log else log.copy(questionId = key)
+        // Snapshot potential mutable lists to avoid external mutation after insertion.
+        val normalized = normalizeIncomingLog(log, key)
 
         val after = _logsMap.updateAndGet { prev ->
             val existing = prev[key]
@@ -135,12 +137,14 @@ class SurveySessionViewModel : ViewModel() {
         // Reference check is intentional: we want to know if *this exact incoming instance* won.
         val accepted = after[key] === normalized
 
+        val lineChars = transcriptCharCount(normalized.lines)
+        val payloadLen = normalized.completionPayload.length
+
         if (accepted) {
-            AppLog.d(
+            SafeLog.d(
                 TAG,
                 "upsertLog: accepted qid=$key skipped=${normalized.isSkipped} " +
-                        "lines=${normalized.lines.size} lineChars=${transcriptCharCount(normalized.lines)} " +
-                        "payloadLen=${normalized.completionPayload.length}"
+                        "lines=${normalized.lines.size} lineChars=$lineChars payloadLen=$payloadLen"
             )
         } else {
             val existing = after[key]
@@ -149,18 +153,16 @@ class SurveySessionViewModel : ViewModel() {
                 val exScore = completenessScore(existing)
                 val tie = inScore == exScore && existing.isSkipped == normalized.isSkipped
                 val suffix = if (tie) " tieScore=$inScore" else " inScore=$inScore exScore=$exScore"
-                AppLog.w(
+                SafeLog.w(
                     TAG,
                     "upsertLog: dropped(stale) qid=$key skipped=${normalized.isSkipped} " +
-                            "lines=${normalized.lines.size} lineChars=${transcriptCharCount(normalized.lines)} " +
-                            "payloadLen=${normalized.completionPayload.length}$suffix"
+                            "lines=${normalized.lines.size} lineChars=$lineChars payloadLen=$payloadLen$suffix"
                 )
             } else {
-                AppLog.w(
+                SafeLog.w(
                     TAG,
                     "upsertLog: dropped(stale) qid=$key skipped=${normalized.isSkipped} " +
-                            "lines=${normalized.lines.size} lineChars=${transcriptCharCount(normalized.lines)} " +
-                            "payloadLen=${normalized.completionPayload.length}"
+                            "lines=${normalized.lines.size} lineChars=$lineChars payloadLen=$payloadLen"
                 )
             }
         }
@@ -170,8 +172,8 @@ class SurveySessionViewModel : ViewModel() {
      * Optional: clear the session.
      */
     fun clear() {
-        _logsMap.value = emptyMap()
-        AppLog.i(TAG, "clear: session cleared")
+        _logsMap.update { emptyMap() }
+        SafeLog.i(TAG, "clear: session cleared")
     }
 
     /**
@@ -368,6 +370,23 @@ class SurveySessionViewModel : ViewModel() {
         val number: Int,
         val raw: String
     )
+
+    /**
+     * Normalize and snapshot an incoming log.
+     *
+     * Why:
+     * - Prevent external mutation of transcript lists after insertion.
+     * - Ensure key normalization is applied consistently.
+     */
+    private fun normalizeIncomingLog(log: ReviewQuestionLog, normalizedKey: String): ReviewQuestionLog {
+        val fixedId = if (log.questionId == normalizedKey) log.questionId else normalizedKey
+        val fixedLines = log.lines.toList()
+        return if (fixedId == log.questionId && fixedLines === log.lines) {
+            log
+        } else {
+            log.copy(questionId = fixedId, lines = fixedLines)
+        }
+    }
 
     private companion object {
         private const val TAG = "SurveySessionVM"
