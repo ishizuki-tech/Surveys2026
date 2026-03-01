@@ -12,33 +12,9 @@
  *  ---------------------------------------------------------------------
  *  Compatibility facade over LiteRtLM (NO MediaPipe).
  *
- *  Why:
- *   - MediaPipe GenAI APIs are removed.
- *   - Keep existing call sites using SLM.* with minimal code changes.
- *
- *  Contract:
- *   - Delegates to LiteRtLM which already implements:
- *       • single-active-stream per key
- *       • runId late-callback suppression
- *       • logical done vs native termination separation
- *       • deferred cleanup after native termination
- *
- *  Strengthen (2026-01):
- *   • Avoid compile-time coupling to LiteRtLM method surface (reflection for non-suspend APIs).
- *   • Best-effort overload matching + argument coercion.
- *   • Supports signature drift by trying trimmed argument tails.
- *   • Caches method candidates to reduce reflection overhead.
- *   • Adds a suspend fallback for generateText via streaming when reflection suspend path fails.
- *
- *  Fix (2026-02):
- *   • StreamDeltaNormalizer: reduce false ACCUMULATED decisions on very short prefixes.
- *   • DEBUG_SLM follows BuildConfig.DEBUG (avoid noisy release logs).
- *   • Add isBusy(model) overload for compatibility with older call sites.
- *
- *  Fix (2026-02-19):
- *   • Reflective suspend invocation MUST treat "invoked" as success even if return value is null
- *     (Unit/void-like returns from Method.invoke()).
- *   • Prevent double-execution due to "null == fallback" misclassification.
+ *  Fix (2026-02-28):
+ *   - Remove reflective invocation.
+ *   - Call LiteRtLM APIs directly to avoid “API not present / signature mismatch” false negatives.
  * =====================================================================
  */
 
@@ -52,54 +28,97 @@ import com.google.ai.edge.litertlm.Message
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.logging.AppLog
-import java.lang.reflect.InvocationTargetException
-import java.lang.reflect.Method
-import java.lang.reflect.Modifier
-import java.lang.reflect.Proxy
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
-import kotlin.coroutines.Continuation
-import kotlin.coroutines.intrinsics.COROUTINE_SUSPENDED
-import kotlin.coroutines.resume
-import kotlin.coroutines.resumeWithException
 import kotlinx.coroutines.CancellationException
-import kotlinx.coroutines.suspendCancellableCoroutine
 
 private const val TAG = "SLM"
-
-/** Toggle facade logs (safe to keep enabled in dev builds). */
 private val DEBUG_SLM: Boolean = BuildConfig.DEBUG
 
-/* ───────────────────────────── Logging helpers ───────────────────────────── */
-
-/** Debug log with lazy message construction. */
 private inline fun d(msg: () -> String) {
     if (DEBUG_SLM) AppLog.d(TAG, msg())
 }
 
-/** Warning log with lazy message construction. */
 private inline fun w(t: Throwable? = null, msg: () -> String) {
     if (t != null) AppLog.w(TAG, msg(), t) else AppLog.w(TAG, msg())
 }
 
-/* ───────────────────────────── Public model/config ───────────────────────────── */
+/**
+ * Wrap a callback so it can be invoked at most once.
+ *
+ * Why:
+ * - The underlying runtime may call callbacks asynchronously.
+ * - This facade may also invoke callbacks on synchronous failure paths.
+ * - Without a guard, it is easy to end up with double delivery and UI/state corruption.
+ *
+ * Notes:
+ * - This only guarantees "at most once" for this wrapper instance.
+ * - It does not guarantee ordering relative to other callbacks.
+ */
+private inline fun once0(crossinline block: () -> Unit): () -> Unit {
+    val fired = AtomicBoolean(false)
+    return {
+        if (fired.compareAndSet(false, true)) {
+            block()
+        }
+    }
+}
 
-/** Hardware accelerator options for inference (CPU or GPU). */
-enum class Accelerator(val label: String) { CPU("CPU"), GPU("GPU") }
-
-/** Configuration keys for LLM inference. */
-enum class ConfigKey { MAX_TOKENS, TOP_K, TOP_P, TEMPERATURE, ACCELERATOR }
+/** See [once0]. */
+private inline fun <T> once1(crossinline block: (T) -> Unit): (T) -> Unit {
+    val fired = AtomicBoolean(false)
+    return { v ->
+        if (fired.compareAndSet(false, true)) {
+            block(v)
+        }
+    }
+}
 
 /**
- * Callback to deliver partial or final inference results.
+ * Compute accelerator selection used by the model runtime.
  *
- * @param partialResult Current partial text (delta chunks).
- * @param done True when logical completion is reached for this request.
+ * Implementation detail:
+ * - The config stores accelerator as a label string for backward compatibility with existing
+ *   config formats and any persisted data.
+ */
+enum class Accelerator(val label: String) {
+    CPU("CPU"),
+    GPU("GPU"),
+}
+
+/**
+ * Model configuration keys used by the app layer.
+ *
+ * Stability contract:
+ * - Keep keys stable because configs may be persisted and/or supplied via remote config.
+ * - Treat unknown/missing values as "use defaults".
+ */
+enum class ConfigKey {
+    MAX_TOKENS,
+    TOP_K,
+    TOP_P,
+    TEMPERATURE,
+    ACCELERATOR,
+}
+
+/**
+ * Streaming inference callback.
+ *
+ * @param partialResult Partial text accumulated so far (implementation-defined).
+ * @param done True when generation is logically completed (end-of-turn).
+ *
+ * Important:
+ * - Callers should treat this as a UI streaming signal, not as an exact token boundary guarantee.
  */
 typealias ResultListener = (partialResult: String, done: Boolean) -> Unit
 
-/** Callback invoked ONLY after native termination (safe point for deferred cleanup). */
+/**
+ * Cleanup callback invoked after an inference session ends (success/failure/cancel).
+ *
+ * Important:
+ * - Callers commonly rely on this to release UI locks/spinners.
+ * - We therefore guard for "at most once" delivery in this facade.
+ */
 typealias CleanUpListener = () -> Unit
 
 private const val DEFAULT_MAX_TOKENS = 4096
@@ -107,50 +126,74 @@ private const val DEFAULT_TOP_K = 40
 private const val DEFAULT_TOP_P = 0.9f
 private const val DEFAULT_TEMPERATURE = 0.7f
 
-/** Keep aligned with LiteRtLM absolute bounds. */
+/**
+ * Absolute hard limits enforced by this app layer.
+ *
+ * Rationale:
+ * - Prevent pathological configs from causing long stalls or memory pressure.
+ * - Provide a stable contract regardless of what upstream runtime accepts.
+ */
 private const val ABS_MAX_TOKENS = 4096
-
-/** Conservative temperature bound to avoid weird sampler behavior. */
 private const val ABS_MAX_TEMPERATURE = 2.0f
-
-/** Defensive TOP_K bound (samplers can behave oddly with absurdly large values). */
 private const val ABS_MAX_TOP_K = 2048
 
 /**
- * Represents a model configuration.
+ * Model descriptor that the app passes around.
  *
- * Notes:
- * - LiteRtLM owns the runtime instance lifecycle internally (Engine/Conversation).
- * - This model class is a config + path holder used by the compatibility facade.
+ * @property name Stable identifier used by the runtime.
+ * @property taskPath Local path to the .task file.
+ * @property config Optional per-model overrides.
+ *
+ * Config typing note:
+ * - Values may originate from JSON / remote config / persisted storage,
+ *   so they can be Number or String.
  */
 data class Model(
     val name: String,
     val taskPath: String,
     val config: Map<ConfigKey, Any> = emptyMap(),
 ) {
-    /** Returns the raw model path used by LiteRtLM EngineConfig. */
     fun getPath(): String = taskPath
 
-    /** Lookup an Int config value with a safe fallback. */
     fun getIntConfigValue(key: ConfigKey, default: Int): Int =
-        (config[key] as? Number)?.toInt()
-            ?: (config[key] as? String)?.toIntOrNull()
-            ?: default
+        config[key].toIntOrDefault(default)
 
-    /** Lookup a Float config value with a safe fallback. */
     fun getFloatConfigValue(key: ConfigKey, default: Float): Float =
-        when (val v = config[key]) {
-            is Number -> v.toFloat()
-            is String -> v.toFloatOrNull() ?: default
-            else -> default
-        }
+        config[key].toFloatOrDefault(default)
 
-    /** Lookup a String config value with a safe fallback. */
     fun getStringConfigValue(key: ConfigKey, default: String): String =
         (config[key] as? String) ?: default
 }
 
-/** Parse accelerator label safely and default to GPU for compatibility. */
+/**
+ * Convert a mixed-typed config value to Int safely.
+ *
+ * This intentionally does NOT throw. Any unexpected type becomes default.
+ */
+private fun Any?.toIntOrDefault(default: Int): Int = when (this) {
+    is Number -> this.toInt()
+    is String -> this.trim().toIntOrNull() ?: default
+    else -> default
+}
+
+/**
+ * Convert a mixed-typed config value to Float safely.
+ *
+ * This intentionally does NOT throw. Any unexpected type becomes default.
+ */
+private fun Any?.toFloatOrDefault(default: Float): Float = when (this) {
+    is Number -> this.toFloat()
+    is String -> this.trim().toFloatOrNull() ?: default
+    else -> default
+}
+
+/**
+ * Normalize accelerator label.
+ *
+ * Policy:
+ * - Default to GPU when empty/unknown to preserve legacy behavior.
+ * - Keep exact labels "CPU"/"GPU" because downstream may compare by label.
+ */
 private fun parseAcceleratorLabel(raw: String?): String {
     val s = raw?.trim()?.uppercase(Locale.ROOT).orEmpty()
     return when (s) {
@@ -162,41 +205,43 @@ private fun parseAcceleratorLabel(raw: String?): String {
 }
 
 /**
- * Normalize config value types so downstream reads remain stable:
- * - MAX_TOKENS/TOP_K: Int
- * - TOP_P/TEMPERATURE: Float
- * - ACCELERATOR: String
+ * Normalize numeric config values to concrete Int/Float types.
+ *
+ * Why:
+ * - Remote config / JSON / storage may surface numbers as String, Double, Long, etc.
+ * - Downstream code must not depend on ambiguous runtime types.
+ *
+ * Post-condition:
+ * - MAX_TOKENS, TOP_K are Int
+ * - TOP_P, TEMPERATURE are Float
+ * - ACCELERATOR is a valid label String
  */
 private fun normalizeNumberTypes(m: MutableMap<ConfigKey, Any>) {
-    m[ConfigKey.MAX_TOKENS] =
-        (m[ConfigKey.MAX_TOKENS] as? Number)?.toInt()
-            ?: (m[ConfigKey.MAX_TOKENS] as? String)?.toIntOrNull()
-                    ?: DEFAULT_MAX_TOKENS
+    m[ConfigKey.MAX_TOKENS] = m[ConfigKey.MAX_TOKENS].toIntOrDefault(DEFAULT_MAX_TOKENS)
+    m[ConfigKey.TOP_K] = m[ConfigKey.TOP_K].toIntOrDefault(DEFAULT_TOP_K)
+    m[ConfigKey.TOP_P] = m[ConfigKey.TOP_P].toFloatOrDefault(DEFAULT_TOP_P)
+    m[ConfigKey.TEMPERATURE] = m[ConfigKey.TEMPERATURE].toFloatOrDefault(DEFAULT_TEMPERATURE)
 
-    m[ConfigKey.TOP_K] =
-        (m[ConfigKey.TOP_K] as? Number)?.toInt()
-            ?: (m[ConfigKey.TOP_K] as? String)?.toIntOrNull()
-                    ?: DEFAULT_TOP_K
-
-    m[ConfigKey.TOP_P] =
-        (m[ConfigKey.TOP_P] as? Number)?.toFloat()
-            ?: (m[ConfigKey.TOP_P] as? String)?.toFloatOrNull()
-                    ?: DEFAULT_TOP_P
-
-    m[ConfigKey.TEMPERATURE] =
-        (m[ConfigKey.TEMPERATURE] as? Number)?.toFloat()
-            ?: (m[ConfigKey.TEMPERATURE] as? String)?.toFloatOrNull()
-                    ?: DEFAULT_TEMPERATURE
-
-    m[ConfigKey.ACCELERATOR] = parseAcceleratorLabel(m[ConfigKey.ACCELERATOR] as? String)
+    val accelRaw = m[ConfigKey.ACCELERATOR] as? String
+    m[ConfigKey.ACCELERATOR] = parseAcceleratorLabel(accelRaw)
 }
 
-/** Clamp config ranges defensively. */
+/**
+ * Clamp normalized config values to safe runtime ranges.
+ *
+ * Safety note:
+ * - This function is designed to be safe even if normalization was skipped,
+ *   by using safe conversions again.
+ */
 private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
-    val maxTokens = (m[ConfigKey.MAX_TOKENS] as Number).toInt().coerceIn(1, ABS_MAX_TOKENS)
-    val topK = (m[ConfigKey.TOP_K] as Number).toInt().coerceIn(1, ABS_MAX_TOP_K)
-    val topP = (m[ConfigKey.TOP_P] as Number).toFloat().coerceIn(0f, 1f)
-    val temp = (m[ConfigKey.TEMPERATURE] as Number).toFloat().coerceIn(0f, ABS_MAX_TEMPERATURE)
+    val maxTokens = m[ConfigKey.MAX_TOKENS].toIntOrDefault(DEFAULT_MAX_TOKENS)
+        .coerceIn(1, ABS_MAX_TOKENS)
+    val topK = m[ConfigKey.TOP_K].toIntOrDefault(DEFAULT_TOP_K)
+        .coerceIn(1, ABS_MAX_TOP_K)
+    val topP = m[ConfigKey.TOP_P].toFloatOrDefault(DEFAULT_TOP_P)
+        .coerceIn(0f, 1f)
+    val temp = m[ConfigKey.TEMPERATURE].toFloatOrDefault(DEFAULT_TEMPERATURE)
+        .coerceIn(0f, ABS_MAX_TEMPERATURE)
 
     m[ConfigKey.MAX_TOKENS] = maxTokens
     m[ConfigKey.TOP_K] = topK
@@ -205,7 +250,15 @@ private fun clampRanges(m: MutableMap<ConfigKey, Any>) {
 }
 
 /**
- * Build a normalized config map from SurveyConfig.SlmMeta.
+ * Build model config from [SurveyConfig.SlmMeta].
+ *
+ * Output invariants:
+ * - MAX_TOKENS/TOP_K are Int
+ * - TOP_P/TEMPERATURE are Float
+ * - ACCELERATOR is a String label ("CPU"/"GPU")
+ *
+ * Logging:
+ * - Logs normalized values for quick diagnosis of remote-config drift.
  */
 fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
     val out: MutableMap<ConfigKey, Any> = mutableMapOf(
@@ -227,537 +280,64 @@ fun buildModelConfig(slm: SurveyConfig.SlmMeta): MutableMap<ConfigKey, Any> {
     return out
 }
 
-/* ───────────────────────────── Stream delta normalizer ───────────────────────────── */
-
 /**
- * Normalizes partial streaming chunks into "delta" chunks.
+ * Build a safe config when [SurveyConfig.SlmMeta] is absent.
  *
- * Background:
- * - Some SDKs emit DELTA chunks (only new text).
- * - Others emit ACCUMULATED chunks (full text so far).
- *
- * This helper attempts to detect the mode and convert to deltas so callers can
- * append text safely without duplications.
+ * Design choice:
+ * - Even if [slm] is non-null, we still re-run normalization + clamping to guarantee invariants
+ *   if the upstream builder changes in the future.
  */
-internal class StreamDeltaNormalizer(
-    modeHint: PartialMode = PartialMode.AUTO,
-    private val prefixSampleChars: Int = 128,
-    private val boundarySampleChars: Int = 64,
-) {
-    enum class PartialMode { AUTO, DELTA, ACCUMULATED }
-
-    private companion object {
-        private const val MIN_STRONG_SAMPLE_CHARS = 16
-        private const val SMALL_PREV_FORCE_GROWTH_CHARS = 8
-        private const val MIN_GROWTH_CHARS = 1
-        private const val ACCUM_MISMATCH_TO_DELTA_THRESHOLD = 2
+internal fun buildModelConfigSafe(slm: SurveyConfig.SlmMeta?): MutableMap<ConfigKey, Any> {
+    val out: MutableMap<ConfigKey, Any> = if (slm == null) {
+        mutableMapOf(
+            ConfigKey.ACCELERATOR to Accelerator.GPU.label,
+            ConfigKey.MAX_TOKENS to DEFAULT_MAX_TOKENS,
+            ConfigKey.TOP_K to DEFAULT_TOP_K,
+            ConfigKey.TOP_P to DEFAULT_TOP_P,
+            ConfigKey.TEMPERATURE to DEFAULT_TEMPERATURE,
+        )
+    } else {
+        buildModelConfig(slm)
     }
 
-    private var decided: PartialMode = modeHint
-    private var lastLen: Int = 0
-
-    private var prefixSample: String = ""
-    private var boundarySample: String = ""
-
-    private var firstChunk: String? = null
-    private var firstChunkLen: Int = 0
-
-    private var accumMismatchCount: Int = 0
-
-    fun toDelta(incoming: String): String {
-        if (incoming.isEmpty()) return ""
-
-        return when (decided) {
-            PartialMode.DELTA -> incoming
-            PartialMode.ACCUMULATED -> accumulatedDelta(incoming)
-            PartialMode.AUTO -> autoDelta(incoming)
-        }
-    }
-
-    private fun autoDelta(incoming: String): String {
-        if (lastLen == 0) {
-            seed(incoming, allowFirstChunk = true)
-            return incoming
-        }
-
-        val looksAccumulated = looksLikeAccumulated(incoming)
-        decided = if (looksAccumulated) PartialMode.ACCUMULATED else PartialMode.DELTA
-
-        firstChunk = null
-        firstChunkLen = 0
-
-        return if (decided == PartialMode.ACCUMULATED) {
-            accumulatedDelta(incoming)
-        } else {
-            seed(incoming, allowFirstChunk = false)
-            incoming
-        }
-    }
-
-    private fun accumulatedDelta(incoming: String): String {
-        if (lastLen == 0) {
-            seed(incoming, allowFirstChunk = false)
-            accumMismatchCount = 0
-            return incoming
-        }
-
-        if (!looksLikeAccumulated(incoming)) {
-            accumMismatchCount++
-            if (accumMismatchCount >= ACCUM_MISMATCH_TO_DELTA_THRESHOLD) {
-                decided = PartialMode.DELTA
-                d { "StreamDeltaNormalizer: downgrade to DELTA after $accumMismatchCount mismatches" }
-            }
-            seed(incoming, allowFirstChunk = false)
-            return incoming
-        }
-
-        accumMismatchCount = 0
-        val delta = if (incoming.length >= lastLen) incoming.substring(lastLen) else incoming
-        seed(incoming, allowFirstChunk = false)
-        return delta
-    }
-
-    private fun seed(text: String, allowFirstChunk: Boolean) {
-        lastLen = text.length
-        prefixSample = text.take(prefixSampleChars)
-        boundarySample = text.takeLast(boundarySampleChars)
-
-        if (allowFirstChunk) {
-            val cap = 4_096
-            val canKeep = text.length in MIN_STRONG_SAMPLE_CHARS..cap
-            firstChunk = if (canKeep) text else null
-            firstChunkLen = text.length
-        }
-    }
-
-    private fun looksLikeAccumulated(incoming: String): Boolean {
-        if (incoming.length < lastLen) return false
-
-        val growth = incoming.length - lastLen
-        if (growth < MIN_GROWTH_CHARS) return false
-
-        if (prefixSample.isNotEmpty() && !incoming.startsWith(prefixSample)) return false
-
-        val fc = firstChunk
-        if (fc != null && firstChunkLen >= MIN_STRONG_SAMPLE_CHARS) {
-            if (incoming.length >= firstChunkLen && incoming.startsWith(fc)) return true
-        }
-
-        if (lastLen < MIN_STRONG_SAMPLE_CHARS && growth < SMALL_PREV_FORCE_GROWTH_CHARS) {
-            return false
-        }
-
-        if (prefixSample.length >= MIN_STRONG_SAMPLE_CHARS && !incoming.startsWith(prefixSample)) {
-            return false
-        }
-
-        if (boundarySample.length >= MIN_STRONG_SAMPLE_CHARS) {
-            val start = (lastLen - boundarySample.length).coerceAtLeast(0)
-            val ok = incoming.regionMatches(
-                thisOffset = start,
-                other = boundarySample,
-                otherOffset = 0,
-                length = boundarySample.length,
-                ignoreCase = false
-            )
-            if (!ok) return false
-        }
-
-        return true
-    }
+    normalizeNumberTypes(out)
+    clampRanges(out)
+    return out
 }
 
-/* ───────────────────────────── Reflection bridge ───────────────────────────── */
-
 /**
- * Reflection bridge that tolerates LiteRtLM signature drift across SDK versions.
+ * Compatibility facade that forwards calls to LiteRtLM directly.
  *
- * Strategy:
- * - Cache method buckets by (class, name, argc).
- * - Best-effort method selection via scoring (assignable/primitive boxing/coercion).
- * - Try argument tail trimming for optional params / overload shifts.
- * - Provide both Unit-style and return-style invocations.
- * - Provide suspend invocation by appending a Continuation argument.
- */
-private object LiteRtLmReflect {
-
-    private val methodBucketCache = ConcurrentHashMap<String, List<Method>>()
-
-    private fun bucketKey(cls: Class<*>, methodName: String, argc: Int): String =
-        "${cls.name}::$methodName/$argc"
-
-    private fun getMethodBucket(cls: Class<*>, methodName: String, argc: Int): List<Method> {
-        val key = bucketKey(cls, methodName, argc)
-        return methodBucketCache.getOrPut(key) {
-            val all = ArrayList<Method>(64)
-            all.addAll(cls.methods.filter { it.name == methodName && it.parameterTypes.size == argc })
-            all.addAll(cls.declaredMethods.filter { it.name == methodName && it.parameterTypes.size == argc })
-
-            all.asSequence()
-                .filterNot { it.isBridge || it.isSynthetic }
-                .distinctBy { m ->
-                    buildString {
-                        append(m.name).append("(")
-                        m.parameterTypes.forEachIndexed { i, p ->
-                            if (i > 0) append(",")
-                            append(p.name)
-                        }
-                        append(")")
-                    }
-                }
-                .toList()
-        }
-    }
-
-    private fun boxedOfPrimitive(p: Class<*>): Class<*>? {
-        if (!p.isPrimitive) return null
-        return when (p) {
-            Boolean::class.javaPrimitiveType -> Boolean::class.javaObjectType
-            Int::class.javaPrimitiveType -> Int::class.javaObjectType
-            Long::class.javaPrimitiveType -> Long::class.javaObjectType
-            Float::class.javaPrimitiveType -> Float::class.javaObjectType
-            Double::class.javaPrimitiveType -> Double::class.javaObjectType
-            Short::class.javaPrimitiveType -> Short::class.javaObjectType
-            Byte::class.javaPrimitiveType -> Byte::class.javaObjectType
-            Char::class.javaPrimitiveType -> Char::class.javaObjectType
-            else -> null
-        }
-    }
-
-    @Suppress("UNCHECKED_CAST")
-    private fun coerceArgForParam(param: Class<*>, arg: Any?): Any? {
-        if (arg == null) return null
-        if (param.isInstance(arg)) return arg
-
-        val boxed = boxedOfPrimitive(param)
-        if (boxed != null && boxed.isInstance(arg)) return arg
-
-        val wantsInt = (param == Int::class.javaPrimitiveType || param == Int::class.javaObjectType)
-        val wantsLong = (param == Long::class.javaPrimitiveType || param == Long::class.javaObjectType)
-        val wantsFloat = (param == Float::class.javaPrimitiveType || param == Float::class.javaObjectType)
-        val wantsDouble = (param == Double::class.javaPrimitiveType || param == Double::class.javaObjectType)
-        val wantsShort = (param == Short::class.javaPrimitiveType || param == Short::class.javaObjectType)
-        val wantsByte = (param == Byte::class.javaPrimitiveType || param == Byte::class.javaObjectType)
-
-        if (arg is Number) {
-            return when {
-                wantsInt -> arg.toInt()
-                wantsLong -> arg.toLong()
-                wantsFloat -> arg.toFloat()
-                wantsDouble -> arg.toDouble()
-                wantsShort -> arg.toShort()
-                wantsByte -> arg.toByte()
-                else -> arg
-            }
-        }
-
-        if (param == Runnable::class.java && arg is Function0<*>) {
-            return Runnable { arg.invoke() }
-        }
-
-        // Best-effort adaptation for Java Consumer when the SDK expects it.
-        if (param.name == "java.util.function.Consumer" && arg is Function1<*, *>) {
-            return runCatching {
-                val f = arg as Function1<Any?, Any?>
-                val consumerCls = Class.forName("java.util.function.Consumer")
-                Proxy.newProxyInstance(
-                    consumerCls.classLoader,
-                    arrayOf(consumerCls)
-                ) { _, method, args ->
-                    if (method.name == "accept") {
-                        f.invoke(args?.getOrNull(0))
-                        null
-                    } else {
-                        null
-                    }
-                }
-            }.getOrElse { arg }
-        }
-
-        return arg
-    }
-
-    private fun scoreParamMatch(param: Class<*>, arg: Any?): Int {
-        if (arg == null) return if (param.isPrimitive) -10_000 else 1
-
-        val coerced = coerceArgForParam(param, arg) ?: return if (param.isPrimitive) -10_000 else 1
-
-        if (param.isPrimitive) {
-            val boxed = boxedOfPrimitive(param) ?: return -10_000
-            return when {
-                boxed == coerced.javaClass -> 8
-                boxed.isAssignableFrom(coerced.javaClass) -> 6
-                else -> -10_000
-            }
-        }
-
-        return when {
-            param == coerced.javaClass -> 10
-            param.isAssignableFrom(coerced.javaClass) -> 7
-            else -> -10_000
-        }
-    }
-
-    private fun findBestMethod(cls: Class<*>, methodName: String, args: Array<Any?>): Method? {
-        val bucket = getMethodBucket(cls, methodName, args.size)
-        if (bucket.isEmpty()) return null
-
-        var best: Method? = null
-        var bestScore = Int.MIN_VALUE
-
-        for (m in bucket) {
-            val params = m.parameterTypes
-            var score = 0
-            var ok = true
-
-            for (i in params.indices) {
-                val s = scoreParamMatch(params[i], args[i])
-                if (s < -1000) {
-                    ok = false
-                    break
-                }
-                score += s
-            }
-            if (!ok) continue
-
-            // Prefer instance methods (common Kotlin object patterns).
-            if (!Modifier.isStatic(m.modifiers)) score += 3
-
-            if (score > bestScore) {
-                bestScore = score
-                best = m
-            }
-        }
-
-        return best
-    }
-
-    private fun buildArgCandidates(args: Array<Any?>): List<Array<Any?>> {
-        if (args.isEmpty()) return listOf(args)
-
-        val out = ArrayList<Array<Any?>>(8)
-        out.add(args)
-
-        fun dropLast(n: Int) {
-            if (args.size > n) out.add(args.copyOf(args.size - n))
-        }
-
-        val last = args.last()
-        if (last is List<*> && last.isEmpty()) dropLast(1)
-        if (last == null) dropLast(1)
-
-        val maxDrop = minOf(4, args.size - 1)
-        for (n in 1..maxDrop) dropLast(n)
-
-        return out.distinctBy { it.size }
-    }
-
-    private fun Method.signatureString(): String {
-        return buildString {
-            append(name).append("(")
-            parameterTypes.forEachIndexed { i, p ->
-                if (i > 0) append(", ")
-                append(p.simpleName)
-            }
-            append(")")
-        }
-    }
-
-    fun invokeReturn(methodName: String, args: Array<Any?>, onFailLog: String): Any? {
-        val cls = LiteRtLM::class.java
-        val candidates = buildArgCandidates(args)
-
-        for (cand in candidates) {
-            try {
-                val m = findBestMethod(cls, methodName, cand)
-                if (m == null) {
-                    d { "$onFailLog (method not found): name='$methodName' argc=${cand.size}" }
-                    continue
-                }
-
-                m.isAccessible = true
-                val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
-
-                val coercedArgs = Array<Any?>(cand.size) { i ->
-                    coerceArgForParam(m.parameterTypes[i], cand[i])
-                }
-
-                d { "invokeReturn: picked ${m.signatureString()} (argc=${cand.size})" }
-                return m.invoke(receiver, *coercedArgs)
-            } catch (ite: InvocationTargetException) {
-                val root = ite.targetException ?: ite
-                w(root) { "$onFailLog (target threw): name='$methodName' err=${root.message}" }
-            } catch (t: Throwable) {
-                w(t) { "$onFailLog (invoke failed): name='$methodName' err=${t.message}" }
-            }
-        }
-
-        return null
-    }
-
-    fun invokeUnit(methodName: String, args: Array<Any?>, onFailLog: String): Boolean {
-        val cls = LiteRtLM::class.java
-        val candidates = buildArgCandidates(args)
-
-        for (cand in candidates) {
-            try {
-                val m = findBestMethod(cls, methodName, cand)
-                if (m == null) {
-                    d { "$onFailLog (method not found): name='$methodName' argc=${cand.size}" }
-                    continue
-                }
-
-                m.isAccessible = true
-                val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
-
-                val coercedArgs = Array<Any?>(cand.size) { i ->
-                    coerceArgForParam(m.parameterTypes[i], cand[i])
-                }
-
-                d { "invokeUnit: picked ${m.signatureString()} (argc=${cand.size})" }
-                m.invoke(receiver, *coercedArgs)
-                return true
-            } catch (ite: InvocationTargetException) {
-                val root = ite.targetException ?: ite
-                w(root) { "$onFailLog (target threw): name='$methodName' err=${root.message}" }
-            } catch (t: Throwable) {
-                w(t) { "$onFailLog (invoke failed): name='$methodName' err=${t.message}" }
-            }
-        }
-
-        return false
-    }
-
-    data class SuspendInvokeResult(
-        val invoked: Boolean,
-        val value: Any?,
-    )
-
-    suspend fun invokeSuspend(
-        methodName: String,
-        argsNoCont: Array<Any?>,
-        onFailLog: String,
-    ): SuspendInvokeResult {
-        val cls = LiteRtLM::class.java
-        val candidates = buildArgCandidates(argsNoCont)
-
-        return suspendCancellableCoroutine { outer ->
-            outer.invokeOnCancellation {
-                d { "invokeSuspend cancelled: method='$methodName'" }
-            }
-
-            val cont = object : Continuation<Any?> {
-                override val context = outer.context
-                override fun resumeWith(result: Result<Any?>) {
-                    if (outer.isCompleted) return
-                    result.fold(
-                        onSuccess = { v ->
-                            if (!outer.isCompleted) outer.resume(SuspendInvokeResult(invoked = true, value = v))
-                        },
-                        onFailure = { e ->
-                            if (!outer.isCompleted) outer.resumeWithException(e)
-                        }
-                    )
-                }
-            }
-
-            for (cand in candidates) {
-                try {
-                    val args = arrayOfNulls<Any?>(cand.size + 1)
-                    for (i in cand.indices) args[i] = cand[i]
-                    args[args.lastIndex] = cont
-
-                    val m = findBestMethod(cls, methodName, args)
-                    if (m == null) {
-                        d { "$onFailLog (suspend method not found): name='$methodName' argc=${args.size}" }
-                        continue
-                    }
-
-                    m.isAccessible = true
-                    val receiver: Any? = if (Modifier.isStatic(m.modifiers)) null else LiteRtLM
-
-                    val coercedArgs = Array<Any?>(args.size) { i ->
-                        coerceArgForParam(m.parameterTypes[i], args[i])
-                    }
-
-                    d { "invokeSuspend: picked ${m.signatureString()} (argc=${args.size})" }
-                    val ret = m.invoke(receiver, *coercedArgs)
-
-                    // If the method returned immediately, complete here.
-                    // Important: "invoked" must be true even if ret is null (Unit/void-like).
-                    if (ret !== COROUTINE_SUSPENDED && !outer.isCompleted) {
-                        outer.resume(SuspendInvokeResult(invoked = true, value = ret))
-                    }
-                    return@suspendCancellableCoroutine
-                } catch (ite: InvocationTargetException) {
-                    val root = ite.targetException ?: ite
-                    w(root) { "$onFailLog (suspend target threw): name='$methodName' err=${root.message}" }
-                } catch (t: Throwable) {
-                    w(t) { "$onFailLog (suspend invoke failed): name='$methodName' err=${t.message}" }
-                }
-            }
-
-            if (!outer.isCompleted) outer.resume(SuspendInvokeResult(invoked = false, value = null))
-        }
-    }
-}
-
-/* ───────────────────────────── Facade API ───────────────────────────── */
-
-/**
- * Compatibility facade over LiteRtLM.
+ * Responsibilities of this facade:
+ * - Keep call sites stable (SLM.* API surface).
+ * - Avoid reflection to prevent signature drift false negatives.
+ * - Provide consistent logging for synchronous failures.
+ * - Guard callbacks to avoid double delivery in mixed sync/async failure modes.
  *
- * Notes:
- * - Uses reflection to avoid compile-time coupling to LiteRtLM's method surface.
- * - Provides best-effort overload matching and argument coercion.
- * - Keeps call sites stable across SDK changes.
+ * Non-goals:
+ * - Do not re-implement LiteRtLM session management or concurrency control.
+ * - Assume LiteRtLM enforces "single active stream per model key" and internal cancellation rules.
  */
 object SLM {
 
-    /** Returns true if the underlying engine is currently busy (best-effort). */
-    fun isBusy(): Boolean {
-        return runCatching {
-            val ret = LiteRtLmReflect.invokeReturn(
-                methodName = "isBusy",
-                args = emptyArray(),
-                onFailLog = "LiteRtLM.isBusy unavailable",
-            )
-            (ret as? Boolean) ?: false
-        }.getOrDefault(false)
-    }
-
-    /** Compatibility overload for call sites that pass a model (best-effort). */
-    fun isBusy(model: Model): Boolean {
-        return runCatching {
-            val ret = LiteRtLmReflect.invokeReturn(
-                methodName = "isBusy",
-                args = arrayOf(model),
-                onFailLog = "LiteRtLM.isBusy(model) unavailable",
-            )
-            (ret as? Boolean) ?: isBusy()
-        }.getOrDefault(false)
-    }
-
-    /**
-     * Sets application context for LiteRtLM.
-     *
-     * This is a best-effort call; older SDKs may not expose this API.
-     */
     fun setApplicationContext(context: Context) {
-        val ok = LiteRtLmReflect.invokeUnit(
-            methodName = "setApplicationContext",
-            args = arrayOf(context),
-            onFailLog = "LiteRtLM.setApplicationContext unavailable",
-        )
-        if (!ok) {
-            w { "setApplicationContext: skipped (LiteRtLM API not present)." }
-        }
+        d { "setApplicationContext" }
+        LiteRtLM.setApplicationContext(context)
     }
 
+    fun isBusy(model: Model): Boolean = LiteRtLM.isBusy(model)
+
+    fun isBusy(modelName: String): Boolean = LiteRtLM.isBusy(modelName)
+
     /**
-     * Initializes the model using a callback-based API (best-effort).
+     * Initialize a model runtime.
      *
-     * This exists mainly as a fallback when reflective suspend invocation is unavailable.
+     * Failure model:
+     * - If LiteRtLM.initialize throws synchronously, we catch and notify [onDone] with an error string.
+     * - If LiteRtLM reports errors asynchronously, it is expected to signal via its own callbacks.
+     *
+     * Callback safety:
+     * - [onDone] is guarded to be invoked at most once by this facade.
      */
     fun initialize(
         context: Context,
@@ -768,34 +348,36 @@ object SLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
     ) {
-        d { "initialize: model='${model.name}' path='${model.taskPath}' image=$supportImage audio=$supportAudio" }
+        val onDoneOnce = once1(onDone)
 
-        val ok = LiteRtLmReflect.invokeUnit(
-            methodName = "initialize",
-            args = arrayOf(
-                context,
-                model,
-                supportImage,
-                supportAudio,
-                onDone,
-                systemMessage,
-                tools
-            ),
-            onFailLog = "LiteRtLM.initialize unavailable",
-        )
+        d {
+            "initialize: model='${model.name}' path='${model.taskPath}' " +
+                    "image=$supportImage audio=$supportAudio tools=${tools.size}"
+        }
 
-        if (!ok) {
-            w { "initialize: failed (LiteRtLM API not present / signature mismatch)." }
-            onDone("error: initialize unavailable")
+        runCatching {
+            LiteRtLM.initialize(
+                context = context,
+                model = model,
+                supportImage = supportImage,
+                supportAudio = supportAudio,
+                onDone = onDoneOnce,
+                systemMessage = systemMessage,
+                tools = tools,
+            )
+        }.onFailure { t ->
+            w(t) { "initialize: failed err=${t.javaClass.simpleName}(${t.message})" }
+            // NOTE: This string may surface to UI depending on call sites. Keep behavior,
+            // but consider mapping to a user-friendly message at the UI boundary.
+            onDoneOnce("error: ${t.javaClass.simpleName}(${t.message})")
         }
     }
 
     /**
-     * Initializes the model if needed (preferred suspend path).
+     * Suspend initializer used when callers need structured cancellation/propagation.
      *
-     * Implementation:
-     * - Try reflective suspend invocation first.
-     * - If unavailable, fall back to callback-based initialize() wrapped in a suspension.
+     * Cancellation:
+     * - CancellationException is rethrown untouched to preserve coroutine semantics.
      */
     suspend fun initializeIfNeeded(
         context: Context,
@@ -805,57 +387,34 @@ object SLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
     ) {
-        d { "initializeIfNeeded: model='${model.name}' image=$supportImage audio=$supportAudio" }
-
-        try {
-            val res = LiteRtLmReflect.invokeSuspend(
-                methodName = "initializeIfNeeded",
-                argsNoCont = arrayOf(
-                    context,
-                    model,
-                    supportImage,
-                    supportAudio,
-                    systemMessage,
-                    tools
-                ),
-                onFailLog = "LiteRtLM.initializeIfNeeded unavailable",
-            )
-            if (res.invoked) return
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (t: Throwable) {
-            w(t) { "initializeIfNeeded: reflection failed err=${t.message}" }
+        d {
+            "initializeIfNeeded: model='${model.name}' " +
+                    "image=$supportImage audio=$supportAudio tools=${tools.size}"
         }
 
-        suspendCancellableCoroutine<Unit> { cont ->
-            initialize(
+        try {
+            LiteRtLM.initializeIfNeeded(
                 context = context,
                 model = model,
                 supportImage = supportImage,
                 supportAudio = supportAudio,
-                onDone = { err ->
-                    if (cont.isCompleted) return@initialize
-
-                    if (err.isBlank()) {
-                        cont.resume(Unit)
-                    } else {
-                        cont.resumeWithException(IllegalStateException("LiteRtLM init failed: $err"))
-                    }
-                },
                 systemMessage = systemMessage,
-                tools = tools
+                tools = tools,
             )
-            cont.invokeOnCancellation {
-                d { "initializeIfNeeded fallback cancelled: model='${model.name}'" }
-                cancel(model)
-            }
+        } catch (ce: CancellationException) {
+            throw ce
+        } catch (t: Throwable) {
+            w(t) { "initializeIfNeeded: failed err=${t.javaClass.simpleName}(${t.message})" }
+            throw t
         }
     }
 
     /**
-     * Resets conversation state (best-effort).
+     * Fire-and-forget conversation reset.
      *
-     * This call is optional for correctness but useful when you want request isolation.
+     * Ordering:
+     * - This does not guarantee completion before subsequent calls.
+     * - Use [resetConversationAndAwait] if strict sequencing is required.
      */
     fun resetConversation(
         model: Model,
@@ -864,59 +423,113 @@ object SLM {
         systemMessage: Message? = null,
         tools: List<Any> = emptyList(),
     ) {
-        d { "resetConversation: model='${model.name}' image=$supportImage audio=$supportAudio" }
-
-        val ok = LiteRtLmReflect.invokeUnit(
-            methodName = "resetConversation",
-            args = arrayOf(model, supportImage, supportAudio, systemMessage, tools),
-            onFailLog = "LiteRtLM.resetConversation unavailable",
-        )
-
-        if (!ok) {
-            w { "resetConversation: skipped (LiteRtLM API not present)." }
+        d {
+            "resetConversation: model='${model.name}' " +
+                    "image=$supportImage audio=$supportAudio tools=${tools.size}"
         }
-    }
 
-    /** Performs deferred cleanup after native termination (best-effort). */
-    fun cleanUp(model: Model, onDone: () -> Unit) {
-        d { "cleanUp: model='${model.name}'" }
-
-        val ok = LiteRtLmReflect.invokeUnit(
-            methodName = "cleanUp",
-            args = arrayOf(model, onDone),
-            onFailLog = "LiteRtLM.cleanUp unavailable",
-        )
-
-        if (!ok) {
-            w { "cleanUp: skipped (LiteRtLM API not present)." }
-            onDone()
+        runCatching {
+            LiteRtLM.resetConversation(
+                model = model,
+                supportImage = supportImage,
+                supportAudio = supportAudio,
+                systemMessage = systemMessage,
+                tools = tools,
+            )
+        }.onFailure { t ->
+            w(t) { "resetConversation: failed err=${t.javaClass.simpleName}(${t.message})" }
         }
     }
 
     /**
-     * Forces cleanup if the SDK supports it; otherwise falls back to cleanUp().
+     * Reset conversation and await completion.
+     *
+     * Why:
+     * - Some flows require "reset must finish BEFORE next user request is issued".
+     *
+     * @return true when reset completed successfully, false on skip/failure/timeout.
+     */
+    suspend fun resetConversationAndAwait(
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+        timeoutMs: Long = 5_000L,
+    ): Boolean {
+        d {
+            "resetConversationAndAwait: model='${model.name}' " +
+                    "image=$supportImage audio=$supportAudio tools=${tools.size} timeoutMs=$timeoutMs"
+        }
+
+        return runCatching {
+            LiteRtLM.resetConversationAndAwait(
+                model = model,
+                supportImage = supportImage,
+                supportAudio = supportAudio,
+                systemMessage = systemMessage,
+                tools = tools,
+                timeoutMs = timeoutMs,
+            )
+        }.onFailure { t ->
+            w(t) { "resetConversationAndAwait: failed err=${t.javaClass.simpleName}(${t.message})" }
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Graceful cleanup.
+     *
+     * Callback safety:
+     * - [onDone] is guarded to avoid double completion if LiteRtLM throws synchronously.
+     */
+    fun cleanUp(model: Model, onDone: () -> Unit) {
+        val onDoneOnce = once0(onDone)
+
+        d { "cleanUp: model='${model.name}'" }
+        runCatching {
+            LiteRtLM.cleanUp(model = model, onDone = onDoneOnce)
+        }.onFailure { t ->
+            w(t) { "cleanUp: failed err=${t.javaClass.simpleName}(${t.message})" }
+            onDoneOnce()
+        }
+    }
+
+    /**
+     * Force cleanup.
+     *
+     * Fallback:
+     * - If force cleanup fails, we fall back to graceful cleanup.
+     *
+     * Callback safety:
+     * - [onDone] is guarded to avoid double completion across fallback paths.
      */
     fun forceCleanUp(model: Model, onDone: () -> Unit) {
+        val onDoneOnce = once0(onDone)
+
         d { "forceCleanUp: model='${model.name}'" }
-
-        val ok = LiteRtLmReflect.invokeUnit(
-            methodName = "forceCleanUp",
-            args = arrayOf(model, onDone),
-            onFailLog = "LiteRtLM.forceCleanUp unavailable",
-        )
-
-        if (!ok) {
-            w { "forceCleanUp: falling back to cleanUp() (deferred)." }
-            cleanUp(model = model, onDone = onDone)
+        runCatching {
+            LiteRtLM.forceCleanUp(model = model, onDone = onDoneOnce)
+        }.onFailure { t ->
+            w(t) { "forceCleanUp: failed err=${t.javaClass.simpleName}(${t.message})" }
+            cleanUp(model = model, onDone = onDoneOnce)
         }
     }
 
     /**
-     * Starts streaming inference.
+     * Start streaming inference.
      *
-     * Important:
-     * - Some SDK builds may emit a final delta together with done=true.
-     * - cleanUpListener must only be used as a native termination safe point.
+     * Failure model:
+     * - If LiteRtLM.runInference throws synchronously, we:
+     *   1) log
+     *   2) call [onError]
+     *   3) call [cleanUpListener]
+     *
+     * Callback safety:
+     * - [cleanUpListener] is guarded to "at most once" to avoid double unlock/unblock bugs.
+     *
+     * Note:
+     * - We intentionally do not guard [resultListener] here because it is expected to be invoked
+     *   multiple times for streaming partials.
      */
     fun runInference(
         model: Model,
@@ -926,42 +539,41 @@ object SLM {
         onError: (message: String) -> Unit = {},
         images: List<Bitmap> = emptyList(),
         audioClips: List<ByteArray> = emptyList(),
-        notifyCancelToOnError: Boolean = true,
+        notifyCancelToOnError: Boolean = false,
     ) {
+        val cleanUpOnce = once0(cleanUpListener)
+
         d {
-            "runInference: model='${model.name}' textLen=${input.length} images=${images.size} audio=${audioClips.size}"
+            "runInference: model='${model.name}' textLen=${input.length} " +
+                    "images=${images.size} audio=${audioClips.size} notifyCancel=$notifyCancelToOnError"
         }
 
-        val ok = LiteRtLmReflect.invokeUnit(
-            methodName = "runInference",
-            args = arrayOf(
-                model,
-                input,
-                resultListener,
-                cleanUpListener,
-                onError,
-                images,
-                audioClips,
-                notifyCancelToOnError
-            ),
-            onFailLog = "LiteRtLM.runInference unavailable",
-        )
-
-        if (!ok) {
-            w { "runInference: failed (LiteRtLM API not present / signature mismatch)." }
-            onError("runInference unavailable")
-            cleanUpListener()
+        runCatching {
+            LiteRtLM.runInference(
+                model = model,
+                input = input,
+                resultListener = resultListener,
+                cleanUpListener = cleanUpOnce,
+                onError = onError,
+                images = images,
+                audioClips = audioClips,
+                notifyCancelToOnError = notifyCancelToOnError,
+            )
+        }.onFailure { t ->
+            w(t) { "runInference: failed err=${t.javaClass.simpleName}(${t.message})" }
+            onError("runInference failed: ${t.javaClass.simpleName}(${t.message})")
+            runCatching { cleanUpOnce() }
         }
     }
 
     /**
-     * Generates a complete string response.
+     * Convenience API for "generate full text" flows.
      *
-     * Preferred path:
-     * - Call LiteRtLM.generateText via reflective suspend invocation.
+     * Behavior:
+     * - Delegates to LiteRtLM.generateText which is expected to handle streaming internally.
      *
-     * Fallback path:
-     * - Use runInference streaming and accumulate deltas until done.
+     * Partial callback:
+     * - [onPartial] may be called multiple times as text grows.
      */
     suspend fun generateText(
         model: Model,
@@ -971,169 +583,29 @@ object SLM {
         onPartial: (String) -> Unit = {},
     ): String {
         d {
-            "generateText: model='${model.name}' textLen=${input.length} images=${images.size} audio=${audioClips.size}"
+            "generateText: model='${model.name}' textLen=${input.length} " +
+                    "images=${images.size} audio=${audioClips.size}"
         }
 
-        // Buffer for reflected suspend path (partial callbacks).
-        val reflectedBuffer = StringBuilder()
-        val reflectedNormalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
-
-        val onPartialWrapped: (String) -> Unit = { chunk ->
-            val delta = reflectedNormalizer.toDelta(chunk)
-            if (delta.isNotEmpty()) {
-                reflectedBuffer.append(delta)
-                runCatching { onPartial(delta) }
-                    .onFailure { t -> w(t) { "generateText onPartial failed: ${t.message}" } }
-            }
-        }
-
-        try {
-            val res = LiteRtLmReflect.invokeSuspend(
-                methodName = "generateText",
-                argsNoCont = arrayOf(model, input, images, audioClips, onPartialWrapped),
-                onFailLog = "LiteRtLM.generateText unavailable",
-            )
-
-            if (res.invoked) {
-                val v = res.value
-                if (v is String) return v
-                if (v is CharSequence) return v.toString()
-
-                // Some implementations might only stream via onPartial and return Unit/null.
-                if (reflectedBuffer.isNotEmpty()) return reflectedBuffer.toString()
-
-                val type = v?.javaClass?.name ?: "null"
-                w { "generateText: invoked but returned unexpected value ($type); returning empty to avoid double inference" }
-                return ""
-            }
-        } catch (ce: CancellationException) {
-            throw ce
-        } catch (t: Throwable) {
-            w(t) { "generateText: reflection failed err=${t.message}" }
-        }
-
-        // Fallback: stream via runInference and accumulate deltas.
-        return suspendCancellableCoroutine { cont ->
-            val buffer = StringBuilder()
-            val normalizer = StreamDeltaNormalizer(StreamDeltaNormalizer.PartialMode.AUTO)
-            val terminal = AtomicBoolean(false)
-
-            val resultListener: ResultListener = result@ { partial, done ->
-                if (terminal.get()) return@result
-
-                val delta = normalizer.toDelta(partial)
-                if (delta.isNotEmpty()) {
-                    buffer.append(delta)
-                    runCatching { onPartial(delta) }
-                        .onFailure { t -> w(t) { "generateText fallback onPartial failed: ${t.message}" } }
-                }
-
-                if (done && terminal.compareAndSet(false, true)) {
-                    runCatching {
-                        if (!cont.isCompleted) cont.resume(buffer.toString())
-                    }.onFailure { t ->
-                        w(t) { "generateText fallback resume failed (likely double-finish): ${t.message}" }
-                    }
-                }
-            }
-
-            val onError: (String) -> Unit = error@ { msg ->
-                if (!terminal.compareAndSet(false, true)) return@error
-
-                val lc = msg.lowercase(Locale.ROOT)
-                val ex = if (lc.contains("cancel")) {
-                    CancellationException("Cancelled")
-                } else {
-                    IllegalStateException("LiteRtLM generation error: $msg")
-                }
-
-                runCatching {
-                    if (!cont.isCompleted) cont.resumeWithException(ex)
-                }.onFailure { t ->
-                    w(t) { "generateText fallback resumeWithException failed (likely double-finish): ${t.message}" }
-                }
-            }
-
-            val ok = LiteRtLmReflect.invokeUnit(
-                methodName = "runInference",
-                args = arrayOf(
-                    model,
-                    input,
-                    resultListener,
-                    { /* no-op cleanup */ },
-                    onError,
-                    images,
-                    audioClips,
-                    true
-                ),
-                onFailLog = "LiteRtLM.runInference unavailable",
-            )
-
-            if (!ok && terminal.compareAndSet(false, true)) {
-                runCatching {
-                    if (!cont.isCompleted) cont.resumeWithException(IllegalStateException("runInference unavailable"))
-                }.onFailure { t ->
-                    w(t) { "generateText fallback immediate failure resumeWithException failed: ${t.message}" }
-                }
-            }
-
-            cont.invokeOnCancellation {
-                d { "generateText fallback cancelled: model='${model.name}'" }
-                cancel(model)
-            }
-        }
+        return LiteRtLM.generateText(
+            model = model,
+            input = input,
+            images = images,
+            audioClips = audioClips,
+            onPartial = onPartial,
+        )
     }
 
-    /** Cancels the active request for the given model (best-effort). */
+    /**
+     * Best-effort cancellation.
+     *
+     * Note:
+     * - Cancellation is inherently racey. A late callback may still arrive depending on runtime.
+     * - LiteRtLM is expected to suppress late callbacks using its own runId/token mechanism.
+     */
     fun cancel(model: Model) {
         d { "cancel: model='${model.name}'" }
-
-        val ok = LiteRtLmReflect.invokeUnit(
-            methodName = "cancel",
-            args = arrayOf(model),
-            onFailLog = "LiteRtLM.cancel unavailable",
-        )
-
-        if (!ok) {
-            w { "cancel: skipped (LiteRtLM API not present)." }
-        }
+        runCatching { LiteRtLM.cancel(model) }
+            .onFailure { t -> w(t) { "cancel: failed err=${t.javaClass.simpleName}(${t.message})" } }
     }
-}
-
-/* ───────────────────────────── R8 / Proguard NOTE ─────────────────────────────
- *
- * If you enable minify/obfuscation, reflection may fail to find methods.
- * Add keep rules for LiteRtLM methods that SLM uses, e.g.:
- *
- * -keep class com.negi.surveys.slm.LiteRtLM { *; }
- *
- * Or annotate LiteRtLM with @Keep.
- *
- * ───────────────────────────────────────────────────────────────────────────── */
-
-/* ────────────────────────── TestTag Sanitizer ────────────────────────── */
-
-/**
- * Sanitize strings for use in test tags.
- *
- * Rules:
- * - Allow only [A-Za-z0-9_.-]
- * - Replace other characters with underscore.
- * - Truncate to [maxLen].
- */
-internal fun safeTestTagTokenInternal(src: String, maxLen: Int): String {
-    val cleaned = buildString(src.length) {
-        for (ch in src) {
-            val ok = ch.isLetterOrDigit() || ch == '_' || ch == '-' || ch == '.'
-            append(if (ok) ch else '_')
-        }
-    }
-    return if (cleaned.length <= maxLen) cleaned else cleaned.take(maxLen)
-}
-
-/**
- * Sanitize strings for use in test tags (extension wrapper for call-site compatibility).
- */
-internal fun String.safeTestTagToken(maxLen: Int): String {
-    return safeTestTagTokenInternal(src = this, maxLen = maxLen)
 }

@@ -105,11 +105,10 @@ data class ChatMessage(
      */
     val hasStreamDetails: Boolean
         get() = streamState != ChatStreamState.NONE &&
-                (!streamText.isNullOrBlank() || streamState == ChatStreamState.STREAMING)
+                (streamState == ChatStreamState.STREAMING || !streamText.isNullOrBlank())
 
     /** True when this message is actively streaming. */
-    val isStreaming: Boolean
-        get() = streamState == ChatStreamState.STREAMING
+    val isStreaming: Boolean get() = streamState == ChatStreamState.STREAMING
 
     /**
      * A best-effort fallback string to render when the UI does not use structured fields.
@@ -118,6 +117,10 @@ data class ChatMessage(
      * 1) [assistantMessage] + [followUpQuestion]
      * 2) [text]
      * 3) [streamText]
+     *
+     * Localization note:
+     * - This method intentionally avoids embedding language-specific labels (e.g., "Question:").
+     *   UI should render labels explicitly if needed.
      */
     fun fallbackDisplayText(): String {
         val a = assistantMessage?.trim().orEmpty()
@@ -128,7 +131,7 @@ data class ChatMessage(
                 if (a.isNotEmpty()) append(a)
                 if (q.isNotEmpty()) {
                     if (length > 0) append("\n\n")
-                    append("Question: ").append(q)
+                    append(q)
                 }
             }
         }
@@ -149,6 +152,8 @@ data class ChatMessage(
      * - This is a pure helper; it does not mutate.
      * - Applies an optional [maxChars] cap to bound memory usage.
      * - Avoids surrogate pair splits when clipping (emoji-safe).
+     * - Also defends against rare boundary cases where a low surrogate could become the first char
+     *   (or a high surrogate could become the last char) due to upstream clipping bugs.
      */
     fun appendStreamChunk(chunk: String, maxChars: Int = Int.MAX_VALUE): ChatMessage {
         if (chunk.isEmpty()) return this
@@ -160,8 +165,25 @@ data class ChatMessage(
         val remain = cap - base.length
         if (remain <= 0) return this
 
-        val toAdd = clipToRemainPreserveSurrogates(chunk, remain)
+        var toAdd = clipToRemainPreserveSurrogates(chunk, remain)
         if (toAdd.isEmpty()) return this
+
+        // Boundary guard:
+        // If base ends with a high surrogate and toAdd begins with a low surrogate, drop the low surrogate.
+        if (base.isNotEmpty() && toAdd.isNotEmpty()) {
+            val lastBase = base[base.lastIndex]
+            val firstAdd = toAdd[0]
+            if (Character.isHighSurrogate(lastBase) && Character.isLowSurrogate(firstAdd)) {
+                toAdd = toAdd.drop(1)
+                if (toAdd.isEmpty()) return this
+            }
+        }
+
+        // Front guard (rare): avoid starting with a low surrogate if base is empty.
+        if (base.isEmpty() && toAdd.isNotEmpty() && Character.isLowSurrogate(toAdd[0])) {
+            toAdd = toAdd.drop(1)
+            if (toAdd.isEmpty()) return this
+        }
 
         return copy(streamText = base + toAdd)
     }
@@ -184,6 +206,22 @@ data class ChatMessage(
             streamState = ChatStreamState.ERROR,
             streamCollapsed = collapsed
         )
+    }
+
+    /**
+     * A PII-safe debug summary suitable for logs.
+     *
+     * Important:
+     * - This intentionally does not include message content.
+     */
+    fun debugSummary(): String {
+        val id8 = id.take(8)
+        val textLen = text.length
+        val aLen = assistantMessage?.length ?: 0
+        val qLen = followUpQuestion?.length ?: 0
+        val sLen = streamText?.length ?: 0
+        return "ChatMessage(id=$id8 role=$role state=$streamState collapsed=$streamCollapsed " +
+                "lens[text=$textLen a=$aLen q=$qLen stream=$sLen] sid=${streamSessionId ?: 0})"
     }
 
     companion object {

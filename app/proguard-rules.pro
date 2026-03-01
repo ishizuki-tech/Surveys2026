@@ -19,3 +19,13 @@
 # If you keep the line number information, uncomment this to
 # hide the original source file name.
 #-renamesourcefileattribute SourceFile
+
+# Keep LiteRtLM class and all of its public APIs used via reflection.
+-keep class com.negi.surveys.slm.LiteRtLM { *; }
+
+# (Optional) Keep Kotlin metadata (helps reflection / debugging).
+-keep class kotlin.Metadata { *; }
+
+# If you moved/renamed the package, keep the correct one too.
+# -keep class <your.actual.package>.LiteRtLM { *; }
+
