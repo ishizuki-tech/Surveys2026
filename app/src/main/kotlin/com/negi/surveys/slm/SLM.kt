@@ -28,6 +28,7 @@ import com.google.ai.edge.litertlm.Message
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.logging.AppLog
+import com.negi.surveys.logging.SafeLog
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
@@ -548,13 +549,24 @@ object SLM {
                     "images=${images.size} audio=${audioClips.size} notifyCancel=$notifyCancelToOnError"
         }
 
+        SafeLog.i("SLM runInference", "input :: $input")
+
         runCatching {
             LiteRtLM.runInference(
                 model = model,
                 input = input,
-                resultListener = resultListener,
-                cleanUpListener = cleanUpOnce,
-                onError = onError,
+                resultListener = { partialResult, done ->
+                    SafeLog.i("SLM runInference", "done = $done | ResultListener::  $partialResult")
+                    resultListener(partialResult,done)
+                },
+                cleanUpListener = {
+                    SafeLog.i("SLM runInference", "cleanUpListener")
+                    cleanUpOnce()
+                },
+                onError = { message ->
+                    SafeLog.i("SLM runInference", "onError :: $message")
+                    onError(message)
+                },
                 images = images,
                 audioClips = audioClips,
                 notifyCancelToOnError = notifyCancelToOnError,
