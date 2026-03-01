@@ -2,7 +2,7 @@
  * =====================================================================
  *  IshizukiTech LLC — Survey App (Fake SLM Repository)
  *  ---------------------------------------------------------------------
- *  File: BaseSlmRepository.kt
+ *  File: FakeSlmRepository.kt
  *  Author: Shu Ishizuki
  *  License: MIT License
  *  © 2026 IshizukiTech LLC. All rights reserved.
@@ -22,8 +22,8 @@ import kotlinx.coroutines.flow.flow
  * A minimal fake "SLM" repository that returns streaming chunks as Flow<String>.
  *
  * Goals:
- * - Behave like a streaming LLM backend (chunk stream).
- * - Produce deterministic JSON-only outputs compatible with SlmAnswerValidator.
+ * - Behave like a streaming LLM backend (delta chunk stream).
+ * - Produce deterministic JSON-only outputs compatible with validator flows.
  * - Support BOTH follow-up formats used across SmallSteps:
  *   (A) Single follow-up:
  *       FOLLOW_UP_ANSWER_BEGIN ... FOLLOW_UP_ANSWER_END
@@ -52,7 +52,7 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
          * - This differs from [requestSetupDelayMs]. It affects the first `emit(...)` timing.
          * - Useful for reproducing cold start / warmup behavior in streaming pipelines.
          */
-        val firstChunkDelayMs: Long = 3000L,
+        val firstChunkDelayMs: Long = 3_000L,
 
         /** If true, throw during request setup (before Flow is returned). */
         val throwOnRequestSetup: Boolean = false,
@@ -95,7 +95,6 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
             return copy(
                 requestSetupDelayMs = requestSetupDelayMs.coerceAtLeast(0L),
                 firstChunkDelayMs = firstChunkDelayMs.coerceAtLeast(0L),
-                throwAfterEmits = throwAfterEmits,
                 chunkDelayMs = chunkDelayMs.coerceAtLeast(0L),
                 chunkSizeChars = chunkSizeChars.coerceAtLeast(1),
                 minMainAnswerChars = minMainAnswerChars.coerceAtLeast(1),
@@ -108,6 +107,22 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
     private val cfg: Config = config.normalized()
 
     override fun buildPrompt(userPrompt: String): String {
+        return _buildPrompt(userPrompt, phase = null)
+    }
+
+    override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
+        return _buildPrompt(userPrompt, phase = phase)
+    }
+
+    private fun _buildPrompt(userPrompt: String, phase: PromptPhase?): String {
+        val phaseLine = phase?.let {
+            val tag = when (it) {
+                PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
+                PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
+            }
+            "\nPHASE=$tag\n"
+        }.orEmpty()
+
         // NOTE:
         // - This wrapper simulates a "system + user" envelope.
         // - Keep it strict: JSON-only, single object, no analysis.
@@ -115,25 +130,7 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
 SYSTEM:
 You are a JSON-only assistant.
 Output MUST be exactly one JSON object.
-No markdown. No extra text. No analysis.
-
-USER:
-$userPrompt
-""".trimIndent()
-    }
-
-    override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
-        val phaseTag = when (phase) {
-            PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
-            PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
-        }
-        return """
-SYSTEM:
-You are a JSON-only assistant.
-Output MUST be exactly one JSON object.
-No markdown. No extra text. No analysis.
-PHASE=$phaseTag
-
+No markdown. No extra text. No analysis.$phaseLine
 USER:
 $userPrompt
 """.trimIndent()
@@ -152,9 +149,7 @@ $userPrompt
             throw IllegalStateException("fake_request_setup_error")
         }
 
-        if (setupDelay > 0L) {
-            delay(setupDelay)
-        }
+        if (setupDelay > 0L) delay(setupDelay)
 
         val safeChunkSize = cfg.chunkSizeChars
         val safeChunkDelay = cfg.chunkDelayMs
@@ -194,8 +189,6 @@ $userPrompt
 
                 !singleFollowUp.isNullOrBlank() -> {
                     val s = singleFollowUp.trim()
-                    // If the single follow-up block actually contains a VM-generated history
-                    // like "FOLLOW_UP_1_A: ...", split it into multiple answers.
                     if (looksLikeFollowUpHistory(s)) {
                         parseFollowUpAnswersFromHistory(s)
                     } else {
@@ -206,10 +199,8 @@ $userPrompt
                 else -> emptyList()
             }
 
-            // Decide whether to prepend non-JSON for robustness testing.
             val prependNonJson = shouldPrependNonJson(prompt)
 
-            // Apply fake "validation" logic.
             val json = when (phase) {
                 PromptPhase.VALIDATE_MAIN -> validateMain(mainAnswer, followUpAnswers)
                 PromptPhase.VALIDATE_FOLLOW_UP -> validateFollowUp(mainAnswer, followUpAnswers)
@@ -221,7 +212,7 @@ $userPrompt
                     append("analysis: (fake) streaming output begins\n")
                 }
                 append(json)
-                if (cfg.appendTrailingNewline) append("\n")
+                if (cfg.appendTrailingNewline) append('\n')
             }
 
             cfg.logger?.invoke(
@@ -230,19 +221,14 @@ $userPrompt
             )
 
             // Preserve the documented behavior: 0 => throw before first emit (no artificial delay).
-            if (throwAfter == 0) {
-                throw RuntimeException("fake_stream_error")
-            }
+            if (throwAfter == 0) throw RuntimeException("fake_stream_error")
 
             // Simulate time-to-first-token latency.
-            if (cfg.firstChunkDelayMs > 0L) {
-                delay(cfg.firstChunkDelayMs)
-            }
+            if (firstDelay > 0L) delay(firstDelay)
 
             var emitCount = 0
             var i = 0
 
-            // Stream as chunks.
             while (i < finalText.length) {
                 if (throwAfter >= 0 && emitCount >= throwAfter) {
                     throw RuntimeException("fake_stream_error")
@@ -277,14 +263,12 @@ $userPrompt
      */
     private fun validateMain(mainAnswer: String, followUpAnswers: List<String>): String {
         val a = mainAnswer.trim()
-
         return if (a.length >= cfg.minMainAnswerChars) {
             jsonAccepted("Looks good. Thanks!")
         } else {
-            val q = nextFollowUpQuestion(index = 1)
             jsonNeedFollowUp(
                 assistantMessage = "Thanks. I need more detail to validate your answer.",
-                followUpQuestion = q
+                followUpQuestion = nextFollowUpQuestion(index = 1)
             )
         }
     }
@@ -311,7 +295,6 @@ $userPrompt
 
         val required = requiredFollowUpsForMain(a)
 
-        // First, if any answer is present but too short, ask to clarify it (more stable than adding new questions).
         val shortIdx = followUpAnswers.indexOfFirst {
             val t = it.trim()
             t.isNotEmpty() && t.length < cfg.minFollowUpAnswerChars
@@ -327,10 +310,9 @@ $userPrompt
         val useful = followUpAnswers.filter { it.trim().length >= cfg.minFollowUpAnswerChars }
 
         if (useful.size < required) {
-            val q = nextFollowUpQuestion(index = useful.size + 1)
             return jsonNeedFollowUp(
                 assistantMessage = "Good. One more concrete detail would make this answer complete.",
-                followUpQuestion = q
+                followUpQuestion = nextFollowUpQuestion(index = useful.size + 1)
             )
         }
 
@@ -442,9 +424,9 @@ $userPrompt
      *   FOLLOW_UP_2_A: ...
      *
      * Notes:
-     * - We only collect "_A:" blocks.
+     * - We only collect "_A:" entries.
      * - Supports multi-line answers: continuation lines are included until the next "FOLLOW_UP_" marker.
-     * - Keeps behavior deterministic and simple for SmallStep testing.
+     * - Handles answers that start on the next line (e.g., "FOLLOW_UP_1_A:" then body lines).
      */
     private fun parseFollowUpAnswersFromHistory(history: String): List<String> {
         val h = history.trim()
@@ -452,38 +434,41 @@ $userPrompt
 
         val out = mutableListOf<String>()
         val current = StringBuilder()
+        var collectingAnswer = false
 
-        fun flushCurrent() {
+        fun flush() {
             val s = current.toString().trim()
             if (s.isNotBlank()) out += s
             current.setLength(0)
+            collectingAnswer = false
         }
 
         h.lineSequence().forEach { line ->
             val t = line.trim()
 
-            // Start of a new follow-up marker.
             if (t.startsWith("FOLLOW_UP_")) {
-                // If we were collecting an answer, flush it when a new marker begins.
-                if (current.isNotEmpty()) flushCurrent()
+                if (collectingAnswer) flush()
 
-                val idx = t.indexOf("_A:")
-                if (idx > 0 && idx + 3 <= t.length) {
-                    val ans = t.substring(idx + 3).trim()
-                    if (ans.isNotBlank()) {
-                        current.append(ans)
+                val aIdx = t.indexOf("_A:")
+                if (aIdx > 0) {
+                    collectingAnswer = true
+                    val inline = t.substring(aIdx + 3).trim()
+                    if (inline.isNotBlank()) {
+                        current.append(inline)
                     }
+                } else {
+                    collectingAnswer = false
                 }
                 return@forEach
             }
 
-            // Continuation line (multi-line answer body).
-            if (current.isNotEmpty()) {
-                current.append('\n').append(line)
+            if (collectingAnswer) {
+                if (current.isNotEmpty()) current.append('\n')
+                current.append(line)
             }
         }
 
-        if (current.isNotEmpty()) flushCurrent()
+        if (collectingAnswer) flush()
         return out
     }
 

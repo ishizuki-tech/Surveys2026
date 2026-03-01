@@ -16,8 +16,10 @@ package com.negi.surveys.chat
 import android.os.SystemClock
 import java.security.MessageDigest
 import java.util.Locale
+import kotlin.math.max
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
@@ -34,8 +36,7 @@ import org.json.JSONObject
  * - Sends Begin/Delta/End/Error into ChatStreamBridge.
  *
  * Privacy note:
- * - This class does not log raw answers, but underlying native libs may log prompts
- *   in debug builds depending on their log configuration.
+ * - This class does not log raw answers; only metadata (length/hash).
  */
 class AnswerValidator(
     private val repository: RepositoryI,
@@ -47,10 +48,13 @@ class AnswerValidator(
 
     override suspend fun validateMain(questionId: String, answer: String): ValidationOutcome {
         return withContext(Dispatchers.Default) {
+            val t0 = SystemClock.elapsedRealtime()
+
             val userPrompt = buildValidationUserPrompt(
+                phase = PromptPhaseTag.VALIDATE_MAIN,
                 questionId = questionId,
                 mainAnswer = answer,
-                followUpAnswer = null
+                followUpAnswerPayload = null
             )
             val modelPrompt = repository.buildPrompt(userPrompt)
 
@@ -63,7 +67,8 @@ class AnswerValidator(
                 maxChars = maxChars
             )
 
-            log("validateMain: qid=${questionId.trim()} stop=${result.reason} chars=${result.text.length}")
+            val elapsed = SystemClock.elapsedRealtime() - t0
+            log("validateMain: qid=${questionId.trim()} stop=${result.reason} chars=${result.text.length} elapsedMs=$elapsed")
 
             parseOutcomeOrFallback(
                 questionId = questionId,
@@ -81,10 +86,13 @@ class AnswerValidator(
         followUpAnswer: String
     ): ValidationOutcome {
         return withContext(Dispatchers.Default) {
+            val t0 = SystemClock.elapsedRealtime()
+
             val userPrompt = buildValidationUserPrompt(
+                phase = PromptPhaseTag.VALIDATE_FOLLOW_UP,
                 questionId = questionId,
                 mainAnswer = mainAnswer,
-                followUpAnswer = followUpAnswer
+                followUpAnswerPayload = followUpAnswer
             )
             val modelPrompt = repository.buildPrompt(userPrompt)
 
@@ -97,7 +105,8 @@ class AnswerValidator(
                 maxChars = maxChars
             )
 
-            log("validateFollowUp: qid=${questionId.trim()} stop=${result.reason} chars=${result.text.length}")
+            val elapsed = SystemClock.elapsedRealtime() - t0
+            log("validateFollowUp: qid=${questionId.trim()} stop=${result.reason} chars=${result.text.length} elapsedMs=$elapsed")
 
             parseOutcomeOrFallback(
                 questionId = questionId,
@@ -109,15 +118,27 @@ class AnswerValidator(
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Prompt construction
+    // ---------------------------------------------------------------------
+
+    /**
+     * Build a strict JSON-only prompt with backward-compatible marker blocks.
+     *
+     * Why markers:
+     * - FakeSlmRepository extracts MAIN_ANSWER via MAIN_ANSWER_BEGIN/END.
+     * - It can parse follow-ups via FOLLOW_UP_ANSWER_BEGIN/END or FOLLOW_UP_HISTORY_BEGIN/END.
+     */
     private fun buildValidationUserPrompt(
+        phase: PromptPhaseTag,
         questionId: String,
         mainAnswer: String,
-        followUpAnswer: String?
+        followUpAnswerPayload: String?
     ): String {
         val qid = questionId.trim()
         val main = mainAnswer.trim()
 
-        val fuRaw = followUpAnswer?.trim().orEmpty()
+        val fuRaw = followUpAnswerPayload?.trim().orEmpty()
         val hasFollowUp = fuRaw.isNotBlank()
         val treatAsHistory = hasFollowUp && looksLikeFollowUpHistory(fuRaw)
 
@@ -126,35 +147,42 @@ class AnswerValidator(
         val latestQ = extracted?.question?.trim().orEmpty()
 
         if (hasFollowUp) {
-            // Do NOT log raw answers. Only a short digest for debugging correctness.
+            // Do NOT log raw answers. Only metadata.
             val sha8 = sha256Hex(latestA).take(8)
             log(
-                "followUpDetected: treatAsHistory=$treatAsHistory " +
+                "followUpDetected: phase=${phase.tag} treatAsHistory=$treatAsHistory " +
                         "latestQlen=${latestQ.length} latestAlen=${latestA.length} latestAsha8=$sha8"
             )
         }
 
-        val followUpBlock = buildString {
-            append("FOLLOW_UP_ANSWER:\n")
-            if (latestA.isNotBlank()) {
-                append(latestA).append('\n')
-            }
-            append('\n')
+        val followUpSection = if (!hasFollowUp) {
+            ""
+        } else {
+            buildString {
+                // Single follow-up (most recent answer). Fake repo supports this block.
+                appendLine("FOLLOW_UP_ANSWER_BEGIN")
+                if (latestA.isNotBlank()) appendLine(latestA)
+                appendLine("FOLLOW_UP_ANSWER_END")
+                appendLine()
 
-            append("FOLLOW_UP_QUESTION:\n")
-            if (latestQ.isNotBlank()) {
-                append(latestQ).append('\n')
-            }
-            append('\n')
+                // Optional: include the follow-up question as extra context (not required by fake repo).
+                appendLine("FOLLOW_UP_QUESTION:")
+                if (latestQ.isNotBlank()) appendLine(latestQ)
+                appendLine()
 
-            if (treatAsHistory) {
-                append("FOLLOW_UP_HISTORY:\n")
-                append(fuRaw).append('\n')
+                // History block. Fake repo supports parsing FOLLOW_UP_n_A from this.
+                if (treatAsHistory) {
+                    appendLine("FOLLOW_UP_HISTORY_BEGIN")
+                    appendLine(fuRaw)
+                    appendLine("FOLLOW_UP_HISTORY_END")
+                    appendLine()
+                }
             }
-        }.trimEnd() + "\n"
+        }
 
         // IMPORTANT:
-        // The Rules section MUST explicitly allow the model to use follow-up answers.
+        // Rules MUST explicitly allow use of follow-ups, and we must provide PHASE tag in user prompt
+        // so FakeSlmRepository can detect it even if repository.buildPrompt(...) wrapper changes.
         return """
 Return exactly ONE JSON object and nothing else.
 - No markdown, no code fences, no backticks.
@@ -173,22 +201,34 @@ Rules:
 - If FOLLOW_UP_ANSWER is non-empty, do NOT repeat the same follow-up question again.
   Either ACCEPTED, or ask a DIFFERENT and more specific follow-up question.
 
+PHASE=${phase.tag}
 QUESTION_ID: $qid
-MAIN_ANSWER:
-$main
 
-$followUpBlock
+MAIN_ANSWER_BEGIN
+$main
+MAIN_ANSWER_END
+
+$followUpSection
 """.trimIndent()
     }
 
+    private enum class PromptPhaseTag(val tag: String) {
+        VALIDATE_MAIN("VALIDATE_MAIN"),
+        VALIDATE_FOLLOW_UP("VALIDATE_FOLLOW_UP")
+    }
+
+    // ---------------------------------------------------------------------
+    // Streaming collection
+    // ---------------------------------------------------------------------
+
     private suspend fun collectStreamingTextResult(
         promptChars: Int,
-        flowProvider: suspend () -> kotlinx.coroutines.flow.Flow<String>,
+        flowProvider: suspend () -> Flow<String>,
         timeoutMs: Long,
         maxChars: Int
     ): FlowTextResult {
-        val maxCharsSafe = maxChars.coerceAtLeast(0)
-        val timeoutMsSafe = timeoutMs.coerceAtLeast(0L)
+        val maxCharsSafe = max(0, maxChars)
+        val timeoutMsSafe = max(0L, timeoutMs)
 
         val sessionId = streamBridge.begin()
         log("collectStreamingText: session=$sessionId promptChars=$promptChars timeoutMs=$timeoutMsSafe maxChars=$maxCharsSafe")
@@ -200,11 +240,11 @@ $followUpBlock
         )
 
         return try {
-            val result = flowProvider().collectToTextSafely(
+            val result = flowProvider().collectToTextResult(
                 timeoutMs = timeoutMsSafe,
                 maxChars = maxCharsSafe,
-                onChunk = { chunk, _ ->
-                    if (chunk.isEmpty()) return@collectToTextSafely
+                onChunk = onChunk@{ chunk, _ ->
+                    if (chunk.isEmpty()) return@onChunk
 
                     val out = coalescer.onChunk(chunk)
                     if (!out.isNullOrEmpty()) {
@@ -212,7 +252,6 @@ $followUpBlock
                     }
                 }
             )
-
             coalescer.flush(force = true)?.let { tail ->
                 if (tail.isNotEmpty()) {
                     streamBridge.emitChunk(sessionId, tail)
@@ -255,6 +294,10 @@ $followUpBlock
         }
     }
 
+    // ---------------------------------------------------------------------
+    // Parsing outcome
+    // ---------------------------------------------------------------------
+
     private fun parseOutcomeOrFallback(
         questionId: String,
         raw: String,
@@ -268,13 +311,20 @@ $followUpBlock
             .trim()
 
         if (cleaned.isBlank()) {
-            val msg = when {
-                stopReason == FlowTextStopReason.TIMEOUT -> "Validation timed out. Please add one more detail."
-                stopReason == FlowTextStopReason.ERROR && errorToken == "ModelNotReadyException" ->
-                    "Model is still warming up. Please try again in a moment."
-                stopReason == FlowTextStopReason.ERROR -> "Validation failed due to a runtime error. Please try again."
-                else -> "I couldn't read the validation result. One more detail would help."
+            val msg = when (stopReason) {
+                FlowTextStopReason.TIMEOUT ->
+                    "Validation timed out. Please add one more detail."
+                FlowTextStopReason.MAX_CHARS ->
+                    "Validation output was too long and got clipped. Please add one more concrete detail."
+                FlowTextStopReason.ERROR ->
+                    when (errorToken) {
+                        "ModelNotReadyException" -> "Model is still warming up. Please try again in a moment."
+                        else -> "Validation failed due to a runtime error. Please try again."
+                    }
+                FlowTextStopReason.COMPLETED ->
+                    "I couldn't read the validation result. One more detail would help."
             }
+
             log("parseOutcome: qid=${questionId.trim()} empty -> stop=$stopReason token=$errorToken")
             return ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
@@ -285,10 +335,21 @@ $followUpBlock
 
         val jsonStr = extractValidationJsonObject(cleaned)
         if (jsonStr == null) {
-            log("parseOutcome: qid=${questionId.trim()} jsonNotFound -> fallback NEED_FOLLOW_UP")
+            val msg = when (stopReason) {
+                FlowTextStopReason.TIMEOUT ->
+                    "Validation timed out before producing a full result. One more detail would help."
+                FlowTextStopReason.MAX_CHARS ->
+                    "Validation output got clipped before a full JSON result appeared. One more detail would help."
+                FlowTextStopReason.ERROR ->
+                    "Validation failed before producing a parseable result. Please add one more detail."
+                FlowTextStopReason.COMPLETED ->
+                    "I couldn't reliably parse the validation result. One more detail would help."
+            }
+
+            log("parseOutcome: qid=${questionId.trim()} jsonNotFound -> stop=$stopReason")
             return ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
-                assistantMessage = "I couldn't reliably parse the validation result. One more detail would help.",
+                assistantMessage = msg,
                 followUpQuestion = fallbackFollowUp
             )
         }
@@ -325,7 +386,7 @@ $followUpBlock
                 )
             }
         } catch (_: Throwable) {
-            log("parseOutcome: qid=${questionId.trim()} jsonParseError -> fallback NEED_FOLLOW_UP")
+            log("parseOutcome: qid=${questionId.trim()} jsonParseError -> fallback NEED_FOLLOW_UP stop=$stopReason")
             ValidationOutcome(
                 status = ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = "Validation output was malformed. Please add one more detail.",
@@ -334,6 +395,14 @@ $followUpBlock
         }
     }
 
+    /**
+     * Extract a single JSON object from a blob (tolerant to prefixed garbage).
+     *
+     * Strategy:
+     * - Scan for '{' candidates.
+     * - Extract balanced JSON object using a small state machine (strings + escapes).
+     * - Validate it contains "status" and is parseable via JSONObject.
+     */
     private fun extractValidationJsonObject(text: String): String? {
         if (text.isBlank()) return null
 
@@ -359,7 +428,6 @@ $followUpBlock
             }.getOrDefault(false)
 
             if (ok) return candidate
-
             cursor = start + 1
         }
 
@@ -436,6 +504,17 @@ $followUpBlock
         return t
     }
 
+    // ---------------------------------------------------------------------
+    // Follow-up payload parsing
+    // ---------------------------------------------------------------------
+
+    /**
+     * Heuristic: detect whether a text blob looks like follow-up history content.
+     *
+     * Supports:
+     * - VM legacy lines: FOLLOW_UP_1_Q: ... / FOLLOW_UP_1_A: ...
+     * - Payloads that contain FOLLOW_UP_TURNS + those lines.
+     */
     private fun looksLikeFollowUpHistory(text: String): Boolean {
         val raw = text.trim()
         if (raw.isEmpty()) return false
@@ -443,6 +522,13 @@ $followUpBlock
         return raw.lineSequence().any { line -> re.matches(line.trim()) }
     }
 
+    /**
+     * Extract the latest follow-up turn from the payload built by the VM.
+     *
+     * Important:
+     * - CURRENT_FOLLOW_UP_Q/A can be multi-line (user may insert newlines).
+     * - Continuation lines are collected until the next marker line begins.
+     */
     private fun extractLatestFollowUpTurn(payload: String): FollowUpTurnExtract? {
         val lines = payload.replace("\u0000", "").split('\n')
         if (lines.isEmpty()) return null
@@ -452,7 +538,10 @@ $followUpBlock
 
         val qRe = Regex("""^FOLLOW_UP_(\d+)_Q:\s*(.*)$""")
         val aRe = Regex("""^FOLLOW_UP_(\d+)_A:\s*(.*)$""")
-        val anyMarkerRe = Regex("""^(CURRENT_FOLLOW_UP_[QA]|FOLLOW_UP_\d+_[QA]|FOLLOW_UP_TURNS:)\s*:?.*$""")
+
+        val anyMarkerRe = Regex(
+            """^(CURRENT_FOLLOW_UP_[QA]|FOLLOW_UP_\d+_[QA]|FOLLOW_UP_TURNS:|FOLLOW_UP_HISTORY_BEGIN|FOLLOW_UP_HISTORY_END)\s*:?.*$"""
+        )
 
         var currentQ: String? = null
         var currentA: String? = null
@@ -461,60 +550,56 @@ $followUpBlock
         var latestA: String? = null
         var latestIdx = -1
 
+        fun readContinuation(startIndex: Int, head: String): Pair<String, Int> {
+            val buf = StringBuilder().append(head)
+            var j = startIndex + 1
+            while (j < lines.size && !anyMarkerRe.matches(lines[j].trim())) {
+                buf.append('\n').append(lines[j])
+                j++
+            }
+            return buf.toString() to j
+        }
+
         var i = 0
         while (i < lines.size) {
             val line = lines[i]
+            val t = line.trim()
 
-            currentQRe.matchEntire(line.trim())?.let { m ->
-                currentQ = m.groupValues[1]
-                i += 1
-                continue
-            }
-            currentARe.matchEntire(line.trim())?.let { m ->
-                currentA = m.groupValues[1]
-                i += 1
+            currentQRe.matchEntire(t)?.let { m ->
+                val (body, nextIdx) = readContinuation(i, m.groupValues[1])
+                currentQ = body
+                i = nextIdx
                 continue
             }
 
-            val qm = qRe.matchEntire(line.trim())
+            currentARe.matchEntire(t)?.let { m ->
+                val (body, nextIdx) = readContinuation(i, m.groupValues[1])
+                currentA = body
+                i = nextIdx
+                continue
+            }
+
+            val qm = qRe.matchEntire(t)
             if (qm != null) {
                 val idx = qm.groupValues[1].toIntOrNull() ?: -1
-                val buf = StringBuilder()
-                buf.append(qm.groupValues[2])
-
-                var j = i + 1
-                while (j < lines.size && !anyMarkerRe.matches(lines[j].trim())) {
-                    buf.append('\n').append(lines[j])
-                    j++
-                }
-
+                val (body, nextIdx) = readContinuation(i, qm.groupValues[2])
                 if (idx >= latestIdx) {
                     latestIdx = idx
-                    latestQ = buf.toString()
+                    latestQ = body
                 }
-
-                i = j
+                i = nextIdx
                 continue
             }
 
-            val am = aRe.matchEntire(line.trim())
+            val am = aRe.matchEntire(t)
             if (am != null) {
                 val idx = am.groupValues[1].toIntOrNull() ?: -1
-                val buf = StringBuilder()
-                buf.append(am.groupValues[2])
-
-                var j = i + 1
-                while (j < lines.size && !anyMarkerRe.matches(lines[j].trim())) {
-                    buf.append('\n').append(lines[j])
-                    j++
-                }
-
+                val (body, nextIdx) = readContinuation(i, am.groupValues[2])
                 if (idx >= latestIdx) {
                     latestIdx = idx
-                    latestA = buf.toString()
+                    latestA = body
                 }
-
-                i = j
+                i = nextIdx
                 continue
             }
 
@@ -533,6 +618,10 @@ $followUpBlock
         val answer: String
     )
 
+    // ---------------------------------------------------------------------
+    // Utility
+    // ---------------------------------------------------------------------
+
     private fun sha256Hex(text: String): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val bytes = digest.digest(text.toByteArray(Charsets.UTF_8))
@@ -547,6 +636,13 @@ $followUpBlock
         return sb.toString()
     }
 
+    /**
+     * Coalesce streaming chunks to reduce UI event pressure.
+     *
+     * Guarantees:
+     * - Does not drop data (only batches).
+     * - Flushes on buffer cap, time interval, chunk size, or newline.
+     */
     private class StreamChunkCoalescer(
         private val minEmitChars: Int,
         private val maxEmitIntervalMs: Long,

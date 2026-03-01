@@ -14,8 +14,7 @@
 package com.negi.surveys.chat
 
 import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ConcurrentLinkedQueue
+import kotlin.math.max
 
 /**
  * Stable key for per-question chat draft state.
@@ -106,16 +105,20 @@ interface ChatDraftStore {
 }
 
 /**
- * Simple in-memory implementation.
+ * In-memory implementation with bounded growth and PII-safe debug stats.
  *
- * Notes:
- * - Lives as long as the process lives.
- * - Must be owned by a long-lived parent (AppRoot/Navigation VM) to be useful.
- * - Applies optional caps to prevent unbounded growth (messages, follow-ups, large strings).
- * - Also caps the number of keys to avoid unbounded draft accumulation across prompt changes.
+ * Key properties:
+ * - Deterministic eviction with LRU (least-recently-used) semantics.
+ * - Thread-safe via a single lock (simple + predictable).
+ * - Size caps for lists and large strings to reduce memory risk.
+ *
+ * NOTE:
+ * - This store does NOT redact content; it only bounds size.
+ * - If you need redaction, do it at the ViewModel layer based on UI policy.
  */
 class InMemoryChatDraftStore(
-    private val config: Config = Config()
+    config: Config = Config(),
+    private val logger: ((String) -> Unit)? = null
 ) : ChatDraftStore {
 
     /**
@@ -123,126 +126,254 @@ class InMemoryChatDraftStore(
      *
      * Notes:
      * - Defaults are intentionally conservative.
-     * - Tweak as needed for your ReviewScreen policy.
+     * - Use maxKeys=0 to disable storage (save becomes a no-op, load always returns null).
      */
     data class Config(
-        /** Max number of draft keys to keep in memory. Oldest keys are evicted best-effort. */
+        /** Max number of draft keys to keep in memory. */
         val maxKeys: Int = 64,
 
+        /** Max number of chat messages stored per draft. */
         val maxMessages: Int = 250,
+
+        /** Max number of follow-up turns stored per draft. */
         val maxFollowUps: Int = 24,
 
+        /** Max chars for the stored main answer. */
         val maxMainAnswerChars: Int = 32_000,
-        val maxFollowUpQuestionChars: Int = 8_000,
-        val maxCompletionPayloadChars: Int = 96_000,
-        val maxInputDraftChars: Int = 16_000
-    )
 
-    private val map = ConcurrentHashMap<DraftKey, ChatDraft>()
+        /** Max chars for the stored current follow-up question (draft-level). */
+        val maxCurrentFollowUpQuestionChars: Int = 8_000,
+
+        /** Max chars for the stored completion payload. */
+        val maxCompletionPayloadChars: Int = 96_000,
+
+        /** Max chars for the stored input draft. */
+        val maxInputDraftChars: Int = 16_000,
+
+        // -----------------------------------------------------------------
+        // Per-message caps (to avoid huge streamText bloating memory)
+        // -----------------------------------------------------------------
+
+        /** Max chars for ChatMessage.text (fallback). */
+        val maxMessageTextChars: Int = 8_000,
+
+        /** Max chars for ChatMessage.assistantMessage. */
+        val maxMessageAssistantChars: Int = 8_000,
+
+        /** Max chars for ChatMessage.followUpQuestion. */
+        val maxMessageFollowUpQuestionChars: Int = 8_000,
+
+        /** Max chars for ChatMessage.streamText (embedded model output / debug). */
+        val maxMessageStreamTextChars: Int = 16_000,
+
+        // -----------------------------------------------------------------
+        // Per-follow-up caps
+        // -----------------------------------------------------------------
+
+        /** Max chars for FollowUpTurn.question. */
+        val maxFollowUpTurnQuestionChars: Int = 2_000,
+
+        /** Max chars for FollowUpTurn.answer. */
+        val maxFollowUpTurnAnswerChars: Int = 8_000
+    ) {
+        /** Normalize config to safe operational values. */
+        fun normalized(): Config {
+            return copy(
+                maxKeys = max(0, maxKeys),
+                maxMessages = max(0, maxMessages),
+                maxFollowUps = max(0, maxFollowUps),
+                maxMainAnswerChars = max(0, maxMainAnswerChars),
+                maxCurrentFollowUpQuestionChars = max(0, maxCurrentFollowUpQuestionChars),
+                maxCompletionPayloadChars = max(0, maxCompletionPayloadChars),
+                maxInputDraftChars = max(0, maxInputDraftChars),
+                maxMessageTextChars = max(0, maxMessageTextChars),
+                maxMessageAssistantChars = max(0, maxMessageAssistantChars),
+                maxMessageFollowUpQuestionChars = max(0, maxMessageFollowUpQuestionChars),
+                maxMessageStreamTextChars = max(0, maxMessageStreamTextChars),
+                maxFollowUpTurnQuestionChars = max(0, maxFollowUpTurnQuestionChars),
+                maxFollowUpTurnAnswerChars = max(0, maxFollowUpTurnAnswerChars)
+            )
+        }
+    }
 
     /**
-     * Insertion-order queue used for best-effort eviction.
+     * PII-safe stats snapshot for debugging.
      *
-     * Notes:
-     * - We may push duplicate keys; eviction checks current map membership.
-     * - This keeps implementation simple and thread-friendly.
+     * Important:
+     * - This intentionally does not include draft contents.
      */
-    private val keyQueue = ConcurrentLinkedQueue<DraftKey>()
+    data class StoreStats(
+        val enabled: Boolean,
+        val keys: Int,
+        val maxKeys: Int,
+        val loads: Long,
+        val saves: Long,
+        val clears: Long,
+        val evictions: Long,
+        val lastEvictedKey: DraftKey?
+    )
 
-    override fun load(key: DraftKey): ChatDraft? {
-        val k = key.normalized()
-        val v = map[k] ?: return null
-        // Return a fresh snapshot to avoid exposing internal list references.
-        return v.freeze()
-    }
+    private val cfg: Config = config.normalized()
+    private val lock = Any()
 
-    override fun save(key: DraftKey, draft: ChatDraft) {
-        val cfg = normalizedConfig(config)
+    /**
+     * LRU map (accessOrder=true) to evict least-recently-used keys deterministically.
+     *
+     * Threading:
+     * - Guarded by [lock].
+     */
+    private val lru = LinkedHashMap<DraftKey, ChatDraft>(/* initialCapacity */ 128, /* loadFactor */ 0.75f, /* accessOrder */ true)
 
-        val k = key.normalized()
-        val capped = draft
-            .freeze()
-            .applyCaps(cfg)
+    // Stats (guarded by lock)
+    private var loads: Long = 0L
+    private var saves: Long = 0L
+    private var clears: Long = 0L
+    private var evictions: Long = 0L
+    private var lastEvictedKey: DraftKey? = null
 
-        map[k] = capped
-        keyQueue.add(k)
-
-        evictIfNeeded(cfg)
-    }
-
-    override fun clear(key: DraftKey) {
-        val k = key.normalized()
-        map.remove(k)
-        // keyQueue cleanup is best-effort; stale entries will be ignored during eviction.
-    }
-
-    // ---------------------------------------------------------------------
-    // Internal helpers
-    // ---------------------------------------------------------------------
-
-    private fun normalizedConfig(cfg: Config): Config {
-        return cfg.copy(
-            maxKeys = cfg.maxKeys.coerceAtLeast(0),
-            maxMessages = cfg.maxMessages.coerceAtLeast(0),
-            maxFollowUps = cfg.maxFollowUps.coerceAtLeast(0),
-            maxMainAnswerChars = cfg.maxMainAnswerChars.coerceAtLeast(0),
-            maxFollowUpQuestionChars = cfg.maxFollowUpQuestionChars.coerceAtLeast(0),
-            maxCompletionPayloadChars = cfg.maxCompletionPayloadChars.coerceAtLeast(0),
-            maxInputDraftChars = cfg.maxInputDraftChars.coerceAtLeast(0)
+    /** Returns a PII-safe stats snapshot. */
+    fun statsSnapshot(): StoreStats = synchronized(lock) {
+        StoreStats(
+            enabled = cfg.maxKeys > 0,
+            keys = lru.size,
+            maxKeys = cfg.maxKeys,
+            loads = loads,
+            saves = saves,
+            clears = clears,
+            evictions = evictions,
+            lastEvictedKey = lastEvictedKey
         )
+    }
+
+    override fun load(key: DraftKey): ChatDraft? = synchronized(lock) {
+        loads += 1
+
+        if (cfg.maxKeys <= 0) {
+            // Storage disabled.
+            return@synchronized null
+        }
+
+        val k = key.normalized()
+        val v = lru[k] ?: return@synchronized null
+        // Return a fresh snapshot to avoid exposing internal list references.
+        v.freeze()
+    }
+
+    override fun save(key: DraftKey, draft: ChatDraft): Unit = synchronized(lock) {
+        saves += 1
+
+        if (cfg.maxKeys <= 0) {
+            // Storage disabled. Best-effort: keep map empty.
+            if (lru.isNotEmpty()) lru.clear()
+            return@synchronized
+        }
+
+        val k = key.normalized()
+        val capped = draft.freeze().applyCaps(cfg)
+
+        lru[k] = capped
+
+        val evicted = evictIfNeededLocked(cfg.maxKeys)
+        if (evicted > 0) {
+            logger?.invoke("InMemoryChatDraftStore: evicted=$evicted keysNow=${lru.size} maxKeys=${cfg.maxKeys}")
+        }
+    }
+
+    override fun clear(key: DraftKey): Unit = synchronized(lock) {
+        clears += 1
+        val k = key.normalized()
+        lru.remove(k)
+    }
+
+    // ---------------------------------------------------------------------
+    // Internal helpers (guarded by lock)
+    // ---------------------------------------------------------------------
+
+    private fun evictIfNeededLocked(maxKeys: Int): Int {
+        if (maxKeys <= 0) {
+            val n = lru.size
+            if (n > 0) {
+                lru.clear()
+                evictions += n.toLong()
+            }
+            lastEvictedKey = null
+            return n
+        }
+
+        var removed = 0
+        while (lru.size > maxKeys) {
+            val it = lru.entries.iterator()
+            if (!it.hasNext()) break
+            val victim = it.next()
+            it.remove()
+
+            removed += 1
+            evictions += 1
+            lastEvictedKey = victim.key
+        }
+        return removed
     }
 
     /**
      * Apply size caps to reduce the risk of unbounded memory growth.
      *
      * Important:
-     * - This does NOT attempt to redact sensitive data; it only bounds size.
+     * - This does NOT redact sensitive data; it only bounds size.
      * - If you need redaction, do it at the ViewModel layer based on UI policy.
      */
     private fun ChatDraft.applyCaps(cfg: Config): ChatDraft {
-        val trimmedMessages = if (cfg.maxMessages == 0) emptyList() else messages.takeLast(cfg.maxMessages)
-        val trimmedFollowUps = if (cfg.maxFollowUps == 0) emptyList() else followUps.takeLast(cfg.maxFollowUps)
+        val trimmedMessages = when {
+            cfg.maxMessages <= 0 -> emptyList()
+            messages.size <= cfg.maxMessages -> messages
+            else -> messages.takeLast(cfg.maxMessages)
+        }.map { it.capStrings(cfg) }
+
+        val trimmedFollowUps = when {
+            cfg.maxFollowUps <= 0 -> emptyList()
+            followUps.size <= cfg.maxFollowUps -> followUps
+            else -> followUps.takeLast(cfg.maxFollowUps)
+        }.map { it.capStrings(cfg) }
 
         return copy(
             messages = trimmedMessages.toList(),
             followUps = trimmedFollowUps.toList(),
             mainAnswer = mainAnswer.takeSafeChars(cfg.maxMainAnswerChars),
-            currentFollowUpQuestion = currentFollowUpQuestion.takeSafeChars(cfg.maxFollowUpQuestionChars),
+            currentFollowUpQuestion = currentFollowUpQuestion.takeSafeChars(cfg.maxCurrentFollowUpQuestionChars),
             completionPayload = completionPayload?.takeSafeChars(cfg.maxCompletionPayloadChars),
             inputDraft = inputDraft.takeSafeChars(cfg.maxInputDraftChars)
         )
     }
 
     /**
-     * Best-effort eviction to cap the number of draft keys.
+     * Cap message string fields to limit memory usage.
      *
-     * Strategy:
-     * - Maintain a queue of keys we have saved.
-     * - When map grows beyond maxKeys, poll keys and remove them if still present.
-     *
-     * Notes:
-     * - This is not a perfect LRU, but it is deterministic and cheap.
+     * Note:
+     * - This is content-preserving (truncation only).
+     * - IDs are not modified.
      */
-    private fun evictIfNeeded(cfg: Config) {
-        val maxKeys = cfg.maxKeys
-        if (maxKeys <= 0) {
-            map.clear()
-            // Keep queue bounded loosely.
-            while (keyQueue.poll() != null) { /* drain */ }
-            return
-        }
+    private fun ChatMessage.capStrings(cfg: Config): ChatMessage {
+        val cappedText = text.takeSafeChars(cfg.maxMessageTextChars)
+        val cappedAssistant = assistantMessage?.takeSafeChars(cfg.maxMessageAssistantChars)
+        val cappedFollowUp = followUpQuestion?.takeSafeChars(cfg.maxMessageFollowUpQuestionChars)
+        val cappedStream = streamText?.takeSafeChars(cfg.maxMessageStreamTextChars)
 
-        while (map.size > maxKeys) {
-            val victim = keyQueue.poll() ?: break
-            // Remove only if it still exists (stale queue entries are harmless).
-            map.remove(victim)
-        }
+        // Keep structure identical; only cap strings.
+        return copy(
+            text = cappedText,
+            assistantMessage = cappedAssistant,
+            followUpQuestion = cappedFollowUp,
+            streamText = cappedStream
+        )
+    }
 
-        // Optional hygiene: prevent the queue from growing without bound if callers save frequently.
-        val hardQueueCap = maxKeys * 6
-        while (keyQueue.size > hardQueueCap) {
-            keyQueue.poll() ?: break
-        }
+    /**
+     * Cap follow-up turn fields.
+     */
+    private fun FollowUpTurn.capStrings(cfg: Config): FollowUpTurn {
+        return copy(
+            question = question.takeSafeChars(cfg.maxFollowUpTurnQuestionChars),
+            answer = answer.takeSafeChars(cfg.maxFollowUpTurnAnswerChars)
+        )
     }
 
     /**

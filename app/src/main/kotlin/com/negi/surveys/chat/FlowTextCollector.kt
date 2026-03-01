@@ -19,7 +19,7 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.withTimeout
 
 /**
- * Reason why collection finished.
+ * Reason why flow collection stopped.
  */
 enum class FlowTextStopReason {
     /** Upstream completed normally. */
@@ -28,19 +28,19 @@ enum class FlowTextStopReason {
     /** Timeout reached; partial text returned. */
     TIMEOUT,
 
-    /** maxChars reached; collection stopped early and text was clipped. */
+    /** Output size cap reached; collection stopped early and text was clipped. */
     MAX_CHARS,
 
-    /** Unexpected error; partial text returned with a sanitized token. */
+    /** Unexpected error; partial text returned with a sanitized error token. */
     ERROR
 }
 
 /**
- * Result of collecting a Flow<String> into text.
+ * Result of collecting a [Flow] of text chunks into a single string.
  *
- * @property text Collected (possibly partial) text.
+ * @property text Collected text (possibly partial).
  * @property reason Why collection stopped.
- * @property errorToken Sanitized error token when reason == ERROR.
+ * @property errorToken Sanitized error token when [reason] == [FlowTextStopReason.ERROR].
  */
 data class FlowTextResult(
     val text: String,
@@ -49,87 +49,86 @@ data class FlowTextResult(
 )
 
 /**
- * Collects a streaming Flow<String> into a single String safely.
+ * Collects a streaming [Flow]<[String]> into a single [String].
  *
  * Design goals:
- * - Bound memory usage via maxChars.
- * - Provide optional per-chunk hook (for live UI updates).
- * - Support timeout to avoid hanging forever.
+ * - Bound memory usage via [maxChars].
+ * - Optional per-chunk hook for live UI updates.
+ * - Optional timeout to avoid hanging forever.
  *
  * Behavior:
  * - Timeout => returns partial text.
- * - Cancellation => rethrows CancellationException.
- * - Other errors => returns partial text as much as possible (use [collectToTextSafely] for details).
+ * - Cancellation => rethrows [CancellationException].
+ * - Other errors => returns partial text (see [collectToTextResult]).
  *
  * Timeout semantics:
- * - timeoutMs > 0 => enforce timeout using withTimeout(timeoutMs).
- * - timeoutMs <= 0 => NO TIMEOUT (collect until completion or maxChars).
+ * - [timeoutMs] > 0 => enforce timeout via [withTimeout].
+ * - [timeoutMs] <= 0 => NO TIMEOUT (collect until completion or [maxChars]).
  *
  * NOTE:
- * - This function intentionally does not log user content.
+ * - This API intentionally does not log user content.
  */
 suspend fun Flow<String>.collectToText(
     timeoutMs: Long = 30_000L,
     maxChars: Int = 32_000,
     onChunk: ((chunk: String, totalChars: Int) -> Unit)? = null
 ): String {
-    return collectToTextSafely(timeoutMs, maxChars, onChunk).text
+    return collectToTextResult(timeoutMs, maxChars, onChunk).text
 }
 
 /**
- * Collects a streaming Flow<String> into text and returns a structured result.
+ * Collects a streaming [Flow]<[String]> into text and returns a structured result.
  *
  * Differences vs [collectToText]:
- * - Returns a [FlowTextResult] including stop reason and a sanitized error token.
+ * - Returns a [FlowTextResult] including stop reason and an error token.
  * - Still rethrows [CancellationException] to respect structured concurrency.
  *
  * Timeout semantics:
- * - timeoutMs > 0 => enforce timeout using withTimeout(timeoutMs).
- * - timeoutMs <= 0 => NO TIMEOUT (collect until completion or maxChars limit).
+ * - [timeoutMs] > 0 => enforce timeout.
+ * - [timeoutMs] <= 0 => NO TIMEOUT (collect until completion or [maxChars]).
  */
-suspend fun Flow<String>.collectToTextSafely(
+suspend fun Flow<String>.collectToTextResult(
     timeoutMs: Long = 30_000L,
     maxChars: Int = 32_000,
     onChunk: ((chunk: String, totalChars: Int) -> Unit)? = null
 ): FlowTextResult {
-    val maxCharsSafe = maxChars.coerceAtLeast(0)
-    if (maxCharsSafe == 0) {
+    val limit = maxChars.coerceAtLeast(0)
+    if (limit == 0) {
         return FlowTextResult(
             text = "",
             reason = FlowTextStopReason.MAX_CHARS
         )
     }
 
-    val sb = StringBuilder(minOf(maxCharsSafe, 4_096))
+    val sb = StringBuilder(minOf(limit, 4_096))
 
-    try {
+    return try {
         if (timeoutMs > 0L) {
             withTimeout(timeoutMs) {
-                collectInto(sb, maxCharsSafe, onChunk)
+                collectInto(sb, limit, onChunk)
             }
         } else {
-            // No timeout requested; collect until completion or maxChars limit.
-            collectInto(sb, maxCharsSafe, onChunk)
+            collectInto(sb, limit, onChunk)
         }
 
-        return FlowTextResult(
+        FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.COMPLETED
         )
-    } catch (_: MaxCharsReached) {
-        return FlowTextResult(
+    } catch (_: OutputLimitReached) {
+        FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.MAX_CHARS
         )
     } catch (_: TimeoutCancellationException) {
-        return FlowTextResult(
+        FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.TIMEOUT
         )
     } catch (ce: CancellationException) {
         throw ce
     } catch (t: Throwable) {
-        return FlowTextResult(
+        FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.ERROR,
             errorToken = sanitizeErrorToken(t)
@@ -138,19 +137,19 @@ suspend fun Flow<String>.collectToTextSafely(
 }
 
 /**
- * Collects a streaming Flow<String> using a strict "budget" timeout.
+ * Collects with a strict timeout budget.
  *
  * Why this exists:
- * - Some callers compute a remaining time budget (e.g., total timeout minus request-creation time).
- * - Passing timeoutMs=0 into [collectToTextSafely] means "NO TIMEOUT", which is a footgun for budgets.
+ * - Some callers compute remaining time budgets (e.g., total deadline minus setup time).
+ * - Passing timeoutMs=0 into [collectToTextResult] means "NO TIMEOUT", which is dangerous for budgets.
  *
  * Budget semantics:
- * - timeoutBudgetMs <= 0 => immediate TIMEOUT (returns empty text).
- * - timeoutBudgetMs > 0 => behaves like [collectToTextSafely] with timeout enforcement.
+ * - [timeoutBudgetMs] <= 0 => immediate TIMEOUT (returns empty text).
+ * - [timeoutBudgetMs] > 0 => behaves like [collectToTextResult] with timeout enforcement.
  *
- * This function does NOT change existing semantics of [collectToTextSafely].
+ * This function intentionally does NOT change semantics of [collectToTextResult].
  */
-suspend fun Flow<String>.collectToTextSafelyWithBudget(
+suspend fun Flow<String>.collectToTextResultWithBudget(
     timeoutBudgetMs: Long,
     maxChars: Int = 32_000,
     onChunk: ((chunk: String, totalChars: Int) -> Unit)? = null
@@ -161,7 +160,7 @@ suspend fun Flow<String>.collectToTextSafelyWithBudget(
             reason = FlowTextStopReason.TIMEOUT
         )
     }
-    return collectToTextSafely(
+    return collectToTextResult(
         timeoutMs = timeoutBudgetMs,
         maxChars = maxChars,
         onChunk = onChunk
@@ -172,11 +171,11 @@ suspend fun Flow<String>.collectToTextSafelyWithBudget(
  * Collects chunks into [sb] while enforcing the [maxChars] ceiling.
  *
  * Implementation note:
- * - Throws [MaxCharsReached] to stop upstream collection early.
+ * - Throws [OutputLimitReached] to stop upstream collection early.
  *
  * Callback note:
  * - Exceptions from [onChunk] must not break collection (to avoid losing model output).
- * - CancellationException is rethrown to respect structured concurrency.
+ * - [CancellationException] is rethrown to respect structured concurrency.
  */
 private suspend fun Flow<String>.collectInto(
     sb: StringBuilder,
@@ -186,44 +185,43 @@ private suspend fun Flow<String>.collectInto(
     collect { chunk ->
         if (chunk.isEmpty()) return@collect
 
-        val remain = maxChars - sb.length
-        if (remain <= 0) throw MaxCharsReached()
+        val remaining = maxChars - sb.length
+        if (remaining <= 0) throw OutputLimitReached()
 
-        val toAppend = clipToRemainPreserveSurrogates(chunk, remain)
-        if (toAppend.isNotEmpty()) {
-            sb.append(toAppend)
+        val clipped = clipToBudgetPreservingSurrogates(chunk, remaining)
+        if (clipped.isNotEmpty()) {
+            sb.append(clipped)
 
-            if (onChunk != null) {
+            onChunk?.let { callback ->
                 try {
-                    onChunk.invoke(toAppend, sb.length)
+                    callback.invoke(clipped, sb.length)
                 } catch (ce: CancellationException) {
                     throw ce
                 } catch (_: Throwable) {
-                    // Swallow onChunk exceptions to avoid losing the collected output.
+                    // Swallow callback failures to avoid losing collected output.
                 }
             }
         }
 
-        if (sb.length >= maxChars) throw MaxCharsReached()
+        if (sb.length >= maxChars) throw OutputLimitReached()
     }
 }
 
 /**
- * Clips [chunk] to at most [remain] UTF-16 code units, avoiding surrogate pair splits.
+ * Clips [chunk] to at most [budget] UTF-16 code units, avoiding surrogate pair splits.
  *
  * Notes:
  * - Kotlin String indexing uses UTF-16 code units.
- * - If we cut between a high surrogate and low surrogate, the resulting String becomes invalid.
+ * - Cutting between a high surrogate and a low surrogate produces an invalid string.
  * - This function steps back by 1 code unit when it detects such a split.
  */
-private fun clipToRemainPreserveSurrogates(chunk: String, remain: Int): String {
-    if (remain <= 0) return ""
-    if (chunk.length <= remain) return chunk
+private fun clipToBudgetPreservingSurrogates(chunk: String, budget: Int): String {
+    if (budget <= 0) return ""
+    if (chunk.length <= budget) return chunk
 
-    var end = remain.coerceAtMost(chunk.length)
+    var end = budget.coerceAtMost(chunk.length)
     if (end <= 0) return ""
 
-    // Avoid ending after a high surrogate if the next char is a low surrogate.
     if (end < chunk.length) {
         val last = chunk[end - 1]
         val next = chunk[end]
@@ -239,7 +237,7 @@ private fun clipToRemainPreserveSurrogates(chunk: String, remain: Int): String {
 /**
  * Sanitizes an error into a short, non-PII token.
  *
- * Avoid using exception messages because they may include file paths or user data.
+ * Avoid using exception messages because they may contain file paths or user content.
  */
 private fun sanitizeErrorToken(t: Throwable): String {
     return t.javaClass.simpleName.ifBlank { "error" }.take(32)
@@ -248,8 +246,8 @@ private fun sanitizeErrorToken(t: Throwable): String {
 /**
  * Internal signal used to stop collection when the output size cap is reached.
  *
- * This is intentionally thrown often in cap scenarios, so avoid stack trace cost.
+ * This is intentionally thrown in cap scenarios, so avoid stack trace cost.
  */
-private class MaxCharsReached : RuntimeException() {
+private class OutputLimitReached : RuntimeException() {
     override fun fillInStackTrace(): Throwable = this
 }

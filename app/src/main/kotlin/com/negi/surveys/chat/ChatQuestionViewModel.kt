@@ -15,6 +15,7 @@ package com.negi.surveys.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.negi.surveys.logging.AppLog
 import java.security.MessageDigest
 import java.util.Collections
 import java.util.Locale
@@ -32,11 +33,10 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-
-import com.negi.surveys.logging.AppLog
 
 /**
  * ViewModel that drives a chat-style Q/A with validation + multi follow-up support,
@@ -80,7 +80,7 @@ class ChatQuestionViewModel(
      * - Rebuilding a new List on every delta is O(N) and gets expensive as history grows.
      *
      * Threading:
-     * - All mutations are performed on Main (see startStreamCollector()).
+     * - All mutations are performed on Main (see [StreamCollector]).
      * - The emitted list is a lightweight wrapper that changes identity via a version bump.
      */
     private val messagesBacking: ArrayList<ChatMessage> = ArrayList(128)
@@ -239,9 +239,11 @@ class ChatQuestionViewModel(
     /** The last assistant outcome bubble appended during the most recent validation attempt. */
     @Volatile private var lastOutcomeAssistantMsgId: String? = null
 
+    private val streamCollector = StreamCollector()
+
     init {
         restoreOrSeed()
-        startStreamCollector()
+        streamCollector.start()
         AppLog.d(TAG, "init qid=$qid draftKey=$draftKey stage=${withStateLock { stage }}")
     }
 
@@ -275,6 +277,7 @@ class ChatQuestionViewModel(
 
         _input.value = ""
         schedulePersistDraftForInput("submit.clearInput")
+
         appendUser(text)
 
         validationJob?.cancel()
@@ -312,21 +315,7 @@ class ChatQuestionViewModel(
         // Invalidate current attempt so late validator returns can't mutate state.
         activeAttemptId = attemptCounter.incrementAndGet()
 
-        var didRequestCancel = false
-
-        // Cancel active stream without requiring the VM to know the session id yet.
-        val cancelledId = streamBridge.cancelActive(CANCELLED_MESSAGE)
-        if (cancelledId > 0L) {
-            didRequestCancel = true
-            lastCancelledStreamSessionId = cancelledId
-        } else {
-            val sessionId = activeStreamSessionId
-            if (sessionId > 0L) {
-                didRequestCancel = true
-                lastCancelledStreamSessionId = sessionId
-                streamBridge.cancel(sessionId, CANCELLED_MESSAGE)
-            }
-        }
+        val didRequestCancel = requestStreamCancel()
 
         suppressNextCancelledError.set(didRequestCancel)
 
@@ -337,6 +326,37 @@ class ChatQuestionViewModel(
         // Close the stream window immediately to ignore late Begin/Delta.
         closeStreamWindow("cancelValidation")
 
+        clearActiveStreamUi("cancelValidation")
+
+        // Prevent late attachments.
+        lastOutcomeAssistantMsgId = null
+        clearPendingModelEmbed("cancelValidation")
+
+        safePersistDraft("cancelValidation")
+    }
+
+    private fun requestStreamCancel(): Boolean {
+        var didRequestCancel = false
+
+        // Cancel active stream without requiring the VM to know the session id yet.
+        val cancelledId = streamBridge.cancelActive(CANCELLED_MESSAGE)
+        if (cancelledId > 0L) {
+            didRequestCancel = true
+            lastCancelledStreamSessionId = cancelledId
+            return didRequestCancel
+        }
+
+        val sessionId = activeStreamSessionId
+        if (sessionId > 0L) {
+            didRequestCancel = true
+            lastCancelledStreamSessionId = sessionId
+            streamBridge.cancel(sessionId, CANCELLED_MESSAGE)
+        }
+
+        return didRequestCancel
+    }
+
+    private fun clearActiveStreamUi(reason: String) {
         val msgId = activeStreamMsgId
         if (msgId != null) {
             removeMessage(msgId)
@@ -344,11 +364,9 @@ class ChatQuestionViewModel(
 
         activeStreamMsgId = null
         activeStreamSessionId = 0L
+        pendingModelSessionId = 0L
 
-        // Prevent late attachments.
-        lastOutcomeAssistantMsgId = null
-        clearPendingModelEmbed("cancelValidation")
-        safePersistDraft("cancelValidation")
+        AppLog.d(TAG, "clearActiveStreamUi reason=$reason")
     }
 
     // ---------------------------------------------------------------------
@@ -387,13 +405,7 @@ class ChatQuestionViewModel(
             }
             safePersistDraft("handleMain.need_follow_up")
         } else {
-            val payload = withStateLock {
-                stage = ChatStage.DONE
-                buildCombined(mainAnswer, followUps)
-            }
-            _completionPayload.value = payload
-            _completion.tryEmit(payload)
-            safePersistDraft("handleMain.done")
+            completeDoneAndPersist("handleMain.done")
         }
 
         // Close stream window if no session is active (defensive against late Begin/Delta).
@@ -406,13 +418,7 @@ class ChatQuestionViewModel(
         val localFollowUpsSize = withStateLock { followUps.size }
         if (localFollowUpsSize >= maxFollowUps) {
             appendAssistantText("I have enough details. Let's move on.")
-            val payload = withStateLock {
-                stage = ChatStage.DONE
-                buildCombined(mainAnswer, followUps)
-            }
-            _completionPayload.value = payload
-            _completion.tryEmit(payload)
-            safePersistDraft("handleFollowUp.max_followups")
+            completeDoneAndPersist("handleFollowUp.max_followups")
             tryCloseStreamWindowIfIdle("handleFollowUp.max_followups.after")
             return
         }
@@ -465,16 +471,20 @@ class ChatQuestionViewModel(
             }
             safePersistDraft("handleFollowUp.need_follow_up")
         } else {
-            val payload = withStateLock {
-                stage = ChatStage.DONE
-                buildCombined(mainAnswer, followUps)
-            }
-            _completionPayload.value = payload
-            _completion.tryEmit(payload)
-            safePersistDraft("handleFollowUp.done")
+            completeDoneAndPersist("handleFollowUp.done")
         }
 
         tryCloseStreamWindowIfIdle("handleFollowUp.after")
+    }
+
+    private fun completeDoneAndPersist(reason: String) {
+        val payload = withStateLock {
+            stage = ChatStage.DONE
+            buildCombined(mainAnswer, followUps)
+        }
+        _completionPayload.value = payload
+        _completion.tryEmit(payload)
+        safePersistDraft(reason)
     }
 
     private fun reopenForEdit() {
@@ -611,7 +621,7 @@ class ChatQuestionViewModel(
     }
 
     // ---------------------------------------------------------------------
-    // Transcript mutations (must be atomic)
+    // Transcript mutations
     // ---------------------------------------------------------------------
 
     private fun appendUser(text: String) {
@@ -740,236 +750,248 @@ class ChatQuestionViewModel(
     // Stream collector (MODEL bubble -> embed into ASSISTANT outcome)
     // ---------------------------------------------------------------------
 
-    private fun startStreamCollector() {
-        viewModelScope.launch(context = Dispatchers.Default) {
-            var localActiveSession = 0L
-            var localStreamMsgId: String? = null
-            val buf = StringBuilder()
+    private inner class StreamCollector {
 
-            var lastUiUpdateNs = 0L
-            var lastRenderedLen = 0
+        private var localActiveSession = 0L
+        private var localStreamMsgId: String? = null
+        private val buf = StringBuilder()
 
-            fun resetLocalStreamState() {
-                localActiveSession = 0L
-                localStreamMsgId = null
-                buf.setLength(0)
-                lastUiUpdateNs = 0L
-                lastRenderedLen = 0
+        private var lastUiUpdateNs = 0L
+        private var lastRenderedLen = 0
+
+        fun start() {
+            viewModelScope.launch(context = Dispatchers.Default) {
+                try {
+                    streamBridge.events.collect { ev ->
+                        when (ev) {
+                            is ChatStreamEvent.Begin -> onBegin(ev.sessionId)
+                            is ChatStreamEvent.Delta -> onDelta(ev.sessionId, ev.text)
+                            is ChatStreamEvent.End -> onEnd(ev.sessionId)
+                            is ChatStreamEvent.Error -> onError(ev.sessionId, ev.code!!)
+                        }
+                    }
+                } catch (t: CancellationException) {
+                    throw t
+                } catch (t: Throwable) {
+                    AppLog.w(TAG, "stream collector crashed (non-fatal) err=${t.javaClass.simpleName}")
+                }
+            }
+        }
+
+        private suspend fun onBegin(sessionId: Long) {
+            if (!streamWindowOpen && localActiveSession == 0L) return
+            if (isCancelledSession(sessionId)) return
+
+            if (localActiveSession != 0L && sessionId != localActiveSession) {
+                AppLog.d(TAG, "stream Begin ignored (overlap) local=$localActiveSession new=$sessionId")
+                return
             }
 
-            suspend fun adoptOrCreateModelBubble(sessionId: Long) {
-                if (localActiveSession == sessionId && localStreamMsgId != null) return
+            adoptOrCreateModelBubble(sessionId)
+        }
 
-                localActiveSession = sessionId
-                buf.setLength(0)
-                lastUiUpdateNs = 0L
-                lastRenderedLen = 0
+        private suspend fun onDelta(sessionId: Long, text: String) {
+            if (text.isEmpty()) return
+            if (!streamWindowOpen && localActiveSession == 0L) return
+            if (isCancelledSession(sessionId)) return
 
-                withContext(Dispatchers.Main.immediate) {
-                    lastOutcomeAssistantMsgId = null
-                    clearPendingModelEmbed("beginSession")
-
-                    val existingId = activeStreamMsgId?.takeIf { containsMessage(it) }
-                    val id = existingId ?: UUID.randomUUID().toString()
-                    localStreamMsgId = id
-
-                    activeStreamSessionId = sessionId
-                    activeStreamMsgId = id
-
-                    if (existingId != null) {
-                        updateMessage(existingId) { m ->
-                            m.copy(
-                                role = ChatRole.MODEL,
-                                text = if (m.text.isBlank()) "Validating…" else m.text,
-                                streamText = m.streamText ?: "",
-                                streamState = ChatStreamState.STREAMING,
-                                streamCollapsed = false,
-                                streamSessionId = sessionId
-                            )
-                        }
-                    } else {
-                        val bubble = ChatMessage.modelStreaming(id, streamSessionId = sessionId).copy(
-                            text = "Validating…"
-                        )
-                        appendMessageInternal(bubble, "stream.begin")
-                    }
-
-                    safePersistDraft("stream.begin")
+            val sessionMismatch = (sessionId != localActiveSession || localStreamMsgId == null)
+            if (sessionMismatch) {
+                if (localActiveSession == 0L && localStreamMsgId == null) {
+                    adoptOrCreateModelBubble(sessionId)
+                } else {
+                    return
                 }
             }
 
-            suspend fun maybeUpdateUi(force: Boolean = false) {
-                val id = localStreamMsgId ?: return
-                val now = System.nanoTime()
-                val deltaChars = buf.length - lastRenderedLen
+            buf.append(text)
+            enforceMaxChars()
 
-                val shouldUpdate =
-                    force ||
-                            deltaChars >= STREAM_MIN_UPDATE_CHARS ||
-                            (now - lastUiUpdateNs) >= STREAM_UI_UPDATE_INTERVAL_NS
+            maybeUpdateUi(force = false)
+        }
 
-                if (!shouldUpdate) return
+        private suspend fun onEnd(sessionId: Long) {
+            if (sessionId != localActiveSession) return
 
-                val rendered = buf.toString()
-
+            if (isCancelledSession(sessionId)) {
                 withContext(Dispatchers.Main.immediate) {
-                    updateMessage(id) { m ->
+                    suppressNextCancelledError.set(false)
+
+                    localStreamMsgId?.let { removeMessage(it) }
+                    clearPendingModelEmbed("stream.end_ignored_cancelled")
+
+                    resetLocalState()
+                    clearVmStreamAfterTerminal("stream.end_ignored_cancelled")
+
+                    lastCancelledStreamSessionId = 0L
+                    closeStreamWindow("stream.end_ignored_cancelled")
+                    safePersistDraft("stream.end_ignored_cancelled")
+                }
+                return
+            }
+
+            maybeUpdateUi(force = true)
+            finalizeAndRemoveModelBubble(state = ChatStreamState.ENDED, errorMessage = null)
+
+            withContext(Dispatchers.Main.immediate) {
+                resetLocalState()
+                clearVmStreamAfterTerminal("stream.end")
+                closeStreamWindow("stream.end")
+                safePersistDraft("stream.end")
+            }
+        }
+
+        private suspend fun onError(sessionId: Long, reason: String) {
+            if (sessionId != localActiveSession) return
+
+            val normalized = reason.trim().lowercase(Locale.US)
+            val isReplaced = (normalized == REPLACED_MESSAGE)
+
+            val suppressedCancel =
+                (normalized == "cancelled" || normalized == "canceled") &&
+                        suppressNextCancelledError.getAndSet(false)
+
+            val cancelledSession = isCancelledSession(sessionId)
+
+            if (suppressedCancel || cancelledSession || isReplaced) {
+                withContext(Dispatchers.Main.immediate) {
+                    localStreamMsgId?.let { removeMessage(it) }
+                    clearPendingModelEmbed("stream.error_suppressed")
+
+                    if (cancelledSession) {
+                        lastCancelledStreamSessionId = 0L
+                    }
+                    suppressNextCancelledError.set(false)
+                }
+            } else {
+                maybeUpdateUi(force = true)
+                finalizeAndRemoveModelBubble(state = ChatStreamState.ERROR, errorMessage = reason)
+            }
+
+            withContext(Dispatchers.Main.immediate) {
+                resetLocalState()
+                clearVmStreamAfterTerminal("stream.error")
+                closeStreamWindow("stream.error")
+                safePersistDraft("stream.error")
+            }
+        }
+
+        private fun isCancelledSession(sessionId: Long): Boolean {
+            val cancelledId = lastCancelledStreamSessionId
+            return cancelledId > 0L && sessionId == cancelledId
+        }
+
+        private suspend fun adoptOrCreateModelBubble(sessionId: Long) {
+            if (localActiveSession == sessionId && localStreamMsgId != null) return
+
+            localActiveSession = sessionId
+            buf.setLength(0)
+            lastUiUpdateNs = 0L
+            lastRenderedLen = 0
+
+            withContext(Dispatchers.Main.immediate) {
+                lastOutcomeAssistantMsgId = null
+                clearPendingModelEmbed("beginSession")
+
+                val existingId = activeStreamMsgId?.takeIf { containsMessage(it) }
+                val id = existingId ?: UUID.randomUUID().toString()
+                localStreamMsgId = id
+
+                activeStreamSessionId = sessionId
+                activeStreamMsgId = id
+
+                if (existingId != null) {
+                    updateMessage(existingId) { m ->
                         m.copy(
                             role = ChatRole.MODEL,
-                            text = rendered.ifBlank { "Validating…" },
-                            streamText = rendered,
+                            text = if (m.text.isBlank()) "Validating…" else m.text,
+                            streamText = m.streamText ?: "",
                             streamState = ChatStreamState.STREAMING,
                             streamCollapsed = false,
-                            streamSessionId = localActiveSession
+                            streamSessionId = sessionId
                         )
                     }
+                } else {
+                    val bubble = ChatMessage.modelStreaming(id, streamSessionId = sessionId).copy(
+                        text = "Validating…"
+                    )
+                    appendMessageInternal(bubble, "stream.begin")
                 }
 
-                lastUiUpdateNs = now
-                lastRenderedLen = buf.length
+                safePersistDraft("stream.begin")
             }
+        }
 
-            suspend fun finalizeAndRemoveModelBubble(state: ChatStreamState, errorMessage: String? = null) {
-                val id = localStreamMsgId ?: return
-                val raw = buf.toString().ifBlank { errorMessage.orEmpty() }
+        private suspend fun maybeUpdateUi(force: Boolean) {
+            val id = localStreamMsgId ?: return
 
-                withContext(Dispatchers.Main.immediate) {
-                    removeMessage(id)
+            val now = System.nanoTime()
+            val deltaChars = buf.length - lastRenderedLen
 
-                    attachOrPendModelOutput(
-                        sessionId = localActiveSession,
-                        output = raw,
-                        state = state
+            val shouldUpdate =
+                force ||
+                        deltaChars >= STREAM_MIN_UPDATE_CHARS ||
+                        (now - lastUiUpdateNs) >= STREAM_UI_UPDATE_INTERVAL_NS
+
+            if (!shouldUpdate) return
+
+            val rendered = buf.toString()
+
+            withContext(Dispatchers.Main.immediate) {
+                updateMessage(id) { m ->
+                    m.copy(
+                        role = ChatRole.MODEL,
+                        text = rendered.ifBlank { "Validating…" },
+                        streamText = rendered,
+                        streamState = ChatStreamState.STREAMING,
+                        streamCollapsed = false,
+                        streamSessionId = localActiveSession
                     )
                 }
             }
 
-            try {
-                streamBridge.events.collect { ev ->
-                    when (ev) {
-                        is ChatStreamEvent.Begin -> {
-                            if (!streamWindowOpen && localActiveSession == 0L) return@collect
+            lastUiUpdateNs = now
+            lastRenderedLen = buf.length
+        }
 
-                            val cancelledId = lastCancelledStreamSessionId
-                            if (cancelledId > 0L && ev.sessionId == cancelledId) return@collect
+        private suspend fun finalizeAndRemoveModelBubble(state: ChatStreamState, errorMessage: String?) {
+            val id = localStreamMsgId ?: return
+            val raw = buf.toString().ifBlank { errorMessage.orEmpty() }
 
-                            if (localActiveSession != 0L && ev.sessionId != localActiveSession) {
-                                AppLog.d(TAG, "stream Begin ignored (overlap) local=$localActiveSession new=${ev.sessionId}")
-                                return@collect
-                            }
-
-                            adoptOrCreateModelBubble(ev.sessionId)
-                        }
-
-                        is ChatStreamEvent.Delta -> {
-                            if (ev.text.isEmpty()) return@collect
-                            if (!streamWindowOpen && localActiveSession == 0L) return@collect
-
-                            val cancelledId = lastCancelledStreamSessionId
-                            if (cancelledId > 0L && ev.sessionId == cancelledId) return@collect
-
-                            val sessionMismatch = ev.sessionId != localActiveSession || localStreamMsgId == null
-                            if (sessionMismatch) {
-                                if (localActiveSession == 0L && localStreamMsgId == null) {
-                                    adoptOrCreateModelBubble(ev.sessionId)
-                                } else {
-                                    return@collect
-                                }
-                            }
-
-                            buf.append(ev.text)
-
-                            if (buf.length > maxModelCharsInUi) {
-                                val dropWanted = buf.length - maxModelCharsInUi
-                                val drop = adjustDropForSurrogates(buf, dropWanted)
-                                if (drop > 0) {
-                                    buf.delete(0, drop)
-                                    lastRenderedLen = (lastRenderedLen - drop).coerceAtLeast(0)
-                                }
-                            }
-
-                            maybeUpdateUi(force = false)
-                        }
-
-                        is ChatStreamEvent.End -> {
-                            if (ev.sessionId != localActiveSession) return@collect
-
-                            val cancelledId = lastCancelledStreamSessionId
-                            if (cancelledId > 0L && ev.sessionId == cancelledId) {
-                                withContext(Dispatchers.Main.immediate) {
-                                    suppressNextCancelledError.set(false)
-
-                                    localStreamMsgId?.let { removeMessage(it) }
-                                    clearPendingModelEmbed("stream.end_ignored_cancelled")
-                                    resetLocalStreamState()
-                                    activeStreamSessionId = 0L
-                                    activeStreamMsgId = null
-                                    lastCancelledStreamSessionId = 0L
-                                    closeStreamWindow("stream.end_ignored_cancelled")
-                                    safePersistDraft("stream.end_ignored_cancelled")
-                                }
-                                return@collect
-                            }
-
-                            maybeUpdateUi(force = true)
-                            finalizeAndRemoveModelBubble(state = ChatStreamState.ENDED)
-
-                            resetLocalStreamState()
-                            withContext(Dispatchers.Main.immediate) {
-                                activeStreamSessionId = 0L
-                                activeStreamMsgId = null
-                                closeStreamWindow("stream.end")
-                                safePersistDraft("stream.end")
-                            }
-                        }
-
-                        is ChatStreamEvent.Error -> {
-                            if (ev.sessionId != localActiveSession) return@collect
-
-                            val msg = ev.reason.trim().lowercase(Locale.US)
-                            val isReplaced = (msg == REPLACED_MESSAGE)
-
-                            val suppressedCancel =
-                                (msg == "cancelled" || msg == "canceled") &&
-                                        suppressNextCancelledError.getAndSet(false)
-
-                            val cancelledId = lastCancelledStreamSessionId
-                            val isCancelledSession = cancelledId > 0L && ev.sessionId == cancelledId
-
-                            if (suppressedCancel || isCancelledSession || isReplaced) {
-                                withContext(Dispatchers.Main.immediate) {
-                                    localStreamMsgId?.let { removeMessage(it) }
-                                    clearPendingModelEmbed("stream.error_suppressed")
-
-                                    if (isCancelledSession) {
-                                        lastCancelledStreamSessionId = 0L
-                                    }
-                                    suppressNextCancelledError.set(false)
-                                }
-                            } else {
-                                maybeUpdateUi(force = true)
-                                finalizeAndRemoveModelBubble(
-                                    state = ChatStreamState.ERROR,
-                                    errorMessage = ev.reason
-                                )
-                            }
-
-                            resetLocalStreamState()
-                            withContext(Dispatchers.Main.immediate) {
-                                activeStreamSessionId = 0L
-                                activeStreamMsgId = null
-                                closeStreamWindow("stream.error")
-                                safePersistDraft("stream.error")
-                            }
-                        }
-                    }
-                }
-            } catch (t: CancellationException) {
-                throw t
-            } catch (t: Throwable) {
-                AppLog.w(TAG, "stream collector crashed (non-fatal) err=${t.javaClass.simpleName}")
+            withContext(Dispatchers.Main.immediate) {
+                removeMessage(id)
+                attachOrPendModelOutput(
+                    sessionId = localActiveSession,
+                    output = raw,
+                    state = state
+                )
             }
         }
+
+        private fun resetLocalState() {
+            localActiveSession = 0L
+            localStreamMsgId = null
+            buf.setLength(0)
+            lastUiUpdateNs = 0L
+            lastRenderedLen = 0
+        }
+
+        private fun enforceMaxChars() {
+            if (buf.length <= maxModelCharsInUi) return
+
+            val dropWanted = buf.length - maxModelCharsInUi
+            val drop = adjustDropForSurrogates(buf, dropWanted)
+            if (drop > 0) {
+                buf.delete(0, drop)
+                lastRenderedLen = (lastRenderedLen - drop).coerceAtLeast(0)
+            }
+        }
+    }
+
+    private fun clearVmStreamAfterTerminal(reason: String) {
+        activeStreamSessionId = 0L
+        activeStreamMsgId = null
+        AppLog.d(TAG, "vm stream cleared reason=$reason")
     }
 
     /**
@@ -1143,7 +1165,7 @@ class ChatQuestionViewModel(
         val hex = "0123456789abcdef"
         val sb = StringBuilder(bytes.size * 2)
         for (b in bytes) {
-            val v = b.toInt()
+            val v = b.toInt() and 0xFF
             sb.append(hex[(v ushr 4) and 0xF])
             sb.append(hex[v and 0xF])
         }
@@ -1156,7 +1178,7 @@ class ChatQuestionViewModel(
         if (length <= n) return this
 
         var end = n
-        if (end > 0 && end < length) {
+        if (end > 0) {
             val last = this[end - 1]
             val next = this[end]
             if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {

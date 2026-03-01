@@ -90,16 +90,22 @@ class SlmRepository(
         val model = buildModel(file)
         awaitInitializedModel(model)
 
+
         if (resetConversationEachRequest) {
             // Ensures request isolation if the underlying SDK keeps conversation state.
-            SLM.resetConversation(
+            val ok = SLM.resetConversationAndAwait(
                 model = model,
                 supportImage = false,
                 supportAudio = false,
                 systemMessage = null,
-                tools = emptyList()
+                tools = emptyList(),
+                timeoutMs = 5_000L
             )
+            if (!ok) {
+                AppLog.w(TAG, "resetConversationAndAwait failed or timed out; continuing: model='${model.name}'")
+            }
         }
+
 
         return callbackFlow {
             val closed = AtomicBoolean(false)
@@ -114,27 +120,17 @@ class SlmRepository(
                 model = model,
                 input = p,
                 resultListener = { delta, done ->
-                    // Some SDK builds may emit a final delta together with done=true.
-                    // Emit delta first, then close.
-                    if (delta.isNotEmpty()) {
-                        trySend(delta).isSuccess
-                    }
-                    if (done) {
-                        closeOnce()
-                    }
+                    if (delta.isNotEmpty()) trySend(delta)
+                    if (done) closeOnce()
                 },
-                cleanUpListener = {
-                    // Native termination safe point.
-                    closeOnce()
-                },
+                cleanUpListener = { closeOnce() },
                 onError = { msg ->
-                    if (closed.compareAndSet(false, true)) {
-                        close(IllegalStateException(msg))
-                    }
+                    if (msg.equals("Cancelled", ignoreCase = true)) return@runInference
+                    if (closed.compareAndSet(false, true)) close(IllegalStateException(msg))
                 },
                 images = emptyList(),
                 audioClips = emptyList(),
-                notifyCancelToOnError = true
+                notifyCancelToOnError = false
             )
 
             awaitClose {

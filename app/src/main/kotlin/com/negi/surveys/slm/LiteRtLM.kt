@@ -30,6 +30,17 @@ import com.google.ai.edge.litertlm.MessageCallback
 import com.google.ai.edge.litertlm.SamplerConfig
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.AppLog
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.lang.reflect.Modifier
+import java.security.MessageDigest
+import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.math.max
+import kotlin.math.min
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
@@ -40,17 +51,8 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
-import java.io.ByteArrayOutputStream
-import java.io.File
-import java.lang.reflect.Modifier
-import java.util.Locale
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
-import kotlin.math.max
-import kotlin.math.min
 
 private const val TAG = "LiteRtLM"
 
@@ -74,8 +76,17 @@ private const val RETIRED_CLOSE_GRACE_MS = 1_500L
 /** Post-terminate cooldown to avoid rapid restart during native teardown. */
 private const val POST_TERMINATE_COOLDOWN_MS = 250L
 
-/** Init await timeout. */
-private const val INIT_AWAIT_TIMEOUT_MS = 90_000L
+/**
+ * Init await timeouts.
+ *
+ * IMPORTANT:
+ * - Some devices take > 90s on a cold GPU/OpenCL delegate compile.
+ * - "Timeout" here can be a false negative if init is slow-but-progressing.
+ * - We adapt timeout based on backend and whether serialized artifacts exist.
+ */
+private const val INIT_AWAIT_TIMEOUT_MS_DEFAULT = 90_000L
+private const val INIT_AWAIT_TIMEOUT_MS_CPU_COLD = 240_000L
+private const val INIT_AWAIT_TIMEOUT_MS_GPU_COLD = 300_000L
 
 /** Streaming watchdog. */
 private const val STREAM_WATCHDOG_MS = 120_000L
@@ -162,11 +173,30 @@ object LiteRtLM {
     private val initSignals: ConcurrentHashMap<String, CompletableDeferred<String>> =
         ConcurrentHashMap()
 
+    /**
+     * Init-wait profile (best-effort hints).
+     *
+     * Why:
+     * - Awaiters (initializeIfNeeded/awaitInitIfInFlight/etc.) need to choose
+     *   a sensible timeout without recomputing configs everywhere.
+     */
+    private data class InitWaitProfile(
+        val backend: Backend,
+        val serializationDir: String?,
+        val createdAtMs: Long,
+    )
+
+    /** Latest init-wait hint per key (cleared after init completes). */
+    private val initWaitProfiles: ConcurrentHashMap<String, InitWaitProfile> = ConcurrentHashMap()
+
     /** Serialize initializeIfNeeded() and generateText(). */
     private val apiMutex: Mutex = Mutex()
 
     /** Busy flag used only by generateText() (suspend API). */
     private val busy: AtomicBoolean = AtomicBoolean(false)
+
+    /** Best-effort tracking of which key currently owns generateText(). */
+    private val busyKey: AtomicReference<String?> = AtomicReference(null)
 
     /** Scheduled idle cleanup jobs (per key). */
     private val cleanupJobs: ConcurrentHashMap<String, Job> = ConcurrentHashMap()
@@ -193,6 +223,49 @@ object LiteRtLM {
 
     /** Returns true when a generateText call is currently in progress. */
     fun isBusy(): Boolean = busy.get()
+
+    /**
+     * Returns true when the given model is currently "busy" in a way that matters to callers:
+     * - runInference streaming is active for the model key
+     * - initialize is in flight for the model key
+     * - generateText() is in progress for the same model key
+     *
+     * NOTE:
+     * - generateText() is serialized via apiMutex, but we still track ownership by key to avoid
+     *   over-reporting busy for unrelated models.
+     */
+    fun isBusy(model: Model): Boolean {
+        val key = runtimeKey(model)
+        val genBusyForKey = busy.get() && busyKey.get() == key
+        val rs = runStates[key]
+        val streamBusyForKey = rs?.let { isRunOccupied(it) } == true
+        val initBusyForKey = initInFlight.contains(key)
+        return genBusyForKey || streamBusyForKey || initBusyForKey
+    }
+
+    /**
+     * Returns true when any runtime key with the given model name is active.
+     *
+     * WARNING:
+     * - Model name alone is not a unique identifier (path is part of the runtime key).
+     * - This is provided for legacy call sites that only track a model name.
+     */
+    fun isBusy(modelName: String): Boolean {
+        val n = modelName.trim()
+        if (n.isEmpty()) {
+            // Best-effort global busy: generation OR any active stream/recovery OR any init in-flight.
+            val anyStreamActive = runStates.values.any { isRunOccupied(it) }
+            return busy.get() || anyStreamActive || initInFlight.isNotEmpty()
+        }
+
+        val prefix = "$n|"
+        val genBusyForName = busy.get() && (busyKey.get()?.startsWith(prefix) == true)
+        val streamBusyForName = runStates.entries.any { (k, rs) ->
+            k.startsWith(prefix) && isRunOccupied(rs)
+        }
+        val initBusyForName = initInFlight.any { it.startsWith(prefix) }
+        return genBusyForName || streamBusyForName || initBusyForName
+    }
 
     /**
      * Normalize model path to avoid duplicate Engine instances caused by alias paths.
@@ -368,7 +441,24 @@ object LiteRtLM {
      * Per-key run state (native lifecycle + logical completion + cancel).
      */
     private data class RunState(
+        /**
+         * True while a run slot is owned.
+         *
+         * NOTE:
+         * - Historically this represented "native streaming is active".
+         * - We keep it as the primary slot gate as well (see `recovering`).
+         */
         val active: AtomicBoolean = AtomicBoolean(false),
+
+        /**
+         * True ONLY during "not alive" recovery window.
+         *
+         * IMPORTANT:
+         * - This prevents accidental concurrency gaps (e.g., if code ever temporarily clears `active`).
+         * - Also used to make cleanup/reset/close treat recovery as "busy".
+         */
+        val recovering: AtomicBoolean = AtomicBoolean(false),
+
         val terminated: AtomicBoolean = AtomicBoolean(false),
         val logicalDone: AtomicBoolean = AtomicBoolean(false),
         val cancelRequested: AtomicBoolean = AtomicBoolean(false),
@@ -400,6 +490,9 @@ object LiteRtLM {
         val prev = runStates.putIfAbsent(key, created)
         return prev ?: created
     }
+
+    /** True if the run slot should be considered occupied (native stream OR recovery window). */
+    private fun isRunOccupied(rs: RunState): Boolean = rs.active.get() || rs.recovering.get()
 
     /** Touch last-use time and invalidate any scheduled cleanup. */
     private fun markUsed(key: String) {
@@ -469,14 +562,85 @@ object LiteRtLM {
     }
 
     /**
+     * Returns true if the serialization directory already has artifacts.
+     *
+     * This is intentionally conservative: any file presence indicates "warm-ish".
+     */
+    private fun isSerializationWarmBestEffort(serializationDir: String?): Boolean {
+        if (serializationDir.isNullOrBlank()) return false
+        val dir = runCatching { File(serializationDir) }.getOrNull() ?: return false
+        if (!dir.exists() || !dir.isDirectory) return false
+        return runCatching { dir.listFiles()?.isNotEmpty() == true }.getOrDefault(false)
+    }
+
+    /**
+     * Choose init-await timeout based on backend + warm/cold serialization state.
+     */
+    private fun recommendedInitAwaitTimeoutMs(
+        backend: Backend,
+        serializationDir: String?,
+    ): Long {
+        val warm = isSerializationWarmBestEffort(serializationDir)
+        if (warm) return INIT_AWAIT_TIMEOUT_MS_DEFAULT
+
+        return when (backend) {
+            Backend.GPU -> INIT_AWAIT_TIMEOUT_MS_GPU_COLD
+            Backend.CPU -> INIT_AWAIT_TIMEOUT_MS_CPU_COLD
+            else -> INIT_AWAIT_TIMEOUT_MS_DEFAULT
+        }
+    }
+
+    /**
+     * Resolve init-await timeout for a key using:
+     * - Explicit hints (backend/dir) if provided
+     * - Otherwise latest initWaitProfile if available
+     * - Otherwise a safe GPU-cold default (worst-case)
+     */
+    private fun initAwaitTimeoutMsForKey(
+        key: String,
+        backendHint: Backend? = null,
+        serializationDirHint: String? = null,
+    ): Long {
+        val p = initWaitProfiles[key]
+        val backend = backendHint ?: p?.backend ?: Backend.GPU
+        val dir = serializationDirHint ?: p?.serializationDir
+        return recommendedInitAwaitTimeoutMs(backend, dir)
+    }
+
+    /**
+     * Await the init signal for a key with adaptive timeout.
+     *
+     * Returns:
+     * - "" on success
+     * - non-empty error string on failure
+     * - "Initialization timed out ..." if timed out
+     */
+    private suspend fun awaitInitSignalAdaptive(
+        key: String,
+        reason: String,
+        backendHint: Backend? = null,
+        serializationDirHint: String? = null,
+    ): String {
+        val signal = getOrCreateInitSignal(key)
+        val timeoutMs = initAwaitTimeoutMsForKey(key, backendHint, serializationDirHint)
+        val warm = isSerializationWarmBestEffort(serializationDirHint ?: initWaitProfiles[key]?.serializationDir)
+
+        AppLog.d(
+            TAG,
+            "Awaiting init: key='$key' timeoutMs=${timeoutMs} warm=$warm backend=${backendHint ?: initWaitProfiles[key]?.backend} reason='$reason'"
+        )
+
+        return withTimeoutOrNull(timeoutMs) { signal.await() }
+            ?: "Initialization timed out after ${timeoutMs}ms."
+    }
+
+    /**
      * Await completion of an in-flight initialization for the same key.
      */
     private suspend fun awaitInitIfInFlight(key: String, reason: String) {
         if (!initInFlight.contains(key)) return
-        val signal = getOrCreateInitSignal(key)
         AppLog.d(TAG, "Awaiting init in flight: key='$key' reason='$reason'")
-        val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
-            ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
+        val err = awaitInitSignalAdaptive(key = key, reason = "awaitInitIfInFlight:$reason")
         if (err.isNotEmpty()) throw IllegalStateException("LiteRT-LM init-in-flight failed: $err")
     }
 
@@ -883,35 +1047,135 @@ object LiteRtLM {
             .replace("\u200D", "")
     }
 
-    /** Compute overlap length where suffix of a matches prefix of b. */
-    private fun overlapSuffixPrefix(a: String, b: String, maxWindow: Int = 1024): Int {
-        if (a.isEmpty() || b.isEmpty()) return 0
-        val start = max(0, a.length - maxWindow)
-        val aWin = a.substring(start)
-        val maxK = min(aWin.length, b.length)
+    // ---- Delta extraction performance work ----
 
-        for (k in maxK downTo 1) {
-            val aPos = aWin.length - k
-            if (aWin.regionMatches(aPos, b, 0, k, ignoreCase = false)) return k
+    private const val DELTA_MAX_WINDOW = 1024
+    private const val DELTA_PREFIX_PROBE_CHARS = 64
+    private const val DELTA_PREFIX_STRICT_THRESHOLD = 2048
+
+    /**
+     * PERF: KMP-based overlap computation to replace O(window^2) naive scan.
+     *
+     * Finds k = max overlap where suffix(a) == prefix(b), with k <= maxWindow.
+     * Complexity: O(maxWindow).
+     */
+    private fun overlapSuffixPrefixKmp(a: String, b: String, maxWindow: Int = DELTA_MAX_WINDOW): Int {
+        if (a.isEmpty() || b.isEmpty()) return 0
+
+        val aStart = max(0, a.length - maxWindow)
+        val aLen = a.length - aStart
+        val bLen = min(b.length, maxWindow)
+        if (aLen <= 0 || bLen <= 0) return 0
+
+        // Choose a separator char that is very unlikely to appear in the text,
+        // and verify it is not present in b[0..bLen).
+        fun chooseSep(): Char {
+            val candidates = charArrayOf('\u0001', '\u0002', '\u0000', '\u0003', '\u001F', '\uFFFF')
+            for (c in candidates) {
+                var found = false
+                for (i in 0 until bLen) {
+                    if (b[i] == c) {
+                        found = true
+                        break
+                    }
+                }
+                if (!found) return c
+            }
+            return '\u0001'
         }
-        return 0
+
+        val sep = chooseSep()
+
+        // Build char array for: Bprefix + sep + Asuffix
+        val n = bLen + 1 + aLen
+        val s = CharArray(n)
+        for (i in 0 until bLen) s[i] = b[i]
+        s[bLen] = sep
+        for (i in 0 until aLen) s[bLen + 1 + i] = a[aStart + i]
+
+        // Prefix function (KMP)
+        val pi = IntArray(n)
+        var j = 0
+        for (i in 1 until n) {
+            while (j > 0 && s[i] != s[j]) {
+                j = pi[j - 1]
+            }
+            if (s[i] == s[j]) j++
+            pi[i] = j
+        }
+
+        // The last pi value gives the longest prefix of Bprefix that is also a suffix of the whole string.
+        val ov = pi[n - 1]
+        return ov.coerceIn(0, min(aLen, bLen))
     }
 
-    /** Delta extractor that works for snapshots or deltas. */
+    /**
+     * PERF: Avoid O(N) `startsWith(prev)` checks on long snapshots.
+     *
+     * For typical "snapshot-style" streaming, `newSnapshot` is just `prev + delta`.
+     * Instead of comparing the entire prefix (which can be thousands of chars),
+     * we probe a few small regions (start/middle/end) to quickly decide.
+     *
+     * This is a pragmatic performance trade-off: extremely low false-positive probability
+     * for natural language streams, while drastically reducing CPU under high-frequency callbacks.
+     */
+    private fun looksLikePrefixExtension(prev: String, next: String, probeChars: Int = DELTA_PREFIX_PROBE_CHARS): Boolean {
+        if (prev.isEmpty()) return true
+        if (next.length < prev.length) return false
+
+        val probe = min(probeChars, prev.length)
+        if (probe <= 0) return true
+
+        // Start probe
+        if (!next.regionMatches(0, prev, 0, probe, ignoreCase = false)) return false
+
+        // End probe within the prefix region
+        val prevEndStart = prev.length - probe
+        if (!next.regionMatches(prevEndStart, prev, prevEndStart, probe, ignoreCase = false)) return false
+
+        // Middle probe (only for sufficiently long strings)
+        if (prev.length >= probe * 4) {
+            val mid = (prev.length / 2) - (probe / 2)
+            val safeMid = mid.coerceIn(0, prev.length - probe)
+            if (!next.regionMatches(safeMid, prev, safeMid, probe, ignoreCase = false)) return false
+        }
+
+        return true
+    }
+
+    /**
+     * Delta extractor that works for snapshots or deltas.
+     *
+     * Changes:
+     * - Avoid worst-case O(window^2) overlap scan by using KMP (O(window)).
+     * - Avoid expensive full-length `startsWith()` on large snapshot streams via probing.
+     */
     private fun computeDeltaSmart(emittedSoFar: String, newSnapshot: String): Pair<String, String> {
         if (newSnapshot.isEmpty()) return "" to emittedSoFar
         if (emittedSoFar.isEmpty()) return newSnapshot to newSnapshot
 
-        if (newSnapshot.length >= emittedSoFar.length && newSnapshot.startsWith(emittedSoFar)) {
-            val delta = newSnapshot.substring(emittedSoFar.length)
-            return delta to newSnapshot
+        // Fast-path: snapshot extension detection without O(N) prefix comparisons.
+        if (newSnapshot.length >= emittedSoFar.length && emittedSoFar.length >= DELTA_PREFIX_STRICT_THRESHOLD) {
+            if (looksLikePrefixExtension(emittedSoFar, newSnapshot)) {
+                val delta = newSnapshot.substring(emittedSoFar.length)
+                return delta to newSnapshot
+            }
+            // If probes fail, do NOT pay O(N) `startsWith()` cost. Fall back to windowed overlap.
+        } else {
+            // For small strings, a strict startsWith is cheap and fully correct.
+            if (newSnapshot.length >= emittedSoFar.length && newSnapshot.startsWith(emittedSoFar)) {
+                val delta = newSnapshot.substring(emittedSoFar.length)
+                return delta to newSnapshot
+            }
         }
 
+        // No rollback: if the model sends a shorter snapshot, keep what we already emitted.
         if (emittedSoFar.length > newSnapshot.length && emittedSoFar.startsWith(newSnapshot)) {
             return "" to emittedSoFar
         }
 
-        val ov = overlapSuffixPrefix(emittedSoFar, newSnapshot)
+        // Windowed overlap (O(window)) for non-snapshot or drift cases.
+        val ov = overlapSuffixPrefixKmp(emittedSoFar, newSnapshot, maxWindow = DELTA_MAX_WINDOW)
         val delta = newSnapshot.substring(ov)
         return delta to (emittedSoFar + delta)
     }
@@ -950,8 +1214,11 @@ object LiteRtLM {
             tools = tools,
         )
 
-        val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
-            ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
+        val backendHint = preferredBackend(model)
+        val serializationHint = initWaitProfiles[key]?.serializationDir
+
+        val err = withTimeoutOrNull(initAwaitTimeoutMsForKey(key, backendHint, serializationHint)) { signal.await() }
+            ?: "Initialization timed out after ${initAwaitTimeoutMsForKey(key, backendHint, serializationHint)}ms."
 
         if (err.isNotEmpty()) throw IllegalStateException("LiteRT-LM initialization failed: $err")
     }
@@ -1022,9 +1289,7 @@ object LiteRtLM {
             tools = tools,
         )
 
-        val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
-            ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
-
+        val err = awaitInitSignalAdaptive(key = key, reason = "upgradeCapabilitiesIfNeeded")
         if (err.isNotEmpty()) throw IllegalStateException("LiteRT-LM capability upgrade failed: $err")
     }
 
@@ -1106,6 +1371,74 @@ object LiteRtLM {
     }
 
     /**
+     * Builds a short stable identifier from a string input.
+     * We intentionally keep it short to avoid long path names.
+     */
+    private fun sha256HexShort(input: String, chars: Int = 16): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) sb.append(String.format("%02x", b))
+        return sb.toString().take(chars.coerceIn(8, 64))
+    }
+
+    /**
+     * Returns a persistent directory path for LiteRT-LM serialized/compiled artifacts.
+     *
+     * Why:
+     * - context.cacheDir is best-effort and can be evicted by the OS.
+     * - warmup compile can be 30-180s; eviction makes startup regress unpredictably.
+     *
+     * Strategy:
+     * - Prefer noBackupFilesDir (stable within app install, not part of auto-backup).
+     * - Create per-model/per-backend subdirectories to avoid collisions across model swaps/updates.
+     * - Include file size/mtime to reduce risk of reusing incompatible serialized data
+     *   when the same path is overwritten with a different model file.
+     *
+     * Fallback:
+     * - If directory creation fails, fall back to cacheDir to keep the app functional.
+     */
+    private fun persistentLiteRtSerializationDir(
+        context: Context,
+        modelName: String,
+        normalizedModelPath: String,
+        backend: Backend,
+        visionBackend: Backend?,
+        audioBackend: Backend?,
+    ): String {
+        val base: File = runCatching {
+            // Keep artifacts out of cache eviction, and avoid auto-backup.
+            File(context.noBackupFilesDir, "litertlm_serialized")
+        }.getOrElse {
+            // Very defensive: noBackupFilesDir should exist, but keep a fallback.
+            File(context.filesDir, "litertlm_serialized")
+        }
+
+        val modelFile = runCatching { File(normalizedModelPath) }.getOrNull()
+        val size = runCatching { modelFile?.length() ?: 0L }.getOrDefault(0L)
+        val mtime = runCatching { modelFile?.lastModified() ?: 0L }.getOrDefault(0L)
+
+        val v = visionBackend?.name ?: "NONE"
+        val a = audioBackend?.name ?: "NONE"
+
+        // Make the dir identity stable but sensitive to model/backend updates.
+        val keyMaterial = "$modelName|$normalizedModelPath|$size|$mtime|backend=${backend.name}|vision=$v|audio=$a"
+        val key = "${modelName}_${sha256HexShort(keyMaterial)}"
+        val dir = File(base, key)
+
+        if (!dir.exists()) {
+            if (!dir.mkdirs()) {
+                // Fallback to cacheDir if we cannot create a persistent directory.
+                return context.cacheDir.absolutePath
+            }
+        }
+        if (!dir.isDirectory) {
+            return context.cacheDir.absolutePath
+        }
+        return dir.absolutePath
+    }
+
+    /**
      * Initialize LiteRT-LM Engine + Conversation (async).
      */
     fun initialize(
@@ -1125,11 +1458,41 @@ object LiteRtLM {
 
         val signal = getOrCreateInitSignal(key)
 
+        // Record init wait profile early so concurrent awaiters can pick a proper timeout.
+        val backendHint = preferredBackend(model)
+        val rawPathHint = model.getPath()
+        val normalizedModelPathHint = normalizeTaskPath(rawPathHint)
+        val visionHint = if (supportImage) Backend.GPU else null
+        val audioHint = if (supportAudio) Backend.CPU else null
+        val serializationDirHint = runCatching {
+            persistentLiteRtSerializationDir(
+                context = context,
+                modelName = model.name,
+                normalizedModelPath = normalizedModelPathHint,
+                backend = backendHint,
+                visionBackend = visionHint,
+                audioBackend = audioHint,
+            )
+        }.getOrNull()
+
+        initWaitProfiles.putIfAbsent(
+            key,
+            InitWaitProfile(
+                backend = backendHint,
+                serializationDir = serializationDirHint,
+                createdAtMs = SystemClock.elapsedRealtime(),
+            )
+        )
+
         val accepted = initInFlight.add(key)
         if (!accepted) {
             ioScope.launch {
-                val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
-                    ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
+                val err = awaitInitSignalAdaptive(
+                    key = key,
+                    reason = "initialize(join)",
+                    backendHint = backendHint,
+                    serializationDirHint = serializationDirHint,
+                )
                 postToMain { onDone(err) }
             }
             return
@@ -1148,8 +1511,8 @@ object LiteRtLM {
 
                     stateMutex.withLock {
                         val rs = getRunState(key)
-                        if (rs.active.get()) {
-                            throw IllegalStateException("Initialization rejected: active native stream in progress for key='$key'.")
+                        if (isRunOccupied(rs)) {
+                            throw IllegalStateException("Initialization rejected: active/recovering run in progress for key='$key'.")
                         }
                     }
 
@@ -1209,19 +1572,32 @@ object LiteRtLM {
                         "ModelPath: raw='$rawModelPath' normalized='$normalizedModelPath'"
                     )
 
-                    val cacheDirPath: String? = runCatching {
-                        if (normalizedModelPath.startsWith("/data/local/tmp")) {
-                            context.getExternalFilesDir(null)?.absolutePath
-                        } else {
-                            context.cacheDir?.absolutePath
-                        }
-                    }.getOrNull()
+                    val visionPreferred = if (supportImage) Backend.GPU else null
+                    val audioPreferred = if (supportAudio) Backend.CPU else null
+
+                    fun resolveCacheDir(
+                        forBackend: Backend,
+                        v: Backend?,
+                        a: Backend?,
+                    ): String? {
+                        return runCatching {
+                            persistentLiteRtSerializationDir(
+                                context = context,
+                                modelName = model.name,
+                                normalizedModelPath = normalizedModelPath,
+                                backend = forBackend,
+                                visionBackend = v,
+                                audioBackend = a,
+                            )
+                        }.getOrNull()
+                    }
 
                     fun buildConfig(
                         forBackend: Backend,
                         visionBackend: Backend?,
                         audioBackend: Backend?
                     ): EngineConfig {
+                        val cacheDirPath = resolveCacheDir(forBackend, visionBackend, audioBackend)
                         return EngineConfig(
                             modelPath = normalizedModelPath,
                             backend = forBackend,
@@ -1232,8 +1608,18 @@ object LiteRtLM {
                         )
                     }
 
-                    val visionPreferred = if (supportImage) Backend.GPU else null
-                    val audioPreferred = if (supportAudio) Backend.CPU else null
+                    // Refresh init-wait profile now that we know the concrete directory.
+                    runCatching {
+                        val dirNow = resolveCacheDir(backend, visionPreferred, audioPreferred)
+                        initWaitProfiles[key] = InitWaitProfile(
+                            backend = backend,
+                            serializationDir = dirNow,
+                            createdAtMs = SystemClock.elapsedRealtime(),
+                        )
+                        val warm = isSerializationWarmBestEffort(dirNow)
+                        val t = recommendedInitAwaitTimeoutMs(backend, dirNow)
+                        AppLog.i(TAG, "Init profile: key='$key' backend=$backend warm=$warm awaitTimeoutMs=$t serializationDir='$dirNow'")
+                    }
 
                     var engineConfig = buildConfig(
                         forBackend = backend,
@@ -1256,6 +1642,15 @@ object LiteRtLM {
                                 visionBackend = v,
                                 audioBackend = a,
                             )
+                            // Update init-wait profile for fallback path.
+                            runCatching {
+                                val dirNow = engineConfig.cacheDir
+                                initWaitProfiles[key] = InitWaitProfile(
+                                    backend = Backend.CPU,
+                                    serializationDir = dirNow,
+                                    createdAtMs = SystemClock.elapsedRealtime(),
+                                )
+                            }
                             Engine(engineConfig).also {
                                 engineToCloseOnFailure = it
                                 it.initialize()
@@ -1311,6 +1706,8 @@ object LiteRtLM {
                 completed = true
             } finally {
                 initInFlight.remove(key)
+                initWaitProfiles.remove(key)
+
                 if (!completed) {
                     completeInitSignal(signal, "Initialization aborted unexpectedly.")
                 }
@@ -1356,9 +1753,7 @@ object LiteRtLM {
                 tools = tools,
             )
 
-            val err = withTimeoutOrNull(INIT_AWAIT_TIMEOUT_MS) { signal.await() }
-                ?: "Initialization timed out after ${INIT_AWAIT_TIMEOUT_MS}ms."
-
+            val err = awaitInitSignalAdaptive(key = key, reason = "initializeIfNeeded")
             if (err.isNotEmpty()) throw IllegalStateException("LiteRT-LM initialization failed: $err")
         }
     }
@@ -1382,6 +1777,7 @@ object LiteRtLM {
         if (!DEBUG_STATE) return
         val rid = rs.runId.get()
         val active = rs.active.get()
+        val recovering = rs.recovering.get()
         val term = rs.terminated.get()
         val logical = rs.logicalDone.get()
         val cancel = rs.cancelRequested.get()
@@ -1390,7 +1786,7 @@ object LiteRtLM {
         val lastTerm = rs.lastTerminateAtMs.get()
         AppLog.d(
             TAG,
-            "state[$prefix] key='$key' runId=$rid active=$active terminated=$term logicalDone=$logical " +
+            "state[$prefix] key='$key' runId=$rid active=$active recovering=$recovering terminated=$term logicalDone=$logical " +
                     "cancel=$cancel pendingCancel=$pending lastMsgAt=$lastMsg lastTermAt=$lastTerm"
         )
     }
@@ -1411,11 +1807,12 @@ object LiteRtLM {
         withSessionLock(key, reason = "closeNow:$reason") {
             val instance: LiteRtLmInstance? = stateMutex.withLock {
                 val rs = getRunState(key)
-                if (rs.active.get()) return@withLock null
+                if (isRunOccupied(rs)) return@withLock null
                 if (initInFlight.contains(key)) return@withLock null
 
                 rs.cancelRequested.set(false)
                 rs.pendingCancel.set(false)
+                rs.recovering.set(false)
                 rs.logicalTerminator.set(null)
                 rs.nativeDoneHook.set(null)
                 rs.terminated.set(true)
@@ -1430,7 +1827,7 @@ object LiteRtLM {
             if (instance == null) {
                 AppLog.d(
                     TAG,
-                    "closeInstanceNowBestEffort: nothing to close (or active/initInFlight): key='$key' reason='$reason'"
+                    "closeInstanceNowBestEffort: nothing to close (or active/recovering/initInFlight): key='$key' reason='$reason'"
                 )
                 return@withSessionLock
             }
@@ -1490,8 +1887,8 @@ object LiteRtLM {
                 val idleForInner = nowInner - rs.lastUseAtMs.get()
                 val tokenInner = rs.cleanupToken.get()
 
-                if (rs.active.get()) {
-                    AppLog.d(TAG, "Idle cleanup skipped (active native stream): key='$key'")
+                if (isRunOccupied(rs)) {
+                    AppLog.d(TAG, "Idle cleanup skipped (active/recovering run): key='$key'")
                     return@withLock null
                 }
                 if (initInFlight.contains(key)) {
@@ -1515,6 +1912,7 @@ object LiteRtLM {
 
                 rs.cancelRequested.set(false)
                 rs.pendingCancel.set(false)
+                rs.recovering.set(false)
                 rs.logicalTerminator.set(null)
                 rs.nativeDoneHook.set(null)
                 rs.terminated.set(true)
@@ -1588,14 +1986,14 @@ object LiteRtLM {
                 postToMain { onDone() }
             }
 
-            val defer = stateMutex.withLock { getRunState(key).active.get() }
+            val defer = stateMutex.withLock { isRunOccupied(getRunState(key)) }
             if (defer) {
                 stateMutex.withLock {
                     pendingAfterStream.getOrPut(key) { mutableListOf() }.add(action)
                 }
                 AppLog.w(
                     TAG,
-                    "cleanUp deferred (will schedule after native termination): key='$key'"
+                    "cleanUp deferred (will schedule after termination): key='$key'"
                 )
                 return@launch
             }
@@ -1632,7 +2030,7 @@ object LiteRtLM {
                     return@launch
                 }
 
-            val defer = stateMutex.withLock { getRunState(key).active.get() }
+            val defer = stateMutex.withLock { isRunOccupied(getRunState(key)) }
             if (defer) {
                 stateMutex.withLock {
                     pendingAfterStream.getOrPut(key) { mutableListOf() }.add {
@@ -1651,7 +2049,7 @@ object LiteRtLM {
                         }
                     }
                 }
-                AppLog.w(TAG, "resetConversation deferred (active stream): key='$key'")
+                AppLog.w(TAG, "resetConversation deferred (active/recovering run): key='$key'")
                 return@launch
             }
 
@@ -1676,10 +2074,93 @@ object LiteRtLM {
     }
 
     /**
+     * Reset conversation and await completion.
+     *
+     * Contract:
+     * - Returns true when the reset completed successfully.
+     * - Returns false if reset was skipped, failed, or timed out.
+     * - If a run slot is occupied, the reset is deferred until after termination.
+     */
+    suspend fun resetConversationAndAwait(
+        model: Model,
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemMessage: Message? = null,
+        tools: List<Any> = emptyList(),
+        timeoutMs: Long = 5_000L,
+    ): Boolean = withContext(Dispatchers.IO) {
+        val key = runtimeKey(model)
+
+        markUsed(key)
+        cancelScheduledCleanup(key, "resetConversationAndAwait")
+
+        runCatching { awaitInitIfInFlight(key, reason = "resetConversationAndAwait") }
+            .onFailure {
+                AppLog.w(
+                    TAG,
+                    "resetConversationAndAwait skipped (init wait failed): key='$key' err=${it.message}"
+                )
+                return@withContext false
+            }
+
+        val initialized = stateMutex.withLock { instances[key] != null }
+        if (!initialized) {
+            AppLog.w(TAG, "resetConversationAndAwait skipped: not initialized key='$key'")
+            return@withContext false
+        }
+
+        val done = CompletableDeferred<Boolean>()
+
+        suspend fun runReset(): Boolean {
+            return runCatching {
+                resetConversationInternal(
+                    key,
+                    model,
+                    supportImage,
+                    supportAudio,
+                    systemMessage,
+                    tools,
+                    "resetConversationAndAwait"
+                )
+                true
+            }.onFailure {
+                AppLog.w(
+                    TAG,
+                    "resetConversationAndAwait action failed: key='$key' err=${it.message}",
+                    it
+                )
+            }.getOrDefault(false)
+        }
+
+        val defer = stateMutex.withLock { isRunOccupied(getRunState(key)) }
+        if (defer) {
+            stateMutex.withLock {
+                pendingAfterStream.getOrPut(key) { mutableListOf() }.add {
+                    ioScope.launch {
+                        val ok = runReset()
+                        done.complete(ok)
+                    }
+                }
+            }
+            AppLog.w(TAG, "resetConversationAndAwait deferred (active/recovering run): key='$key'")
+        } else {
+            val ok = runReset()
+            done.complete(ok)
+        }
+
+        val ok = withTimeoutOrNull(timeoutMs) { done.await() }
+        if (ok == null) {
+            AppLog.w(TAG, "resetConversationAndAwait timed out: key='$key' timeoutMs=$timeoutMs")
+            return@withContext false
+        }
+        ok
+    }
+
+    /**
      * Internal suspend reset that is lifecycle-serialized via session lock.
      *
      * Contract:
-     * - Must not run while native stream is active.
+     * - Must not run while a run slot is occupied.
      */
     private suspend fun resetConversationInternal(
         key: String,
@@ -1701,8 +2182,8 @@ object LiteRtLM {
                 AppLog.w(TAG, "resetConversationInternal skipped: not initialized key='$key'")
                 return@withSessionLock
             }
-            if (rs.active.get()) {
-                AppLog.w(TAG, "resetConversationInternal rejected: active stream key='$key'")
+            if (isRunOccupied(rs)) {
+                AppLog.w(TAG, "resetConversationInternal rejected: active/recovering run key='$key'")
                 return@withSessionLock
             }
 
@@ -1748,14 +2229,13 @@ object LiteRtLM {
                         key,
                         reason = "resetConversationInternal-recover"
                     )
+                }.onFailure {
+                    AppLog.w(
+                        TAG,
+                        "resetConversationInternal recovery close failed: key='$key' err=${it.message}",
+                        it
+                    )
                 }
-                    .onFailure {
-                        AppLog.w(
-                            TAG,
-                            "resetConversationInternal recovery close failed: key='$key' err=${it.message}",
-                            it
-                        )
-                    }
 
                 val ctx = appContextRef.get()
                 if (ctx != null) {
@@ -1794,7 +2274,7 @@ object LiteRtLM {
      * Force immediate teardown (best-effort).
      *
      * Contract:
-     * - If a native stream is active, defer until after termination.
+     * - If a run slot is occupied, defer until after termination.
      */
     fun forceCleanUp(model: Model, onDone: () -> Unit) {
         val key = runtimeKey(model)
@@ -1816,14 +2296,14 @@ object LiteRtLM {
                 postToMain { onDone() }
             }
 
-            val defer = stateMutex.withLock { getRunState(key).active.get() }
+            val defer = stateMutex.withLock { isRunOccupied(getRunState(key)) }
             if (defer) {
                 stateMutex.withLock {
                     pendingAfterStream.getOrPut(key) { mutableListOf() }.add {
                         ioScope.launch { runCatching { action() } }
                     }
                 }
-                AppLog.w(TAG, "forceCleanUp deferred (active stream): key='$key'")
+                AppLog.w(TAG, "forceCleanUp deferred (active/recovering run): key='$key'")
                 return@launch
             }
 
@@ -1851,8 +2331,8 @@ object LiteRtLM {
                 while (true) {
                     delay(HARD_CLOSE_POLL_MS)
 
-                    if (!rs.active.get() || rs.terminated.get()) {
-                        AppLog.d(TAG, "Hard-close watchdog exit: key='$key' already terminated")
+                    if (!isRunOccupied(rs) || rs.terminated.get()) {
+                        AppLog.d(TAG, "Hard-close watchdog exit: key='$key' already terminated/free")
                         return@launch
                     }
 
@@ -1881,7 +2361,7 @@ object LiteRtLM {
                         // Serialize with session lifecycle ops to avoid racing with reset/init/close.
                         withSessionLock(key, reason = "hardClose:$reason") {
                             val inst: LiteRtLmInstance? = stateMutex.withLock {
-                                if (!rs.active.get()) return@withLock null
+                                if (!isRunOccupied(rs)) return@withLock null
 
                                 // Clear related state to avoid stale defers/signals after emergency teardown.
                                 pendingAfterStream.remove(key)
@@ -1914,6 +2394,7 @@ object LiteRtLM {
                             rs.cooldownUntilMs.set(tNow + POST_TERMINATE_COOLDOWN_MS)
 
                             rs.active.set(false)
+                            rs.recovering.set(false)
                             rs.logicalDone.set(true)
                             rs.logicalTerminator.set(null)
 
@@ -1958,9 +2439,7 @@ object LiteRtLM {
             runCatching { awaitInitIfInFlight(key, reason = "runInference") }
                 .onFailure { t ->
                     val msg =
-                        "LiteRT-LM cannot start inference while initialization is in progress: ${
-                            cleanError(t.message)
-                        }"
+                        "LiteRT-LM cannot start inference while initialization is in progress: ${cleanError(t.message)}"
                     AppLog.e(TAG, msg, t)
                     postToMain {
                         onError(msg)
@@ -2077,16 +2556,25 @@ object LiteRtLM {
 
                     val rs = getRunState(key)
 
+                    // Block new runs if we are in the middle of recovery (belt + suspenders).
+                    if (rs.recovering.get()) {
+                        rejectMsg =
+                            "LiteRT-LM runInference rejected: recovery is in progress for key='$key'."
+                        return@withLock
+                    }
+
                     val acquired = rs.active.compareAndSet(false, true)
                     if (!acquired) {
                         rejectMsg =
-                            "LiteRT-LM runInference rejected: another native stream is already active for key='$key'."
+                            "LiteRT-LM runInference rejected: another run is already active for key='$key'."
                         return@withLock
                     }
 
                     myRunId = rs.runId.incrementAndGet()
                     rs.terminated.set(false)
                     rs.logicalDone.set(false)
+                    rs.recovering.set(false)
+
                     val nowStartMs = SystemClock.elapsedRealtime()
                     rs.lastMessageAtMs.set(nowStartMs)
 
@@ -2169,11 +2657,11 @@ object LiteRtLM {
                     }
                 }
 
-                rs.nativeDoneHook.set hook@{
+                rs.nativeDoneHook.set(hook@{
                     if (rs.runId.get() != myRunId) return@hook
                     scheduleCleanUpListener()
                     scheduleDeferredActions()
-                }
+                })
 
                 fun cancelProcessBestEffort(stage: String) {
                     ioScope.launch {
@@ -2236,6 +2724,7 @@ object LiteRtLM {
                     rs.cooldownUntilMs.set(now + POST_TERMINATE_COOLDOWN_MS)
 
                     rs.active.set(false)
+                    rs.recovering.set(false)
                     rs.logicalTerminator.set(null)
 
                     // Clear cancel flags on normal completion.
@@ -2322,9 +2811,7 @@ object LiteRtLM {
                                 val lead = deltaRaw.firstOrNull()
                                 val leadInfo =
                                     if (lead == null) "null"
-                                    else "U+${
-                                        lead.code.toString(16).uppercase(Locale.ROOT)
-                                    } ws=${lead.isWhitespace()} ch='$lead'"
+                                    else "U+${lead.code.toString(16).uppercase(Locale.ROOT)} ws=${lead.isWhitespace()} ch='$lead'"
 
                                 val dPreview = delta.take(DEBUG_PREFIX_CHARS).replace("\n", "\\n")
                                 val sPreview =
@@ -2391,11 +2878,7 @@ object LiteRtLM {
                         if (BuildConfig.DEBUG) {
                             AppLog.i(
                                 TAG,
-                                "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length} preview='${
-                                    safeLogPreview(
-                                        trimmed
-                                    )
-                                }'"
+                                "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length} preview='${safeLogPreview(trimmed)}'"
                             )
                         } else {
                             AppLog.i(
@@ -2427,14 +2910,23 @@ object LiteRtLM {
                     )
 
                     if (recoverable) {
+                        // IMPORTANT:
+                        // - Keep the run slot occupied (active=true) while recovering.
+                        // - Use `recovering=true` to prevent any "gap" from appearing in future refactors,
+                        //   and to ensure other lifecycle ops treat this window as busy.
+                        rs.recovering.set(true)
+                        rs.lastMessageAtMs.set(SystemClock.elapsedRealtime())
+
                         AppLog.w(
                             TAG,
                             "Recovering from not-alive conversation: key='$key' runId=$myRunId"
                         )
 
-                        stateMutex.withLock {
-                            rs.active.set(false)
-                            rs.logicalTerminator.set(null)
+                        // If cancellation was requested during the failure, honor it before heavy recovery work.
+                        if (rs.cancelRequested.get()) {
+                            AppLog.i(TAG, "Recovery aborted due to cancellation: key='$key' runId=$myRunId")
+                            markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
+                            return@withSessionLock
                         }
 
                         val ok = runCatching {
@@ -2457,49 +2949,51 @@ object LiteRtLM {
                         }.isSuccess
 
                         if (ok) {
-                            val reacquired = stateMutex.withLock {
-                                val acquired2 = rs.active.compareAndSet(false, true)
-                                if (acquired2) {
-                                    rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
-                                }
-                                acquired2
+                            // Re-check cancellation after recovery work but before retrying the send.
+                            if (rs.cancelRequested.get()) {
+                                AppLog.i(TAG, "Recovery retry skipped due to cancellation: key='$key' runId=$myRunId")
+                                markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
+                                return@withSessionLock
                             }
 
-                            if (reacquired) {
-                                runCatching {
-                                    if (!hasMm) {
-                                        conv!!.sendMessageAsync(trimmed, callback)
-                                    } else {
-                                        val contentList = buildContentList(
-                                            input = trimmed,
-                                            images = images,
-                                            audioClips = audioClips
-                                        )
-                                        val contentsObj = buildContentsObject(contentList)
-                                        conv!!.sendMessageAsync(contentsObj, callback)
-                                    }
-                                }.onSuccess {
-                                    AppLog.w(
-                                        TAG,
-                                        "Recovery retry succeeded: key='$key' runId=$myRunId"
+                            runCatching {
+                                if (!hasMm) {
+                                    conv!!.sendMessageAsync(trimmed, callback)
+                                } else {
+                                    val contentList = buildContentList(
+                                        input = trimmed,
+                                        images = images,
+                                        audioClips = audioClips
                                     )
-                                    nativeStarted.set(true)
-                                }.onFailure { e2 ->
-                                    AppLog.e(
-                                        TAG,
-                                        "Recovery retry failed: key='$key' runId=$myRunId err=${e2.message}",
-                                        e2
-                                    )
-                                    markNativeDoneOnce(cleanError(e2.message))
+                                    val contentsObj = buildContentsObject(contentList)
+                                    conv!!.sendMessageAsync(contentsObj, callback)
                                 }
-                            } else {
-                                markNativeDoneOnce("Recovery failed: could not reacquire active stream")
+                            }.onSuccess {
+                                AppLog.w(
+                                    TAG,
+                                    "Recovery retry succeeded: key='$key' runId=$myRunId"
+                                )
+                                nativeStarted.set(true)
+                                rs.recovering.set(false)
+                            }.onFailure { e2 ->
+                                AppLog.e(
+                                    TAG,
+                                    "Recovery retry failed: key='$key' runId=$myRunId err=${e2.message}",
+                                    e2
+                                )
+                                markNativeDoneOnce(cleanError(e2.message))
                             }
                         } else {
                             markNativeDoneOnce(cleanError(e.message))
                         }
                     } else {
                         markNativeDoneOnce(cleanError(e.message))
+                    }
+                } finally {
+                    // Ensure we don't leave the recovering flag stuck if we exit early.
+                    // Note: markNativeDoneOnce also clears it.
+                    if (rs.runId.get() == myRunId && rs.terminated.get()) {
+                        rs.recovering.set(false)
                     }
                 }
             } // end session lock
@@ -2536,6 +3030,8 @@ object LiteRtLM {
         if (!busy.compareAndSet(false, true)) {
             throw IllegalStateException("LiteRT-LM is already busy with another request.")
         }
+
+        busyKey.set(key)
 
         try {
             val buffer = StringBuilder()
@@ -2579,6 +3075,7 @@ object LiteRtLM {
                 throw e
             }
         } finally {
+            busyKey.set(null)
             busy.set(false)
         }
     }
@@ -2587,8 +3084,8 @@ object LiteRtLM {
      * Best-effort cancellation.
      *
      * Behavior:
-     * - Only cancels an ACTIVE native stream.
-     * - Does NOT poison the next run when no stream is active.
+     * - Only cancels an ACTIVE native stream (or recovery-owned run slot).
+     * - Does NOT poison the next run when no run slot is occupied.
      */
     fun cancel(model: Model) {
         val key = runtimeKey(model)
@@ -2597,10 +3094,8 @@ object LiteRtLM {
             val rs = getRunState(key)
             val nowMs = SystemClock.elapsedRealtime()
 
-            // If the active flag is not set, we still do two best-effort things:
-            // 1) Record a short-lived pending cancel to catch start-race windows.
-            // 2) Try cancelProcess() on the current conversation (if any).
-            if (!rs.active.get()) {
+            // If not occupied, record a short-lived pending cancel to catch start-race windows.
+            if (!isRunOccupied(rs)) {
                 rs.pendingCancelAtMs.set(nowMs)
                 rs.pendingCancel.set(true)
 
@@ -2618,7 +3113,7 @@ object LiteRtLM {
                 if (DEBUG_STATE) debugState(key, rs, "cancel:noActive")
                 AppLog.d(
                     TAG,
-                    "cancel requested (no active flag): key='$key' (pending TTL ${PENDING_CANCEL_TTL_MS}ms)"
+                    "cancel requested (no active/recovering run): key='$key' (pending TTL ${PENDING_CANCEL_TTL_MS}ms)"
                 )
                 return@launch
             }
