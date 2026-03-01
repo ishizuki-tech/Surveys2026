@@ -106,11 +106,13 @@ import com.negi.surveys.chat.InMemoryChatDraftStore
 import com.negi.surveys.chat.RepositoryI
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.slm.SlmRepository
+import kotlinx.coroutines.FlowPreview
 import java.util.Locale
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
 
+@OptIn(FlowPreview::class)
 @Composable
 fun ChatQuestionScreen(
     questionId: String,

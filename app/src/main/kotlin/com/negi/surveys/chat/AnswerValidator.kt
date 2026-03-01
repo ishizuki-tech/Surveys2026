@@ -14,6 +14,7 @@
 package com.negi.surveys.chat
 
 import android.os.SystemClock
+import com.negi.surveys.logging.SafeLog
 import java.security.MessageDigest
 import java.util.Locale
 import kotlin.math.max
@@ -264,7 +265,6 @@ $followUpSection
                 FlowTextStopReason.TIMEOUT -> streamBridge.error(sessionId, "timeout")
                 FlowTextStopReason.ERROR -> streamBridge.error(sessionId, result.errorToken ?: "error")
             }
-
             result
         } catch (ce: CancellationException) {
             runCatching {

@@ -15,10 +15,12 @@ package com.negi.surveys.slm
 
 import android.content.Context
 import com.negi.surveys.chat.RepositoryI
+import com.negi.surveys.chat.collectToTextResultWithBudget
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
 import java.io.File
+import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.Dispatchers
@@ -32,31 +34,27 @@ private const val TAG = "SlmRepository"
 /** Max time the repository will wait for warmup compile before proceeding. */
 private const val COMPILE_BARRIER_TIMEOUT_MS: Long = 1_500L
 
-/**
- * Repository implementation backed by SLM (streaming).
- *
- * Contract:
- * - buildPrompt(userPrompt): string composition only (no IO).
- * - request(prompt): suspend; ensures model is initialized then returns Flow<String> deltas.
- *
- * Notes:
- * - Warmup compile is treated as a best-effort optimization.
- * - initializeIfNeeded() remains the source of truth for readiness.
- */
+/** Two-step: max time budget for the first (main) generation. */
+private const val TWO_STEP_MAIN_TIMEOUT_MS: Long = 120_000L
+
+/** Two-step: cap the amount of main output included in the eval prompt (avoid huge prompts). */
+private const val TWO_STEP_EVAL_MAIN_ANSWER_MAX_CHARS: Int = 8_000
+
+/** Two-step: cap the amount of original prompt included in the eval prompt. */
+private const val TWO_STEP_EVAL_USER_PROMPT_MAX_CHARS: Int = 4_000
+
 class SlmRepository(
     context: Context,
     private val configAssetName: String = "survey.yaml",
     private val fallbackModelName: String = "Gemma3n4B",
     private val fallbackModelFileName: String = "Gemma3n4B.litertlm",
     private val resetConversationEachRequest: Boolean = true,
+    private val enableTwoStepEval: Boolean = true,
 ) : RepositoryI {
 
     private val appContext: Context = context.applicationContext
     private val cachedConfig = AtomicReference<SurveyConfig?>(null)
 
-    /**
-     * Model-not-ready error used to produce a stable error token in upstream collectors.
-     */
     class ModelNotReadyException(message: String) : IllegalStateException(message)
 
     override fun buildPrompt(userPrompt: String): String {
@@ -66,7 +64,6 @@ class SlmRepository(
         val cfg = getConfigBestEffort()
         val sys = runCatching { cfg?.composeSystemPrompt() }.getOrNull().orEmpty().trim()
 
-        // If no system prompt is configured, pass through.
         if (sys.isBlank()) return u
 
         return """
@@ -90,25 +87,78 @@ class SlmRepository(
         val model = buildModel(file)
         awaitInitializedModel(model)
 
+        return if (enableTwoStepEval) {
+            requestTwoStepEval(model = model, userPrompt = p)
+        } else {
+            requestOneStep(model = model, prompt = p)
+        }
+    }
 
+    /**
+     * One-step request: stream model output directly.
+     */
+    private suspend fun requestOneStep(model: Model, prompt: String): Flow<String> {
         if (resetConversationEachRequest) {
-            // Ensures request isolation if the underlying SDK keeps conversation state.
-            val ok = SLM.resetConversationAndAwait(
-                model = model,
-                supportImage = false,
-                supportAudio = false,
-                systemMessage = null,
-                tools = emptyList(),
-                timeoutMs = 5_000L
-            )
-            if (!ok) {
-                AppLog.w(TAG, "resetConversationAndAwait failed or timed out; continuing: model='${model.name}'")
-            }
+            resetConversationBestEffort(model, reason = "oneStepRequest")
+        }
+        return runInferenceAsFlow(model = model, input = prompt)
+    }
+
+    /**
+     * Two-step request:
+     * 1) Run main generation and collect it internally.
+     * 2) Run eval generation that outputs exactly one JSON object, and stream that to callers.
+     */
+    private suspend fun requestTwoStepEval(model: Model, userPrompt: String): Flow<String> {
+        // Step 1: main output (internal).
+        if (resetConversationEachRequest) {
+            resetConversationBestEffort(model, reason = "twoStepMain")
         }
 
+        val mainFlow = runInferenceAsFlow(model = model, input = userPrompt)
+        val mainResult = mainFlow.collectToTextResultWithBudget(
+            timeoutBudgetMs = TWO_STEP_MAIN_TIMEOUT_MS,
+            maxChars = 32_000,
+            onChunk = null
+        )
+
+        val questionId = extractQuestionId(userPrompt) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
+        val evalPrompt = buildTwoStepEvalPrompt(
+            questionId = questionId,
+            userPrompt = userPrompt,
+            mainAnswer = mainResult.text,
+            mainStopReason = mainResult.reason.name,
+            mainErrorToken = mainResult.errorToken
+        )
+
+        // Step 2: eval output streamed to caller.
+        // Always reset to isolate eval from any SDK conversation state.
+        resetConversationBestEffort(model, reason = "twoStepEval")
+
+        // Enforce eval time budget by collecting with a timeout on the consumer side if needed.
+        // Here we keep it streaming; upstream collectors may cap with FlowTextCollector if desired.
+        return runInferenceAsFlow(model = model, input = evalPrompt)
+    }
+
+    /**
+     * Runs SLM inference and exposes deltas as a Flow<String>.
+     *
+     * Key fix:
+     * - Do NOT call cancel() when the run ended normally (done/cleanup/error).
+     * - Only call cancel() when the collector stopped early.
+     */
+    private fun runInferenceAsFlow(model: Model, input: String): Flow<String> {
+        val p = input.trim()
+        if (p.isBlank()) {
+            return callbackFlow { close() }
+        }
 
         return callbackFlow {
             val closed = AtomicBoolean(false)
+
+            // True when the underlying SDK run reached a terminal state.
+            // If true, we must NOT call cancel() in awaitClose (prevents sticky cancel TTL).
+            val terminal = AtomicBoolean(false)
 
             fun closeOnce() {
                 if (closed.compareAndSet(false, true)) {
@@ -119,13 +169,27 @@ class SlmRepository(
             SLM.runInference(
                 model = model,
                 input = p,
-                resultListener = { delta, done ->
-                    if (delta.isNotEmpty()) trySend(delta)
-                    if (done) closeOnce()
+                resultListener = { partialResult, done ->
+                    if (partialResult.isNotEmpty()) {
+                        trySend(partialResult)
+                    }
+                    if (done) {
+                        terminal.set(true)
+                        closeOnce()
+                    }
                 },
-                cleanUpListener = { closeOnce() },
+                cleanUpListener = {
+                    terminal.set(true)
+                    closeOnce()
+                },
                 onError = { msg ->
-                    if (msg.equals("Cancelled", ignoreCase = true)) return@runInference
+                    // "Cancelled" is treated as a non-error stop by policy.
+                    if (msg.equals("Cancelled", ignoreCase = true)) {
+                        terminal.set(true)
+                        closeOnce()
+                        return@runInference
+                    }
+                    terminal.set(true)
                     if (closed.compareAndSet(false, true)) close(IllegalStateException(msg))
                 },
                 images = emptyList(),
@@ -134,9 +198,28 @@ class SlmRepository(
             )
 
             awaitClose {
-                // Best effort cancellation when collector stops early.
-                runCatching { SLM.cancel(model) }
+                // Cancel only if the collector stopped early (i.e., run not terminal yet).
+                if (!terminal.get()) {
+                    runCatching { SLM.cancel(model) }
+                }
             }
+        }
+    }
+
+    private suspend fun resetConversationBestEffort(model: Model, reason: String) {
+        val ok = runCatching {
+            SLM.resetConversationAndAwait(
+                model = model,
+                supportImage = false,
+                supportAudio = false,
+                systemMessage = null,
+                tools = emptyList(),
+                timeoutMs = 5_000L
+            )
+        }.getOrNull() == true
+
+        if (!ok) {
+            AppLog.w(TAG, "resetConversationAndAwait failed or timed out; continuing: reason='$reason' model='${model.name}'")
         }
     }
 
@@ -195,13 +278,6 @@ class SlmRepository(
         )
     }
 
-    /**
-     * Ensures SLM is initialized for the given [model].
-     *
-     * Important:
-     * - initializeIfNeeded() is treated as the authoritative readiness gate.
-     * - Warmup compile may reduce latency, but is not required for correctness.
-     */
     private suspend fun awaitInitializedModel(model: Model) {
         withContext(Dispatchers.Default) {
             runCatching { SLM.setApplicationContext(appContext) }
@@ -218,9 +294,70 @@ class SlmRepository(
         }
     }
 
-    /**
-     * Returns true if compile state is terminal (no further progress without a new request/reset).
-     */
+    private fun extractQuestionId(prompt: String): String? {
+        val m = Regex("""(?m)^\s*QUESTION_ID:\s*([^\s]+)\s*$""").find(prompt) ?: return null
+        return m.groupValues.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
+    }
+
+    private fun buildTwoStepEvalPrompt(
+        questionId: String,
+        userPrompt: String,
+        mainAnswer: String,
+        mainStopReason: String,
+        mainErrorToken: String?
+    ): String {
+        val clippedUserPrompt = clipForEval(userPrompt, TWO_STEP_EVAL_USER_PROMPT_MAX_CHARS)
+        val clippedMain = clipForEval(mainAnswer, TWO_STEP_EVAL_MAIN_ANSWER_MAX_CHARS)
+        val err = mainErrorToken?.takeIf { it.isNotBlank() } ?: "-"
+
+        return """
+            Return exactly ONE JSON object and nothing else.
+            - No markdown, no code fences, no backticks.
+            - Output must start with "{" and end with "}".
+            - Do not include extra keys beyond the valid shapes.
+
+            Valid shapes:
+            1) {"status":"ACCEPTED","assistantMessage":"..."}
+            2) {"status":"NEED_FOLLOW_UP","assistantMessage":"...","followUpQuestion":"..."}
+
+            Rules:
+            - Judge whether MAIN_ANSWER is sufficient to satisfy USER_PROMPT.
+            - If sufficient: return ACCEPTED with assistantMessage (concise).
+            - If not sufficient: return NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
+            - Do not repeat large chunks of USER_PROMPT or MAIN_ANSWER verbatim.
+
+            QUESTION_ID: $questionId
+            MAIN_STOP_REASON: $mainStopReason
+            MAIN_ERROR_TOKEN: $err
+
+            USER_PROMPT:
+            $clippedUserPrompt
+
+            MAIN_ANSWER:
+            $clippedMain
+        """.trimIndent()
+    }
+
+    private fun clipForEval(text: String, maxChars: Int): String {
+        val t = text
+        if (maxChars <= 0) return ""
+        if (t.length <= maxChars) return t
+
+        var end = maxChars.coerceAtMost(t.length)
+        if (end <= 0) return ""
+
+        if (end < t.length) {
+            val last = t[end - 1]
+            val next = t[end]
+            if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
+                end -= 1
+            }
+        }
+
+        if (end <= 0) return ""
+        return t.take(end)
+    }
+
     private fun SlmWarmup.CompileState.isTerminal(): Boolean {
         return this is SlmWarmup.CompileState.Compiled ||
                 this is SlmWarmup.CompileState.Failed ||

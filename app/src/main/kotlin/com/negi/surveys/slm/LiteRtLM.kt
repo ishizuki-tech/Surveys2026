@@ -97,8 +97,8 @@ private const val HARD_CLOSE_POLL_MS = 750L
 private const val HARD_CLOSE_ENABLE = true
 
 /** Streaming debug toggles. */
-private val DEBUG_STREAM: Boolean = BuildConfig.DEBUG
-private const val DEBUG_STREAM_EVERY_N = 16
+private val DEBUG_STREAM: Boolean = true
+private const val DEBUG_STREAM_EVERY_N = 1
 private const val DEBUG_PREFIX_CHARS = 24
 
 /** Text extraction debug toggles. */
