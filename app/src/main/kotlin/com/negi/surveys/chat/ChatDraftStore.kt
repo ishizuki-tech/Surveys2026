@@ -222,7 +222,11 @@ class InMemoryChatDraftStore(
      * Threading:
      * - Guarded by [lock].
      */
-    private val lru = LinkedHashMap<DraftKey, ChatDraft>(/* initialCapacity */ 128, /* loadFactor */ 0.75f, /* accessOrder */ true)
+    private val lru = LinkedHashMap<DraftKey, ChatDraft>(
+        /* initialCapacity */ 128,
+        /* loadFactor */ 0.75f,
+        /* accessOrder */ true
+    )
 
     // Stats (guarded by lock)
     private var loads: Long = 0L
@@ -255,16 +259,17 @@ class InMemoryChatDraftStore(
 
         val k = key.normalized()
         val v = lru[k] ?: return@synchronized null
+
         // Return a fresh snapshot to avoid exposing internal list references.
-        v.freeze()
+        // Also re-apply caps defensively (cheap, and prevents surprises if older drafts slip in).
+        v.freeze().applyCaps(cfg)
     }
 
     override fun save(key: DraftKey, draft: ChatDraft): Unit = synchronized(lock) {
         saves += 1
 
         if (cfg.maxKeys <= 0) {
-            // Storage disabled. Best-effort: keep map empty.
-            if (lru.isNotEmpty()) lru.clear()
+            // Storage disabled. No-op by design.
             return@synchronized
         }
 
@@ -347,22 +352,16 @@ class InMemoryChatDraftStore(
     /**
      * Cap message string fields to limit memory usage.
      *
-     * Note:
+     * Notes:
      * - This is content-preserving (truncation only).
-     * - IDs are not modified.
+     * - IDs and enums are not modified.
      */
     private fun ChatMessage.capStrings(cfg: Config): ChatMessage {
-        val cappedText = text.takeSafeChars(cfg.maxMessageTextChars)
-        val cappedAssistant = assistantMessage?.takeSafeChars(cfg.maxMessageAssistantChars)
-        val cappedFollowUp = followUpQuestion?.takeSafeChars(cfg.maxMessageFollowUpQuestionChars)
-        val cappedStream = streamText?.takeSafeChars(cfg.maxMessageStreamTextChars)
-
-        // Keep structure identical; only cap strings.
         return copy(
-            text = cappedText,
-            assistantMessage = cappedAssistant,
-            followUpQuestion = cappedFollowUp,
-            streamText = cappedStream
+            text = text.takeSafeChars(cfg.maxMessageTextChars),
+            assistantMessage = assistantMessage?.takeSafeChars(cfg.maxMessageAssistantChars),
+            followUpQuestion = followUpQuestion?.takeSafeChars(cfg.maxMessageFollowUpQuestionChars),
+            streamText = streamText?.takeSafeChars(cfg.maxMessageStreamTextChars)
         )
     }
 

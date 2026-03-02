@@ -27,10 +27,12 @@
  *     - followup_output_mode: "JSON" or "TEXT" (2-call followup output control)
  *     - (fallback to key_contract / length_budget / strict_output when phase-specific fields are missing)
  *
- *  Notes:
+ *  Validation contract (updated):
  *  ---------------------------------------------------------------------
- *   • Validation assumes a single-successor graph using nextId.
- *     If you later introduce branching (per-option next ids), update validation.
+ *   • graph.startId is canonical.
+ *   • If graph.startId is blank, and exactly one START node exists,
+ *     we treat that START node id as the startId.
+ *   • If both are present, they must match (after trim).
  * =====================================================================
  */
 
@@ -233,6 +235,9 @@ data class SurveyConfig(
         @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
     )
 
+    /**
+     * Resolves legacy one-step prompt for a node.
+     */
     fun resolveOneStepPrompt(nodeId: String): String? {
         val id = nodeId.trim()
         if (id.isBlank()) return null
@@ -240,6 +245,13 @@ data class SurveyConfig(
         return p.prompt?.takeIf { it.isNotBlank() }
     }
 
+    /**
+     * Resolves eval prompt for two-step prompts.
+     *
+     * Priority:
+     * 1) legacy inline two-step (only if complete)
+     * 2) split prompts_eval/prompts_followup (only if both exist for the id)
+     */
     fun resolveEvalPrompt(nodeId: String): String? {
         val id = nodeId.trim()
         if (id.isBlank()) return null
@@ -256,6 +268,13 @@ data class SurveyConfig(
         return null
     }
 
+    /**
+     * Resolves follow-up prompt for two-step prompts.
+     *
+     * Priority:
+     * 1) legacy inline two-step (only if complete)
+     * 2) split prompts_eval/prompts_followup (only if both exist for the id)
+     */
     fun resolveFollowupPrompt(nodeId: String): String? {
         val id = nodeId.trim()
         if (id.isBlank()) return null
@@ -272,6 +291,9 @@ data class SurveyConfig(
         return null
     }
 
+    /**
+     * Builds a one-step system prompt by composing non-empty components.
+     */
     fun composeSystemPromptOneStep(): String {
         val parts = listOf(
             slm.preamble,
@@ -285,6 +307,9 @@ data class SurveyConfig(
         return parts.joinToString("\n")
     }
 
+    /**
+     * Builds the evaluation system prompt for two-step pipelines.
+     */
     fun composeSystemPromptEval(): String {
         val contract = slm.keyContractEval?.takeIf { it.isNotBlank() } ?: slm.keyContract
         val budget = slm.lengthBudgetEval?.takeIf { it.isNotBlank() } ?: slm.lengthBudget
@@ -302,12 +327,22 @@ data class SurveyConfig(
         return parts.joinToString("\n")
     }
 
+    /**
+     * Default strict instruction for TEXT follow-up mode.
+     */
     private fun defaultFollowupStrictText(): String = """
         STRICT OUTPUT (NO MARKDOWN):
         - Output ONLY the follow-up question as plain text on ONE LINE, or EMPTY output if none.
         - No JSON, no quotes, no extra text.
     """.trimIndent()
 
+    /**
+     * Builds the follow-up system prompt for two-step pipelines.
+     *
+     * Behavior:
+     * - If followup_output_mode=TEXT, emptyJsonInstruction is NOT appended.
+     * - If followup_output_mode=JSON, emptyJsonInstruction is appended (if present).
+     */
     fun composeSystemPromptFollowup(): String {
         val contract = slm.keyContractFollowup?.takeIf { it.isNotBlank() } ?: slm.keyContract
         val budget = slm.lengthBudgetFollowup?.takeIf { it.isNotBlank() } ?: slm.lengthBudget
@@ -334,8 +369,18 @@ data class SurveyConfig(
         return parts.joinToString("\n")
     }
 
+    /**
+     * Backward-compatible alias for one-step system prompt.
+     */
     fun composeSystemPrompt(): String = composeSystemPromptOneStep()
 
+    /**
+     * Normalizes prompts into a single list of Prompt entries.
+     *
+     * Merge rule:
+     * - Legacy prompts[] win if the same nodeId appears in split lists.
+     * - Split two-step is included only when BOTH eval and followup exist.
+     */
     fun normalizedPrompts(): List<Prompt> {
         val legacyById = LinkedHashMap<String, Prompt>()
         prompts.forEach { p ->
@@ -376,24 +421,33 @@ data class SurveyConfig(
         return out
     }
 
+    /**
+     * Exports normalized prompt entries as JSONL lines.
+     */
     fun toJsonl(): List<String> =
         SurveyConfigLoader.jsonCompact.let { json ->
             normalizedPrompts().map { json.encodeToString(Prompt.serializer(), it) }
         }
 
+    /**
+     * Encodes the entire config as JSON.
+     */
     fun toJson(pretty: Boolean = true): String =
         (if (pretty) SurveyConfigLoader.jsonPretty else SurveyConfigLoader.jsonCompact)
             .encodeToString(serializer(), this)
 
     /**
-     * Encode the whole config into YAML.
-     *
-     * Note:
-     * - Uses cached Yaml instances to avoid repeated allocations.
+     * Encodes the entire config as YAML using cached Yaml instances.
      */
     fun toYaml(strict: Boolean = false): String =
         SurveyConfigLoader.yamlCached(strict).encodeToString(serializer(), this)
 
+    /**
+     * Debug summary for logging.
+     *
+     * Adds:
+     * - ambiguous count: nodeIds that exist in both legacy prompts[] and split lists (any presence)
+     */
     fun debugSummary(maxIds: Int = 8): String {
         fun takeIds(xs: List<String>, n: Int): String {
             val t = xs.asSequence().map { it.trim() }.filter { it.isNotBlank() }.distinct().take(n).toList()
@@ -407,16 +461,28 @@ data class SurveyConfig(
         val legacyOne = prompts.count { it.isOneStep() }
         val legacyInlineTwo = prompts.count { it.isTwoStepComplete() }
 
+        val legacySet = legacyIds.asSequence().map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val splitSet = (evalIds.asSequence() + followIds.asSequence()).map { it.trim() }.filter { it.isNotBlank() }.toSet()
+        val ambiguous = (legacySet intersect splitSet).size
+
         val followMode = slm.resolvedFollowupOutputMode().name
 
         return "legacy=${prompts.size}(one=$legacyOne,inline2=$legacyInlineTwo) " +
                 "splitEval=${promptsEval.size} splitFollow=${promptsFollowup.size} " +
+                "ambiguous=$ambiguous " +
                 "followMode=$followMode " +
                 "legacyIds=[${takeIds(legacyIds, maxIds)}] " +
                 "evalIds=[${takeIds(evalIds, maxIds)}] " +
                 "followIds=[${takeIds(followIds, maxIds)}]"
     }
 
+    /**
+     * Debug dump with a bounded preview.
+     *
+     * Note:
+     * - This includes system prompt previews (which may contain prompt text).
+     * - If you want a safer dump for production, add a "safe" variant that only logs lengths/hashes.
+     */
     fun debugDump(maxPreviewChars: Int = 320): String {
         fun preview(s: String): String {
             val t = s.replace("\r", "\\r").replace("\n", "\\n")
@@ -449,17 +515,24 @@ data class SurveyConfig(
         }
     }
 
+    /**
+     * Validates the config and returns a list of issues.
+     *
+     * Updated contract:
+     * - graph.startId is canonical.
+     * - If graph.startId is blank, and exactly one START node exists,
+     *   we treat that START node id as the startId (implicit start).
+     * - If both are present, they must match.
+     */
     fun validate(): List<String> {
         val issues = mutableListOf<String>()
 
-        if (graph.startId.isBlank()) {
-            issues += "graph.startId is blank"
-        }
         if (graph.nodes.isEmpty()) {
             issues += "graph.nodes is empty"
             return issues
         }
 
+        // Normalize node ids and build maps once (avoid O(N^2) patterns).
         val rawIds = graph.nodes.map { it.id }
         val ids = rawIds.map { it.trim() }
         val idSet = ids.filter { it.isNotBlank() }.toSet()
@@ -469,18 +542,12 @@ data class SurveyConfig(
             issues += "graph.nodes contains blank id entries"
         }
 
-        val trimmedMismatch = graph.nodes
-            .map { it.id }
+        val trimmedMismatch = rawIds
             .filter { it.isNotBlank() }
             .filter { it != it.trim() }
             .distinct()
         if (trimmedMismatch.isNotEmpty()) {
             issues += "graph.nodes contains ids with leading/trailing whitespace: ${trimmedMismatch.joinToString(",")}"
-        }
-
-        val startIdNorm = graph.startId.trim()
-        if (startIdNorm.isNotBlank() && startIdNorm !in idSet) {
-            issues += "graph.startId='${graph.startId}' not found in node ids: ${idSet.joinToString(",")}"
         }
 
         val duplicateIds = ids
@@ -510,16 +577,42 @@ data class SurveyConfig(
             issues += "nodes with unknown type: ${unknownTypes.joinToString(",")}"
         }
 
-        val startNode = graph.nodes.firstOrNull { it.id.trim() == startIdNorm }
-        if (startNode != null && startNode.nodeType() != NodeType.START) {
-            issues += "graph.startId points to a non-START node (id='${startNode.id}', type='${startNode.type}')"
+        // START contract handling (unified).
+        val explicitStarts = graph.nodes
+            .asSequence()
+            .filter { it.nodeType() == NodeType.START }
+            .map { it.id.trim() }
+            .filter { it.isNotBlank() }
+            .toList()
+
+        val startIdNormFromGraph = graph.startId.trim()
+        val resolvedStartId = when {
+            startIdNormFromGraph.isNotBlank() -> startIdNormFromGraph
+            explicitStarts.size == 1 -> explicitStarts.first()
+            else -> ""
         }
 
-        val explicitStarts = graph.nodes.count { it.nodeType() == NodeType.START }
-        if (explicitStarts == 0) {
-            issues += "no START node detected (expected exactly one START node)"
-        } else if (explicitStarts > 1) {
-            issues += "multiple START nodes detected (count=$explicitStarts)"
+        if (startIdNormFromGraph.isBlank()) {
+            if (explicitStarts.isEmpty()) {
+                issues += "graph.startId is blank and no START node detected (provide graph.startId or a START node)"
+            } else if (explicitStarts.size > 1) {
+                issues += "graph.startId is blank but multiple START nodes detected (count=${explicitStarts.size})"
+            }
+        } else {
+            if (explicitStarts.isNotEmpty()) {
+                if (explicitStarts.size > 1) {
+                    issues += "multiple START nodes detected (count=${explicitStarts.size})"
+                } else {
+                    val only = explicitStarts.first()
+                    if (only != startIdNormFromGraph) {
+                        issues += "graph.startId='$startIdNormFromGraph' does not match START node id='$only'"
+                    }
+                }
+            }
+        }
+
+        if (resolvedStartId.isNotBlank() && resolvedStartId !in idSet) {
+            issues += "resolved startId='$resolvedStartId' not found in node ids: ${idSet.joinToString(",")}"
         }
 
         val doneIds = graph.nodes
@@ -532,14 +625,22 @@ data class SurveyConfig(
             issues += "no DONE node detected (expected at least one terminal node)"
         }
 
+        // Prompt maps (O(1) lookup) for validation.
+        val legacyMap: Map<String, Prompt> = run {
+            val m = LinkedHashMap<String, Prompt>()
+            prompts.forEach { p ->
+                val id = p.nodeId.trim()
+                if (id.isNotBlank() && !m.containsKey(id)) m[id] = p
+            }
+            m
+        }
+
         val legacyBlankTargets = prompts.map { it.nodeId }.filter { it.isBlank() }.distinct()
         if (legacyBlankTargets.isNotEmpty()) {
             issues += "prompts contain blank nodeId entries"
         }
 
-        val legacyUnknownTargets = prompts
-            .map { it.nodeId.trim() }
-            .filter { it.isNotBlank() }
+        val legacyUnknownTargets = legacyMap.keys
             .filter { it !in idSet }
             .distinct()
         if (legacyUnknownTargets.isNotEmpty()) {
@@ -587,16 +688,16 @@ data class SurveyConfig(
         val followMap = promptsFollowup.associateBy({ it.nodeId.trim() }, { it.prompt })
 
         val allPromptIds: Set<String> = run {
-            val a = prompts.map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
-            val b = promptsEval.map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
-            val c = promptsFollowup.map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
+            val a = legacyMap.keys
+            val b = promptsEval.asSequence().map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
+            val c = promptsFollowup.asSequence().map { it.nodeId.trim() }.filter { it.isNotBlank() }.toSet()
             a + b + c
         }
 
         var hasAnyTwoStep = false
 
         allPromptIds.asSequence().sorted().forEach { id ->
-            val legacy = prompts.firstOrNull { it.nodeId.trim() == id }
+            val legacy = legacyMap[id]
 
             val legacyHasOne = legacy?.isOneStep() == true
             val legacyHasTwoAny = legacy?.isTwoStepAny() == true
@@ -672,6 +773,7 @@ data class SurveyConfig(
             }
         }
 
+        // AI node prompt coverage.
         graph.nodes
             .asSequence()
             .filter { it.nodeType() == NodeType.AI }
@@ -685,6 +787,7 @@ data class SurveyConfig(
                 }
             }
 
+        // nextId validity.
         graph.nodes.forEach { node ->
             node.nextId
                 ?.trim()
@@ -696,11 +799,13 @@ data class SurveyConfig(
                 }
         }
 
+        // AI nodes should have a question.
         graph.nodes
             .asSequence()
             .filter { it.nodeType() == NodeType.AI && it.question.isBlank() }
             .forEach { issues += "AI node '${it.id}' has empty question" }
 
+        // Choice nodes should have options.
         graph.nodes
             .asSequence()
             .filter {
@@ -718,6 +823,7 @@ data class SurveyConfig(
                 }
             }
 
+        // DONE should not have nextId.
         graph.nodes
             .asSequence()
             .filter { it.nodeType() == NodeType.DONE }
@@ -726,6 +832,7 @@ data class SurveyConfig(
                 issues += "DONE node '${node.id}' should not define nextId (got nextId='${node.nextId}')"
             }
 
+        // Non-terminal nodes should have nextId.
         graph.nodes
             .asSequence()
             .filter { it.nodeType() != NodeType.DONE && it.nodeType() != NodeType.UNKNOWN }
@@ -736,8 +843,9 @@ data class SurveyConfig(
                 }
             }
 
+        // Reachability, DONE reachability, and cycle detection.
         run {
-            if (startIdNorm.isBlank() || startIdNorm !in idSet) return@run
+            if (resolvedStartId.isBlank() || resolvedStartId !in idSet) return@run
 
             val nodeById = LinkedHashMap<String, NodeDTO>()
             graph.nodes.forEach { n ->
@@ -749,7 +857,7 @@ data class SurveyConfig(
 
             val visited = LinkedHashSet<String>()
             val queue: ArrayDeque<String> = ArrayDeque()
-            queue.add(startIdNorm)
+            queue.add(resolvedStartId)
 
             while (queue.isNotEmpty()) {
                 val cur = queue.removeFirst()
@@ -761,19 +869,19 @@ data class SurveyConfig(
 
             val unreachable = idSet - visited
             if (unreachable.isNotEmpty()) {
-                issues += "unreachable nodes from startId='$startIdNorm': ${unreachable.ellipsisJoin()}"
+                issues += "unreachable nodes from startId='$resolvedStartId': ${unreachable.ellipsisJoin()}"
             }
 
             if (doneIds.isNotEmpty()) {
                 val reachableDone = doneIds.any { it in visited }
                 if (!reachableDone) {
-                    issues += "no DONE node is reachable from startId='$startIdNorm' (reachable=${visited.size}, total=${idSet.size})"
+                    issues += "no DONE node is reachable from startId='$resolvedStartId' (reachable=${visited.size}, total=${idSet.size})"
                 }
             }
 
             run {
                 val seen = HashSet<String>()
-                var cur: String? = startIdNorm
+                var cur: String? = resolvedStartId
                 var cycle = false
                 while (cur != null && cur in idSet) {
                     if (!seen.add(cur)) {
@@ -784,11 +892,12 @@ data class SurveyConfig(
                     cur = n?.nextId?.trim()?.takeIf { it.isNotBlank() }
                 }
                 if (cycle) {
-                    issues += "cycle detected in nextId chain starting from startId='$startIdNorm'"
+                    issues += "cycle detected in nextId chain starting from startId='$resolvedStartId'"
                 }
             }
         }
 
+        // SLM parameter sanity checks.
         slm.accelerator?.let { acc ->
             val a = acc.trim().uppercase()
             if (a != "CPU" && a != "GPU") issues += "slm.accelerator should be 'CPU' or 'GPU' (got '$acc')"
@@ -798,6 +907,7 @@ data class SurveyConfig(
         slm.topP?.let { if (it !in 0.0..1.0) issues += "slm.top_p must be in [0.0,1.0] (got $it)" }
         slm.temperature?.let { if (it !in 0.0..2.0) issues += "slm.temperature must be in [0.0,2.0] (got $it)" }
 
+        // Whisper sanity checks.
         whisper.assetModelPath?.let { if (it.isBlank()) issues += "whisper.asset_model_path is blank" }
         whisper.language?.let { lang ->
             val norm = lang.trim().lowercase()
@@ -815,6 +925,7 @@ data class SurveyConfig(
             }
         }
 
+        // Model defaults sanity checks.
         modelDefaults.modelName?.let { if (it.isBlank()) issues += "model_defaults.model_name is blank" }
         modelDefaults.defaultModelUrl?.let { if (it.isBlank()) issues += "model_defaults.default_model_url is blank" }
         modelDefaults.defaultFileName?.let { if (it.isBlank()) issues += "model_defaults.default_file_name is blank" }
@@ -825,6 +936,9 @@ data class SurveyConfig(
         return issues
     }
 
+    /**
+     * Throws if validation fails.
+     */
     fun requireValid() {
         val issues = validate()
         require(issues.isEmpty()) {
@@ -937,9 +1051,6 @@ object SurveyConfigLoader {
 
     /**
      * Return cached YAML instance.
-     *
-     * Note:
-     * - strictMode primarily affects parsing behavior, but we keep it consistent here.
      */
     internal fun yamlCached(strict: Boolean = false): Yaml = if (strict) yamlStrict else yamlLenient
 
@@ -1041,6 +1152,14 @@ object SurveyConfigLoader {
         file.writeText(text, charset)
     }
 
+    /**
+     * Parses config from raw text.
+     *
+     * AUTO behavior:
+     * - Decide preferred format by filename/content sniffing
+     * - Try parse preferred format
+     * - If it fails and desired format is AUTO, retry the other format once
+     */
     fun fromString(
         text: String,
         format: ConfigFormat = ConfigFormat.AUTO,
@@ -1051,33 +1170,59 @@ object SurveyConfigLoader {
 
         AppLog.d(TAG, "fromString -> ${decision.debugString()} file='${fileNameHint.orEmpty()}'")
 
-        val cfg = try {
-            when (decision.format) {
-                ConfigFormat.JSON -> jsonCompact.decodeFromString(SurveyConfig.serializer(), sanitized)
-                ConfigFormat.YAML -> yamlLenient.decodeFromString(SurveyConfig.serializer(), sanitized)
-                ConfigFormat.AUTO -> error("AUTO should have been resolved before decoding; this is a bug.")
-            }
-        } catch (ex: SerializationException) {
-            val preview = sanitized.safePreview()
-            throw IllegalArgumentException(
-                "Parsing error (${decision.debugString()}, file='${fileNameHint.orEmpty()}'). " +
-                        "First 200 chars: $preview :: ${ex.message}",
-                ex
-            )
-        } catch (ex: Exception) {
-            val preview = sanitized.safePreview()
-            throw IllegalArgumentException(
-                "Unexpected error while parsing SurveyConfig " +
-                        "(${decision.debugString()}, file='${fileNameHint.orEmpty()}'). " +
-                        "First 200 chars: $preview :: ${ex.message}",
-                ex
+        // First attempt.
+        val firstAttempt = runCatching {
+            decodeWithFormat(format = decision.format, text = sanitized)
+        }
+
+        if (firstAttempt.isSuccess) {
+            val cfg = firstAttempt.getOrThrow()
+            AppLog.d(TAG, "fromString loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
+            AppLog.d(TAG, cfg.debugDump())
+            return cfg
+        }
+
+        // If caller forced a format, don't retry.
+        if (format != ConfigFormat.AUTO) {
+            throw wrapParseFailure(
+                ex = firstAttempt.exceptionOrNull()!!,
+                decision = decision,
+                sanitized = sanitized,
+                fileNameHint = fileNameHint
             )
         }
 
-        AppLog.d(TAG, "fromString loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
-        AppLog.d(TAG, cfg.debugDump())
+        // AUTO retry with the other format (helps reduce "mystery parse" failures).
+        val other = when (decision.format) {
+            ConfigFormat.JSON -> ConfigFormat.YAML
+            ConfigFormat.YAML -> ConfigFormat.JSON
+            ConfigFormat.AUTO -> ConfigFormat.JSON
+        }
 
-        return cfg
+        AppLog.w(TAG, "fromString AUTO retry: first=${decision.format.name} -> other=${other.name} file='${fileNameHint.orEmpty()}'")
+
+        val secondAttempt = runCatching {
+            decodeWithFormat(format = other, text = sanitized)
+        }
+
+        if (secondAttempt.isSuccess) {
+            val cfg = secondAttempt.getOrThrow()
+            AppLog.d(TAG, "fromString loaded (AUTO retry, ${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
+            AppLog.d(TAG, cfg.debugDump())
+            return cfg
+        }
+
+        // Both failed: report first decision plus retry info.
+        val firstErr = firstAttempt.exceptionOrNull()!!
+        val secondErr = secondAttempt.exceptionOrNull()!!
+
+        val preview = sanitized.safePreview()
+        throw IllegalArgumentException(
+            "Parsing error (AUTO tried ${decision.format.name} then ${other.name}, ${decision.debugString()}, file='${fileNameHint.orEmpty()}'). " +
+                    "First 200 chars: $preview :: first=${firstErr.javaClass.simpleName}:${firstErr.message} " +
+                    "second=${secondErr.javaClass.simpleName}:${secondErr.message}",
+            secondErr
+        )
     }
 
     fun fromStringValidated(
@@ -1111,6 +1256,36 @@ object SurveyConfigLoader {
             val preview = sanitized.safePreview()
             throw IllegalArgumentException(
                 "Failed strict YAML parse (file='${fileNameHint.orEmpty()}'). First 200 chars: $preview :: ${ex.message}",
+                ex
+            )
+        }
+    }
+
+    private fun decodeWithFormat(format: ConfigFormat, text: String): SurveyConfig {
+        return when (format) {
+            ConfigFormat.JSON -> jsonCompact.decodeFromString(SurveyConfig.serializer(), text)
+            ConfigFormat.YAML -> yamlLenient.decodeFromString(SurveyConfig.serializer(), text)
+            ConfigFormat.AUTO -> error("AUTO should have been resolved before decoding; this is a bug.")
+        }
+    }
+
+    private fun wrapParseFailure(
+        ex: Throwable,
+        decision: FormatDecision,
+        sanitized: String,
+        fileNameHint: String?
+    ): IllegalArgumentException {
+        val preview = sanitized.safePreview()
+        return when (ex) {
+            is SerializationException -> IllegalArgumentException(
+                "Parsing error (${decision.debugString()}, file='${fileNameHint.orEmpty()}'). " +
+                        "First 200 chars: $preview :: ${ex.message}",
+                ex
+            )
+            else -> IllegalArgumentException(
+                "Unexpected error while parsing SurveyConfig " +
+                        "(${decision.debugString()}, file='${fileNameHint.orEmpty()}'). " +
+                        "First 200 chars: $preview :: ${ex.message}",
                 ex
             )
         }

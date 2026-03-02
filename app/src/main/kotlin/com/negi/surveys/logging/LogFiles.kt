@@ -15,6 +15,7 @@ package com.negi.surveys.logging
 
 import android.content.Context
 import android.os.Build
+import android.os.Looper
 import android.os.Process
 import com.negi.surveys.BuildConfig
 import java.io.BufferedInputStream
@@ -29,6 +30,8 @@ import java.util.TimeZone
 import java.util.UUID
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Log file utilities (paths + bundling).
@@ -40,8 +43,14 @@ import java.util.zip.ZipOutputStream
  *
  * Bundles (cache):
  * - cacheDir/{kind}-{utc}-{pid}.zip
+ *
+ * Threading:
+ * - [createZipBundle] performs blocking IO and should NOT be called on main thread.
+ * - Prefer [createZipBundleAsync] to avoid ANR risk.
  */
 object LogFiles {
+    private const val TAG = "LogFiles"
+
     private const val ROOT_DIR = "logs"
     private const val SUBDIR_APP = "app"
     private const val SUBDIR_CRASH = "crash"
@@ -160,6 +169,29 @@ object LogFiles {
             ?.sortedByDescending { it.lastModified() }
             ?: emptyList()
 
+    /**
+     * Async wrapper to avoid ANR risk.
+     */
+    suspend fun createZipBundleAsync(
+        context: Context,
+        kind: UploadKind,
+        includeCrashFiles: List<File> = emptyList(),
+        reason: String? = null,
+        maxAppLogs: Int = DEFAULT_MAX_APP_LOGS,
+        maxCrashLogs: Int = DEFAULT_MAX_CRASH_LOGS,
+        maxTotalBytes: Long = DEFAULT_MAX_TOTAL_BYTES
+    ): File = withContext(Dispatchers.IO) {
+        createZipBundle(
+            context = context,
+            kind = kind,
+            includeCrashFiles = includeCrashFiles,
+            reason = reason,
+            maxAppLogs = maxAppLogs,
+            maxCrashLogs = maxCrashLogs,
+            maxTotalBytes = maxTotalBytes,
+        )
+    }
+
     fun createZipBundle(
         context: Context,
         kind: UploadKind,
@@ -170,6 +202,11 @@ object LogFiles {
         maxTotalBytes: Long = DEFAULT_MAX_TOTAL_BYTES
     ): File {
         val appContext = context.applicationContext
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            // Avoid crashing; warn loudly to prevent ANR incidents in production.
+            AppLog.w(TAG, "createZipBundle: called on main thread (ANR risk). Prefer createZipBundleAsync().")
+        }
 
         val safeMaxApp = maxAppLogs.coerceAtLeast(0)
         val safeMaxCrash = maxCrashLogs.coerceAtLeast(0)
@@ -184,9 +221,19 @@ object LogFiles {
 
         // Candidates (newest-first).
         val appCandidates = listAppLogs(appContext)
-        val crashCandidates = includeCrashFiles
-            .filter { it.exists() && it.isFile }
-            .sortedByDescending { it.lastModified() }
+
+        // Crash candidate policy:
+        // - If caller provided explicit files, use them.
+        // - If CRASH kind and none provided, include pending crashes by default.
+        val crashCandidates: List<File> = when {
+            includeCrashFiles.isNotEmpty() -> includeCrashFiles
+                .filter { it.exists() && it.isFile }
+                .sortedByDescending { it.lastModified() }
+
+            kind == UploadKind.CRASH -> listPendingCrashLogs(appContext)
+
+            else -> emptyList()
+        }
 
         val selected = selectFilesWithinBudget(
             appFiles = appCandidates,
@@ -488,15 +535,30 @@ object LogFiles {
      *
      * We do not allow:
      * - absolute paths
-     * - "../"
+     * - ".." path segments
+     * - Windows drive-like prefixes
      */
     private fun sanitizeZipEntryName(name: String): String {
-        var s = name.replace('\\', '/')
+        var s = name.replace('\\', '/').trim()
+
+        // Strip absolute path prefix.
         while (s.startsWith("/")) s = s.removePrefix("/")
-        while (s.contains("../")) s = s.replace("../", "")
-        // Additional guard: collapse "//"
-        while (s.contains("//")) s = s.replace("//", "/")
-        return s.ifBlank { "file" }
+
+        // Remove Windows drive separators (e.g., "C:").
+        s = s.replace(':', '_')
+
+        // Normalize and drop unsafe segments.
+        val parts = s.split('/').filter { it.isNotBlank() }
+        val safeParts = ArrayList<String>(parts.size)
+        for (p in parts) {
+            when (p) {
+                ".", ".." -> Unit
+                else -> safeParts.add(p)
+            }
+        }
+
+        val joined = safeParts.joinToString("/")
+        return joined.ifBlank { "file" }
     }
 
     /** Encodes list of files as JSON array with minimal fields. */

@@ -109,10 +109,7 @@ internal object SlmModelResolver {
     ): Model {
         val name = resolveModelName(config = config, fallbackModelName = fallbackModelName)
 
-        // IMPORTANT:
-        // - buildModelConfigSafe() is defined in SLM.kt as a shared utility.
-        // - This avoids resolver/warmup duplicating defaults and clamp logic.
-        val cfg = buildModelConfigSafe(config?.slm)
+        val cfg = Model.buildModelConfigSafe(config?.slm)
 
         return Model(
             name = name,

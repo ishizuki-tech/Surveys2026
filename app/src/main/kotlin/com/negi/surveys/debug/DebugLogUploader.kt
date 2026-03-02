@@ -26,6 +26,8 @@ import java.net.HttpURLConnection
 import java.net.URL
 import java.time.Instant
 import java.util.Locale
+import java.util.concurrent.TimeUnit
+import kotlin.math.max
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
@@ -41,6 +43,15 @@ import org.json.JSONObject
 object DebugLogUploader {
 
     private const val TAG = "DebugLogUploader"
+
+    private const val DEFAULT_LOG_DIR = "logs"
+    private const val DEFAULT_KEEP_FILES = 20
+    private const val DEFAULT_LOGCAT_MAX_BYTES = 900_000
+    private const val DEFAULT_GH_CONNECT_TIMEOUT_MS = 15_000
+    private const val DEFAULT_GH_READ_TIMEOUT_MS = 30_000
+
+    private const val DEFAULT_PROC_WAIT_MS = 2_000L
+    private const val DEFAULT_HTTP_MSG_TRUNCATE = 800
 
     data class UploadResult(
         val ok: Boolean,
@@ -83,15 +94,15 @@ object DebugLogUploader {
      * - Prunes old log files to keep storage bounded.
      */
     private fun collectLogFile(context: Context): File {
-        val dir = File(context.filesDir, "logs").apply { mkdirs() }
+        val dir = File(context.filesDir, DEFAULT_LOG_DIR).apply { mkdirs() }
 
-        pruneOldLogs(dir, keep = 20)
+        pruneOldLogs(dir, keep = DEFAULT_KEEP_FILES)
 
-        val ts = Instant.now().toString().replace(":", "-")
+        val ts = safeTimestampForFilename(Instant.now().toString())
         val file = File(dir, "debug-log-$ts.txt")
 
         val header = buildHeader(context)
-        val logcat = collectLogcatBestEffort(maxBytes = 900_000)
+        val logcat = collectLogcatBestEffort(maxBytes = DEFAULT_LOGCAT_MAX_BYTES)
 
         val body = StringBuilder(header.length + logcat.length + 256)
             .append(header)
@@ -101,6 +112,7 @@ object DebugLogUploader {
             .toString()
 
         file.writeText(body)
+
         AppLog.d(TAG, "Collected debug log file: ${file.absolutePath} (len=${file.length()})")
         return file
     }
@@ -109,6 +121,7 @@ object DebugLogUploader {
         val now = Instant.now().toString()
         val pkg = context.packageName
         val pid = Process.myPid()
+        val uid = Process.myUid()
 
         // IMPORTANT: Never include token strings in logs.
         val hasGhToken = BuildConfig.GH_TOKEN.isNotBlank() || BuildConfig.GITHUB_TOKEN.isNotBlank()
@@ -118,6 +131,7 @@ object DebugLogUploader {
             timeUtc=$now
             package=$pkg
             pid=$pid
+            uid=$uid
 
             # Build
             debug=${BuildConfig.DEBUG}
@@ -147,6 +161,7 @@ object DebugLogUploader {
      */
     private fun collectLogcatBestEffort(maxBytes: Int): String {
         val pid = Process.myPid()
+        val cap = max(0, maxBytes)
 
         // Primary: only this process.
         val candidates: List<List<String>> = listOf(
@@ -156,7 +171,7 @@ object DebugLogUploader {
         )
 
         for (cmd in candidates) {
-            val out = runCatching { runCommandLimited(cmd, maxBytes) }.getOrNull()
+            val out = runCatching { runCommandLimited(cmd, cap) }.getOrNull()
             if (!out.isNullOrBlank()) {
                 return out
             }
@@ -166,42 +181,63 @@ object DebugLogUploader {
     }
 
     private fun runCommandLimited(cmd: List<String>, maxBytes: Int): String {
-        val pb = ProcessBuilder(cmd)
-        pb.redirectErrorStream(true)
+        val cap = max(0, maxBytes)
+        if (cap == 0) return ""
+
+        val pb = ProcessBuilder(cmd).redirectErrorStream(true)
         val p = pb.start()
 
-        BufferedInputStream(p.inputStream).use { input ->
-            val buf = ByteArray(8 * 1024)
-            var total = 0
-            val baos = ByteArrayOutputStream()
+        try {
+            BufferedInputStream(p.inputStream).use { input ->
+                val buf = ByteArray(8 * 1024)
+                var total = 0
+                val baos = ByteArrayOutputStream()
 
-            while (true) {
-                val read = input.read(buf)
-                if (read <= 0) break
-                val canWrite = (maxBytes - total).coerceAtLeast(0)
-                if (canWrite <= 0) break
-                val n = minOf(read, canWrite)
-                baos.write(buf, 0, n)
-                total += n
-                if (total >= maxBytes) break
+                while (true) {
+                    val read = input.read(buf)
+                    if (read <= 0) break
+
+                    val canWrite = (cap - total).coerceAtLeast(0)
+                    if (canWrite <= 0) break
+
+                    val n = minOf(read, canWrite)
+                    baos.write(buf, 0, n)
+                    total += n
+
+                    if (total >= cap) break
+                }
+
+                return baos.toString(Charsets.UTF_8.name())
             }
-
-            runCatching { p.destroy() }
-            return baos.toString(Charsets.UTF_8.name())
+        } finally {
+            // Best-effort cleanup. Avoid leaving a stuck process around.
+            runCatching {
+                if (!p.waitFor(DEFAULT_PROC_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                    p.destroy()
+                    if (!p.waitFor(DEFAULT_PROC_WAIT_MS, TimeUnit.MILLISECONDS)) {
+                        p.destroyForcibly()
+                    }
+                }
+            }
         }
     }
 
     private fun pruneOldLogs(dir: File, keep: Int) {
-        val files = dir.listFiles()?.filter { it.isFile }?.sortedByDescending { it.lastModified() } ?: return
-        if (files.size <= keep) return
-        for (f in files.drop(keep)) {
+        val k = keep.coerceAtLeast(0)
+        val files = dir.listFiles()
+            ?.filter { it.isFile }
+            ?.sortedByDescending { it.lastModified() }
+            ?: return
+
+        if (files.size <= k) return
+        for (f in files.drop(k)) {
             runCatching { f.delete() }
         }
     }
 
     private fun writeFallbackFile(context: Context, reason: String): File {
-        val dir = File(context.filesDir, "logs").apply { mkdirs() }
-        val ts = Instant.now().toString().replace(":", "-")
+        val dir = File(context.filesDir, DEFAULT_LOG_DIR).apply { mkdirs() }
+        val ts = safeTimestampForFilename(Instant.now().toString())
         val file = File(dir, "debug-fallback-$ts.txt")
 
         val body = buildString {
@@ -240,8 +276,8 @@ object DebugLogUploader {
 
         conn.requestMethod = "PUT"
         conn.doOutput = true
-        conn.connectTimeout = 15_000
-        conn.readTimeout = 30_000
+        conn.connectTimeout = DEFAULT_GH_CONNECT_TIMEOUT_MS
+        conn.readTimeout = DEFAULT_GH_READ_TIMEOUT_MS
 
         conn.setRequestProperty("Accept", "application/vnd.github+json")
         conn.setRequestProperty("Authorization", "Bearer $token")
@@ -288,9 +324,17 @@ object DebugLogUploader {
         return runCatching {
             stream.bufferedReader().use { it.readText() }
         }.getOrDefault("")
-            .take(800)
+            .take(DEFAULT_HTTP_MSG_TRUNCATE)
             .replace("\\s+".toRegex(), " ")
             .trim()
             .lowercase(Locale.ROOT)
+    }
+
+    private fun safeTimestampForFilename(raw: String): String {
+        // Replace characters that commonly cause issues on filesystems or URLs.
+        return raw
+            .replace(":", "-")
+            .replace("/", "-")
+            .replace("\\", "-")
     }
 }

@@ -18,7 +18,6 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.os.SystemClock
-import androidx.annotation.RequiresApi
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
@@ -36,15 +35,15 @@ import java.util.concurrent.atomic.AtomicLong
  * - A persisted crash report enables "upload on next launch".
  *
  * Notes:
- * - This is intentionally minimal; it does not attempt to do network work on crash.
+ * - Intentionally minimal; never attempts network work on crash.
  * - Upload happens on the next cold start via upload manager.
  * - Uses a re-entrancy guard to avoid infinite recursion if the handler itself crashes.
  * - Writes to a temp file first, then renames for best-effort atomicity.
  *
  * Hardening:
  * - Unique crash filenames even if timestamps collide.
- * - Best-effort redaction for secrets/PII-like values (including JSON-ish logs).
- * - Size cap to avoid OOM or huge crash files.
+ * - Best-effort redaction for secrets/PII-like values.
+ * - Size cap to avoid huge crash files / accidental OOM.
  * - Prunes old pending crash files to a fixed maximum.
  */
 object CrashCapture {
@@ -73,14 +72,10 @@ object CrashCapture {
     // ----------------------------
 
     /** "Authorization: Bearer <token>" style header. */
-    private val reAuthBearerHeader = Regex(
-        "(?i)\\bauthorization\\b\\s*:\\s*bearer\\s+[^\\s]+"
-    )
+    private val reAuthBearerHeader = Regex("(?i)\\bauthorization\\b\\s*:\\s*bearer\\s+[^\\s]+")
 
     /** JSON-ish: "authorization": "Bearer <token>" */
-    private val reAuthBearerJson = Regex(
-        "(?i)\"authorization\"\\s*:\\s*\"\\s*bearer\\s+[^\"]+\""
-    )
+    private val reAuthBearerJson = Regex("(?i)\"authorization\"\\s*:\\s*\"\\s*bearer\\s+[^\"]+\"")
 
     /** key[:=]value patterns (keeps separator). */
     private val reKeyValue = Regex(
@@ -111,14 +106,14 @@ object CrashCapture {
      * Notes:
      * - Safe to call multiple times.
      * - Uses applicationContext to avoid leaking an Activity.
+     * - MUST NOT throw; crash path must never block process termination.
      */
-    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
     fun install(context: Context) {
         if (!installed.compareAndSet(false, true)) return
 
         val appContext = context.applicationContext
 
-        // Ensure AppLog is ready so crash-path logging has a higher chance to land on disk.
+        // Best-effort: make file logger ready so crash-path logs can land on disk.
         runCatching { AppLog.ensureReady(appContext) }
 
         previous = Thread.getDefaultUncaughtExceptionHandler()
@@ -133,7 +128,8 @@ object CrashCapture {
 
             try {
                 runCatching {
-                    AppLog.e(TAG, "uncaught: thread=${thread.name} tid=${thread.threadId()} pid=${Process.myPid()}", throwable)
+                    val tid = safeThreadId(thread)
+                    AppLog.e(TAG, "uncaught: thread=${thread.name} tid=$tid pid=${Process.myPid()}", throwable)
                 }
                 runCatching {
                     writeCrashFile(appContext, thread, throwable)
@@ -155,7 +151,6 @@ object CrashCapture {
     fun pendingCrashFiles(context: Context): List<File> =
         LogFiles.listPendingCrashLogs(context.applicationContext)
 
-    @RequiresApi(Build.VERSION_CODES.BAKLAVA)
     private fun writeCrashFile(context: Context, thread: Thread, t: Throwable) {
         val appContext = context.applicationContext
 
@@ -179,6 +174,7 @@ object CrashCapture {
         val safeInstallId = runCatching { LogFiles.installId(appContext).take(8) }.getOrDefault("unknown")
 
         val uptimeMs = runCatching { SystemClock.elapsedRealtime() }.getOrDefault(-1L)
+        val tid = safeThreadId(thread)
 
         // Best-effort: write to tmp then rename into place.
         FileOutputStream(tmp, false).use { fos ->
@@ -189,13 +185,13 @@ object CrashCapture {
                     pw.println("===== Survey App Crash Report =====")
                     pw.println("utcCompact=$utcCompact")
                     pw.println("thread=${thread.name}")
-                    pw.println("threadId=${thread.threadId()}")
+                    pw.println("threadId=$tid")
                     pw.println("pid=$pid")
                     pw.println("uptimeMs=$uptimeMs")
                     pw.println("sdk=${Build.VERSION.SDK_INT}")
                     pw.println("device=${Build.MANUFACTURER}/${Build.MODEL}")
-                    pw.println("fingerprint=${Build.FINGERPRINT}")
-                    pw.println("abis=${Build.SUPPORTED_ABIS.joinToString(",")}")
+                    pw.println("fingerprint=${Build.FINGERPRINT ?: ""}")
+                    pw.println("abis=${(Build.SUPPORTED_ABIS ?: emptyArray()).joinToString(",")}")
                     pw.println("appId=$pkg")
                     pw.println("versionName=$versionName")
                     pw.println("versionCode=$versionCode")
@@ -224,13 +220,13 @@ object CrashCapture {
                         pw.println("===== Survey App Crash Report =====")
                         pw.println("utcCompact=$utcCompact")
                         pw.println("thread=${thread.name}")
-                        pw.println("threadId=${thread.threadId()}")
+                        pw.println("threadId=$tid")
                         pw.println("pid=$pid")
                         pw.println("uptimeMs=$uptimeMs")
                         pw.println("sdk=${Build.VERSION.SDK_INT}")
                         pw.println("device=${Build.MANUFACTURER}/${Build.MODEL}")
-                        pw.println("fingerprint=${Build.FINGERPRINT}")
-                        pw.println("abis=${Build.SUPPORTED_ABIS.joinToString(",")}")
+                        pw.println("fingerprint=${Build.FINGERPRINT ?: ""}")
+                        pw.println("abis=${(Build.SUPPORTED_ABIS ?: emptyArray()).joinToString(",")}")
                         pw.println("appId=$pkg")
                         pw.println("versionName=$versionName")
                         pw.println("versionCode=$versionCode")
@@ -247,7 +243,6 @@ object CrashCapture {
             }
             runCatching { tmp.delete() }
         } else {
-            // Best-effort cleanup (should already be gone after rename).
             runCatching { tmp.delete() }
         }
     }
@@ -256,7 +251,7 @@ object CrashCapture {
      * Best-effort redaction for secrets/PII-like values.
      *
      * Notes:
-     * - Conservative: it won't catch everything.
+     * - Conservative; it won't catch everything.
      * - The primary protection is still: "do not log sensitive data at call sites".
      */
     private fun sanitizeLine(input: String): String {
@@ -301,7 +296,7 @@ object CrashCapture {
         // 2) Keep only the newest N crash reports.
         val files = dir.listFiles()
             ?.filter { it.isFile && it.name.startsWith("crash-") && it.name.endsWith(".txt") }
-            ?.sortedWith(compareByDescending<File> { it.name }.thenByDescending { it.lastModified() })
+            ?.sortedWith(compareByDescending<File> { it.lastModified() }.thenByDescending { it.name })
             .orEmpty()
 
         if (files.size <= MAX_PENDING_CRASH_FILES) return
@@ -343,11 +338,21 @@ object CrashCapture {
     }
 
     /**
+     * Returns a stable thread identifier without relying on newer APIs.
+     *
+     * Notes:
+     * - thread.id exists widely (though it may be deprecated); it is safe in crash paths.
+     */
+    private fun safeThreadId(thread: Thread): Long {
+        return runCatching { thread.id }.getOrDefault(-1L)
+    }
+
+    /**
      * OutputStream wrapper that stops writing after reaching a size limit.
      *
      * Notes:
      * - Does NOT close the underlying stream on close(); caller manages lifecycle.
-     * - Once the limit is hit, it writes a short truncation marker (best-effort) and ignores further writes.
+     * - Once the limit is hit, it writes a truncation marker (best-effort) and ignores further writes.
      */
     private class LimitedOutputStream(
         private val base: OutputStream,
@@ -456,7 +461,7 @@ object CrashCapture {
             val raw = buf.toString()
             buf.setLength(0)
 
-            val clean = sanitizer(raw)
+            val clean = runCatching { sanitizer(raw) }.getOrDefault(raw)
             base.write(clean)
             if (withNewline) base.write("\n")
         }

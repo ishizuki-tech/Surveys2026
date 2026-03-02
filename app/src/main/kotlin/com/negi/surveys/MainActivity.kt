@@ -13,12 +13,12 @@
 
 package com.negi.surveys
 
+import android.app.ActivityManager
 import android.content.Context
 import android.os.Build
 import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
-import android.util.Log
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -30,7 +30,9 @@ import com.negi.surveys.logging.AppLog
 import com.negi.surveys.logging.CrashCapture
 import com.negi.surveys.logging.GitHubLogUploadManager
 import com.negi.surveys.logging.SafeLog
+import java.io.FileInputStream
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 /**
@@ -81,6 +83,10 @@ private const val TAG_UPLOAD = "PendingCrashUpload"
 private const val THREAD_NAME = "PendingCrashUpload"
 private const val ERR_MSG_MAX = 220
 
+// Hard ceiling: keep a cap so a "blocking" upload cannot silently hang forever.
+// This does not forcibly stop the blocking call, but increases observability.
+private const val UPLOAD_WATCHDOG_MS = 25_000L
+
 /**
  * Process-scoped bootstrap to keep startup stable.
  *
@@ -93,36 +99,38 @@ private object AppBootstrap {
 
     fun ensureInitialized(context: Context) {
         val appCtx = context.applicationContext
+
+        // Avoid duplicated heavy work in non-main processes (WorkManager/remote services, etc.).
+        if (!ProcessGuards.isMainProcess(appCtx)) {
+            SafeLog.i(
+                TAG_BOOT,
+                "bootstrap: non-main process detected (skip) pid=${Process.myPid()} process=${ProcessGuards.currentProcessNameCached()}"
+            )
+            return
+        }
+
         if (!started.compareAndSet(false, true)) {
-            // Already initialized in this process.
             SafeLog.d(TAG_BOOT, "bootstrap: already initialized (skip)")
             return
         }
 
         val t0 = SystemClock.elapsedRealtime()
 
-        // Initialize file logger early so crash capture can write minimal traces too.
-        runCatching {
-            AppLog.init(appCtx)
-        }.onFailure { t ->
-            // Fall back to Logcat only; do not crash.
+        runCatching { AppLog.init(appCtx) }.onFailure { t ->
             SafeLog.w(TAG_BOOT, "AppLog.init failed (non-fatal): ${t.javaClass.simpleName}", t)
         }
 
-        // Install crash capture as early as possible (still best-effort).
-        runCatching {
-            CrashCapture.install(appCtx)
-        }.onFailure { t ->
+        runCatching { CrashCapture.install(appCtx) }.onFailure { t ->
             SafeLog.w(TAG_BOOT, "CrashCapture.install failed (non-fatal): ${t.javaClass.simpleName}", t)
         }
 
-        // Attempt to upload any pending crash logs from a previous session (best-effort).
         PendingCrashUploadKickoff.tryStart(appCtx)
 
         val dt = SystemClock.elapsedRealtime() - t0
         SafeLog.i(
             TAG_BOOT,
             "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()} " +
+                    "process=${ProcessGuards.currentProcessNameCached()} " +
                     "build=${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
         )
     }
@@ -130,10 +138,6 @@ private object AppBootstrap {
 
 /**
  * Process-scoped guard to prevent starting multiple upload threads due to Activity recreation.
- *
- * Why:
- * - Activity can be recreated (rotation, multi-window, task restore).
- * - Upload is best-effort; doing it twice adds noise and can race "move pending files".
  */
 private object PendingCrashUploadKickoff {
     private val started = AtomicBoolean(false)
@@ -146,6 +150,15 @@ private object PendingCrashUploadKickoff {
         }
         kickOffPendingCrashUpload(appCtx)
     }
+}
+
+private enum class UploadPhase {
+    INIT,
+    COUNT_PENDING_INITIAL,
+    CHECK_GH_CONFIG,
+    UPLOAD_BLOCKING,
+    COUNT_PENDING_AFTER,
+    DONE
 }
 
 /**
@@ -161,30 +174,50 @@ private fun kickOffPendingCrashUpload(context: Context) {
         thread(
             start = true,
             name = THREAD_NAME,
-            isDaemon = true
+            // Do NOT daemonize: we want a higher chance of completing early uploads.
+            isDaemon = false
         ) {
             val appCtx = context.applicationContext
             val t0 = SystemClock.elapsedRealtime()
+            val phaseRef = AtomicReference(UploadPhase.INIT)
 
-            // Ensure we see unexpected crashes inside this worker thread.
             Thread.currentThread().uncaughtExceptionHandler =
                 Thread.UncaughtExceptionHandler { _, e ->
                     SafeLog.e(TAG_UPLOAD, "pending crash upload: uncaught exception", e)
                 }
 
-            // Lower priority: this should never compete with first-frame UI.
             runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND) }
 
+            // Watchdog: if the blocking upload hangs, leave an observable breadcrumb.
+            val workerThread = Thread.currentThread()
+            val watchdog = thread(
+                start = true,
+                name = "${THREAD_NAME}-Watchdog",
+                isDaemon = true
+            ) {
+                runCatching {
+                    Thread.sleep(UPLOAD_WATCHDOG_MS)
+                    val elapsed = SystemClock.elapsedRealtime() - t0
+                    SafeLog.w(
+                        TAG_UPLOAD,
+                        "pending crash upload: watchdog timeout after ${UPLOAD_WATCHDOG_MS}ms " +
+                                "elapsed=${elapsed}ms phase=${phaseRef.get()} state=${workerThread.state} " +
+                                "process=${ProcessGuards.currentProcessNameCached()}"
+                    )
+                }
+            }
+
             try {
-                // Snapshot configuration early for deterministic logs.
-                val ghConfigured = runCatching { GitHubLogUploadManager.isConfigured() }.getOrDefault(false)
+                phaseRef.set(UploadPhase.COUNT_PENDING_INITIAL)
                 val pending0 = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
+
+                phaseRef.set(UploadPhase.CHECK_GH_CONFIG)
+                val ghConfigured = runCatching { GitHubLogUploadManager.isConfigured() }.getOrDefault(false)
 
                 SafeLog.i(
                     TAG_UPLOAD,
-                    "pending crash upload: start pending=$pending0 " +
-                            "ghConfigured=$ghConfigured " +
-                            "pid=${Process.myPid()} " +
+                    "pending crash upload: start pending=$pending0 ghConfigured=$ghConfigured " +
+                            "pid=${Process.myPid()} process=${ProcessGuards.currentProcessNameCached()} " +
                             "build=${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
                 )
 
@@ -198,40 +231,44 @@ private fun kickOffPendingCrashUpload(context: Context) {
                     return@thread
                 }
 
-                // If pending0 < 0, the count failed; still attempt upload best-effort.
-                runCatching {
-                    val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
+                phaseRef.set(UploadPhase.UPLOAD_BLOCKING)
+                val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
 
-                    val r = GitHubLogUploadManager.tryUploadPendingCrashesBlocking(appCtx)
+                val r = runCatching { GitHubLogUploadManager.tryUploadPendingCrashesBlocking(appCtx) }
 
-                    val err = r.exceptionOrNull()
-                    val errMsg = err?.message?.replace('\n', ' ')?.take(ERR_MSG_MAX).orEmpty()
+                val err = r.exceptionOrNull()
+                val errMsg = err?.message?.replace('\n', ' ')?.take(ERR_MSG_MAX).orEmpty()
 
-                    SafeLog.i(
-                        TAG_UPLOAD,
-                        "pending crash upload (GitHub): pendingBefore=$pendingBefore ok=${r.isSuccess} " +
-                                "result=${r.getOrNull()} err=${err?.javaClass?.simpleName} " +
-                                "msg=${if (errMsg.isBlank()) "-" else errMsg}"
-                    )
+                SafeLog.i(
+                    TAG_UPLOAD,
+                    "pending crash upload (GitHub): pendingBefore=$pendingBefore ok=${r.isSuccess} " +
+                            "result=${r.getOrNull()} err=${err?.javaClass?.simpleName} " +
+                            "msg=${if (errMsg.isBlank()) "-" else errMsg}"
+                )
 
-                    if (err != null) {
-                        SafeLog.e(TAG_UPLOAD, "pending crash upload (GitHub) failed", err)
-                    }
-                }.onFailure { t ->
-                    SafeLog.e(TAG_UPLOAD, "pending crash upload (GitHub) failed", t)
+                if (err != null) {
+                    SafeLog.e(TAG_UPLOAD, "pending crash upload (GitHub) failed", err)
                 }
 
+                phaseRef.set(UploadPhase.COUNT_PENDING_AFTER)
                 val pendingAfter = runCatching { CrashCapture.countPendingCrashes(appCtx) }.getOrDefault(-1)
                 SafeLog.i(TAG_UPLOAD, "pending crash upload: end pendingAfter=$pendingAfter")
             } catch (t: Throwable) {
                 SafeLog.e(TAG_UPLOAD, "kickOffPendingCrashUpload: unexpected failure", t)
             } finally {
+                phaseRef.set(UploadPhase.DONE)
+                runCatching { watchdog.interrupt() }
+
                 val dt = SystemClock.elapsedRealtime() - t0
                 SafeLog.i(TAG_UPLOAD, "pending crash upload: done in ${dt}ms")
             }
         }
     }.onFailure { t ->
-        SafeLog.w(TAG_UPLOAD, "Failed to start PendingCrashUpload thread (non-fatal): ${t.javaClass.simpleName}", t)
+        SafeLog.w(
+            TAG_UPLOAD,
+            "Failed to start PendingCrashUpload thread (non-fatal): ${t.javaClass.simpleName}",
+            t
+        )
     }
 }
 
@@ -244,14 +281,90 @@ private fun kickOffPendingCrashUpload(context: Context) {
  */
 private fun buildStartupLog(savedInstanceState: Bundle?): String {
     val recreation = savedInstanceState != null
-    // Keep log content non-sensitive.
     val buildLabel =
         "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
                 "${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
     return "onCreate: sdk=${Build.VERSION.SDK_INT} " +
             "device=${Build.MANUFACTURER}/${Build.MODEL} " +
             "pid=${Process.myPid()} uid=${Process.myUid()} " +
+            "process=${ProcessGuards.currentProcessNameCached()} " +
             "uptimeMs=${SystemClock.uptimeMillis()} " +
             "recreated=$recreation " +
             "build=$buildLabel"
+}
+
+/**
+ * Process-related guards.
+ *
+ * Note:
+ * - Multi-process surprises happen easily (WorkManager, services, content providers).
+ * - Guarding bootstrap to main process reduces duplicate work and race conditions.
+ */
+private object ProcessGuards {
+
+    private val cachedProcessName = AtomicReference<String?>(null)
+
+    /**
+     * Returns a cached current process name if available.
+     */
+    fun currentProcessNameCached(): String {
+        return cachedProcessName.get() ?: "unknown"
+    }
+
+    /**
+     * Returns true if this code is running in the app's main process.
+     */
+    fun isMainProcess(context: Context): Boolean {
+        val appCtx = context.applicationContext
+        val packageName = appCtx.packageName
+
+        val current = getCurrentProcessName(appCtx)
+        if (current.isNullOrBlank()) {
+            // Fail-open for safety, but leave a breadcrumb for diagnosis.
+            SafeLog.w(TAG_BOOT, "process name unavailable; fail-open (treat as main)")
+            return true
+        }
+
+        cachedProcessName.set(current)
+        return current == packageName
+    }
+
+    /**
+     * Best-effort process name retrieval.
+     */
+    private fun getCurrentProcessName(context: Context): String? {
+        // API 28+: reliable fast path.
+        if (Build.VERSION.SDK_INT >= 28) {
+            val name = runCatching { android.app.Application.getProcessName() }.getOrNull()
+            if (!name.isNullOrBlank()) return name
+        }
+
+        // Fallback: ActivityManager scan.
+        val am = runCatching {
+            context.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        }.getOrNull()
+
+        if (am != null) {
+            val pid = Process.myPid()
+            val name = runCatching {
+                am.runningAppProcesses?.firstOrNull { it.pid == pid }?.processName
+            }.getOrNull()
+            if (!name.isNullOrBlank()) return name
+        }
+
+        // Last resort: /proc/self/cmdline (small read, but still IO).
+        return readProcCmdline()
+    }
+
+    private fun readProcCmdline(): String? {
+        return runCatching {
+            FileInputStream("/proc/self/cmdline").use { fis ->
+                val bytes = ByteArray(256)
+                val n = fis.read(bytes)
+                if (n <= 0) return@runCatching null
+                val raw = String(bytes, 0, n)
+                raw.trim { it <= ' ' || it == '\u0000' }.ifBlank { null }
+            }
+        }.getOrNull()
+    }
 }

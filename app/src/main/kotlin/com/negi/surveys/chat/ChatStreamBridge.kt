@@ -150,7 +150,7 @@ class ChatStreamBridge(
 
         if (!ok) {
             droppedEvents.incrementAndGet()
-            logger?.invoke("ChatStreamBridge: event dropped kind=$kind session=$sessionId")
+            logger?.invoke("ChatStreamBridge: dropped kind=$kind session=$sessionId")
         }
     }
 
@@ -327,7 +327,19 @@ class ChatStreamBridge(
      */
     private fun sanitizeReason(raw: String, fallback: String, maxLen: Int = 256): String {
         val t = raw.trim()
-        return (if (t.isBlank()) fallback else t).take(maxLen)
+        val base = if (t.isBlank()) fallback else t
+
+        // Normalize whitespace to avoid UI/log disruption.
+        val normalized = buildString(base.length) {
+            for (c in base) {
+                when (c) {
+                    '\n', '\r', '\t' -> append(' ')
+                    else -> append(c)
+                }
+            }
+        }
+
+        return normalized.trim().take(maxLen)
     }
 
     private companion object {

@@ -107,14 +107,22 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
     private val cfg: Config = config.normalized()
 
     override fun buildPrompt(userPrompt: String): String {
-        return _buildPrompt(userPrompt, phase = null)
+        return buildPromptInternal(userPrompt = userPrompt, phase = null)
     }
 
     override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
-        return _buildPrompt(userPrompt, phase = phase)
+        // IMPORTANT:
+        // - Do NOT introduce a nullable overload (PromptPhase?) because JVM signatures collide.
+        return buildPromptInternal(userPrompt = userPrompt, phase = phase)
     }
 
-    private fun _buildPrompt(userPrompt: String, phase: PromptPhase?): String {
+    /**
+     * Internal builder that may accept null.
+     *
+     * IMPORTANT:
+     * - Keep this PRIVATE to avoid JVM signature clashes with public overloads.
+     */
+    private fun buildPromptInternal(userPrompt: String, phase: PromptPhase?): String {
         val phaseLine = phase?.let {
             val tag = when (it) {
                 PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"

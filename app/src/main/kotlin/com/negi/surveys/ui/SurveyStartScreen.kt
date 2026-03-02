@@ -13,6 +13,7 @@
 
 package com.negi.surveys.ui
 
+import android.os.SystemClock
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -39,12 +40,10 @@ import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.negi.surveys.logging.AppLog
-import com.negi.surveys.slm.SlmWarmupController
 import com.negi.surveys.utils.CompileState
 import com.negi.surveys.utils.WarmupController
 import kotlinx.coroutines.delay
@@ -64,8 +63,7 @@ private const val FAILED_MSG_MAX = 160
  * - Gate "Begin" until compile warmup is in a ready terminal state to reduce first-question jank.
  *
  * Architecture:
- * - UI depends ONLY on [WarmupController] (facade). The default implementation is [SlmWarmupController].
- * - Prefer passing a shared controller via [warmupControllerOverride] to avoid state split.
+ * - UI depends ONLY on [WarmupController] (facade).
  *
  * Concurrency model:
  * - "Begin" is protected by:
@@ -77,27 +75,23 @@ private const val FAILED_MSG_MAX = 160
 fun SurveyStartScreen(
     onBegin: () -> Unit,
     onBack: () -> Unit,
+    warmupController: WarmupController,
     debugInfo: DebugInfo? = null,
-    warmupControllerOverride: WarmupController? = null,
 ) {
     val latestOnBegin by rememberUpdatedState(onBegin)
     val latestOnBack by rememberUpdatedState(onBack)
+    val latestController by rememberUpdatedState(warmupController)
 
-    val appContext = LocalContext.current.applicationContext
     val scope = rememberCoroutineScope()
 
-    val controller: WarmupController = remember(appContext, warmupControllerOverride) {
-        warmupControllerOverride ?: SlmWarmupController(
-            context = appContext,
-            logger = { AppLog.d(TAG, it) }
-        )
-    }
-
-    val compileState: CompileState by controller.compileState.collectAsStateWithLifecycle()
+    val compileState: CompileState by warmupController.compileState.collectAsStateWithLifecycle()
     val latestCompileState by rememberUpdatedState(compileState)
 
     var beginLocked by remember { mutableStateOf(false) }
     var beginPendingWarmup by remember { mutableStateOf(false) }
+
+    // Tracks how long the user has been waiting since pressing Begin while not ready.
+    var pendingWarmupStartMs by remember { mutableStateOf<Long?>(null) }
 
     fun requestCompile(reason: String) {
         val st = latestCompileState
@@ -109,7 +103,7 @@ fun SurveyStartScreen(
         AppLog.d(TAG, "compile request: reason=$reason state=${st.javaClass.simpleName}")
         scope.launch {
             runCatching {
-                controller.compileOnce()
+                latestController.compileOnce()
             }.onFailure { t ->
                 AppLog.w(TAG, "compileOnce failed (non-fatal): ${t.javaClass.simpleName}(${t.message})", t)
             }
@@ -118,7 +112,12 @@ fun SurveyStartScreen(
 
     fun proceedBegin(source: String) {
         beginLocked = true
-        AppLog.i(TAG, "begin proceed: source=$source state=${latestCompileState.javaClass.simpleName}")
+        val st = latestCompileState
+        val waitedMs = pendingWarmupStartMs?.let { SystemClock.elapsedRealtime() - it }
+        AppLog.i(
+            TAG,
+            "begin proceed: source=$source state=${st.javaClass.simpleName} waitedMs=${waitedMs ?: -1}"
+        )
 
         runCatching { latestOnBegin() }
             .onFailure { t ->
@@ -141,13 +140,20 @@ fun SurveyStartScreen(
 
         if (!isWarmupReady(latestCompileState)) {
             requestCompile(reason = "enterScreen")
+        } else {
+            AppLog.d(TAG, "enterScreen: warmup already ready state=${latestCompileState.javaClass.simpleName}")
         }
     }
 
     LaunchedEffect(beginPendingWarmup, compileState) {
         if (!beginPendingWarmup) return@LaunchedEffect
+
         if (isWarmupReady(compileState)) {
+            val waitedMs = pendingWarmupStartMs?.let { SystemClock.elapsedRealtime() - it } ?: -1
+            AppLog.i(TAG, "warmup became ready while pending (auto proceed) waitedMs=$waitedMs")
+
             beginPendingWarmup = false
+            pendingWarmupStartMs = null
             proceedBegin(source = "autoAfterWarmup")
         }
     }
@@ -187,9 +193,9 @@ fun SurveyStartScreen(
             WarmupStatusPanel(
                 compileState = compileState,
                 onRetry = {
-                    AppLog.w(TAG, "warmup retry requested (SurveyStart)")
+                    AppLog.w(TAG, "warmup retry requested (SurveyStart) state=${compileState.javaClass.simpleName}")
                     scope.launch {
-                        runCatching { controller.resetForRetry(reason = "uiRetry") }
+                        runCatching { latestController.resetForRetry(reason = "uiRetry") }
                             .onFailure { t ->
                                 AppLog.w(
                                     TAG,
@@ -213,6 +219,7 @@ fun SurveyStartScreen(
                 onClick = {
                     if (beginPendingWarmup) {
                         beginPendingWarmup = false
+                        pendingWarmupStartMs = null
                         AppLog.d(TAG, "begin pending cancelled by back")
                     }
 
@@ -245,13 +252,17 @@ fun SurveyStartScreen(
                         return@Button
                     }
 
-                    if (isWarmupReady(compileState)) {
+                    val st = compileState
+                    AppLog.d(TAG, "click: begin state=${st.javaClass.simpleName} elapsedMs=${st.elapsedMs}")
+
+                    if (isWarmupReady(st)) {
                         AppLog.i(TAG, "click: begin (ready)")
                         proceedBegin(source = "immediate")
                         return@Button
                     }
 
                     beginPendingWarmup = true
+                    pendingWarmupStartMs = SystemClock.elapsedRealtime()
                     AppLog.i(TAG, "click: begin (waiting for warmup)")
                     requestCompile(reason = "beginClicked")
                 },
@@ -272,7 +283,14 @@ fun SurveyStartScreen(
         if (beginLocked) {
             Text("Starting…")
         } else if (beginPendingWarmup) {
-            Text("Preparing the AI model… (this may take a while on first run)")
+            val waitedMs = pendingWarmupStartMs?.let { SystemClock.elapsedRealtime() - it }
+            Text(
+                if (waitedMs != null && waitedMs >= 0) {
+                    "Preparing the AI model… (${waitedMs}ms)"
+                } else {
+                    "Preparing the AI model… (this may take a while on first run)"
+                }
+            )
         }
     }
 }
@@ -295,8 +313,9 @@ private fun WarmupStatusPanel(
         }
     }
 
+    val elapsed = compileState.elapsedMs
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-        Text(label)
+        Text("$label  (elapsed=${elapsed}ms)")
         if (compileState is CompileState.Failed || compileState is CompileState.Cancelled) {
             OutlinedButton(onClick = onRetry, modifier = Modifier.testTag("warmup_retry")) {
                 Text("Retry warmup")
