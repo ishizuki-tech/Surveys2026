@@ -1,8 +1,28 @@
 package com.negi.surveys.utils
 
-import com.google.ai.edge.litertlm.Message
 import java.io.File
 import kotlinx.coroutines.flow.StateFlow
+
+/**
+ * SDK-agnostic system prompt definition used by warmup/compile runs.
+ *
+ * This exists to prevent SDK types (e.g., LiteRT-LM Message) from leaking into public APIs.
+ */
+sealed interface SystemPrompt {
+    /** Plain text system prompt. */
+    data class Text(val text: String) : SystemPrompt
+
+    /**
+     * Future-proof payload.
+     *
+     * Use this if you need to carry structured data without coupling to a specific SDK type.
+     * Implementations MUST treat unknown payload keys safely.
+     */
+    data class Structured(
+        val type: String,
+        val payload: Map<String, Any?> = emptyMap(),
+    ) : SystemPrompt
+}
 
 sealed interface PrefetchState {
     val elapsedMs: Long
@@ -49,12 +69,6 @@ sealed interface PrefetchState {
     ) : PrefetchState
 }
 
-/**
- * Public, UI-safe compile warmup state.
- *
- * "Compile" here means any heavy initialization that may touch GPU / delegates
- * and should be deferred until the app is ready (e.g., after first frame).
- */
 sealed interface CompileState {
     val elapsedMs: Long
 
@@ -104,6 +118,15 @@ sealed interface CompileState {
     ) : CompileState
 }
 
+/**
+ * Process-scoped warmup coordinator interface (SDK-agnostic).
+ *
+ * Terminal state definition:
+ * - Prefetch terminal states: [PrefetchState.Prefetched], [PrefetchState.Failed],
+ *   [PrefetchState.Cancelled], [PrefetchState.SkippedNotConfigured].
+ * - Compile terminal states: [CompileState.Compiled], [CompileState.Failed],
+ *   [CompileState.Cancelled], [CompileState.SkippedNotConfigured].
+ */
 interface WarmupController {
 
     /** Prefetch warmup state flow (public/UI model). */
@@ -112,10 +135,17 @@ interface WarmupController {
     /** Compile warmup state flow (public/UI model). */
     val compileState: StateFlow<CompileState>
 
+    /**
+     * Updates conversation options used for warmup/compile runs.
+     *
+     * Tools contract:
+     * - [tools] is intentionally loosely typed for API stability.
+     * - Implementations MUST ignore unknown tool types safely (no crash).
+     */
     fun setWarmupConversationOptions(
         supportImage: Boolean = false,
         supportAudio: Boolean = false,
-        systemMessage: Message? = null,
+        systemPrompt: SystemPrompt? = null,
         tools: List<Any> = emptyList(),
     )
 

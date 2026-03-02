@@ -139,6 +139,9 @@ object GitHubLogUploadManager {
         val cfg = cfgOrNull()
             ?: return Result.failure(IllegalStateException("GitHub upload is not configured (owner/repo/branch/token)."))
 
+        // Ensure file logger exists so the bundle is not mysteriously empty.
+        runCatching { AppLog.ensureReady(context.applicationContext) }
+
         val install = LogFiles.installId(context)
         val zip = LogFiles.createZipBundle(
             context = context,
@@ -155,8 +158,11 @@ object GitHubLogUploadManager {
         )
 
         AppLog.i(TAG, "uploadRegular: start path=$remotePath size=${zip.length()}")
-        val result = uploadZipAsRepoContent(cfg = cfg, zipFile = zip, repoPath = remotePath, commitHint = "regular logs")
-        runCatching { zip.delete() }
+        val result = try {
+            uploadZipAsRepoContent(cfg = cfg, zipFile = zip, repoPath = remotePath, commitHint = "regular logs")
+        } finally {
+            runCatching { zip.delete() }
+        }
 
         return result.onSuccess {
             AppLog.i(TAG, "uploadRegular: ok path=$it")
@@ -198,42 +204,16 @@ object GitHubLogUploadManager {
         )
 
         AppLog.i(TAG, "uploadCrash: start path=$remotePath crashes=${pending.size} size=${zip.length()}")
-        val result = uploadZipAsRepoContent(cfg = cfg, zipFile = zip, repoPath = remotePath, commitHint = "crash logs")
-        runCatching { zip.delete() }
+        val uploadResult = try {
+            uploadZipAsRepoContent(cfg = cfg, zipFile = zip, repoPath = remotePath, commitHint = "crash logs")
+        } finally {
+            runCatching { zip.delete() }
+        }
 
-        return result.map { uploadedRepoPath ->
+        return uploadResult.map { uploadedRepoPath ->
             // Move crash files to uploaded/ only if upload succeeded.
-            val uploadedDir = LogFiles.crashUploadedDir(context)
-            if (!uploadedDir.exists()) runCatching { uploadedDir.mkdirs() }
-
-            var moved = 0
-            for (f in pending) {
-                if (!f.exists()) continue
-                val dst = File(uploadedDir, f.name)
-
-                val okRename = runCatching { f.renameTo(dst) }.getOrDefault(false)
-                if (okRename) {
-                    moved++
-                    continue
-                }
-
-                // Fallback: copy then delete.
-                val okCopy = runCatching {
-                    f.inputStream().use { input ->
-                        FileOutputStream(dst, false).use { output ->
-                            input.copyTo(output)
-                            output.flush()
-                        }
-                    }
-                    true
-                }.getOrDefault(false)
-
-                if (okCopy) {
-                    runCatching { f.delete() }
-                    moved++
-                }
-            }
-
+            val movedFiles = LogFiles.moveCrashFilesToUploaded(context, pending)
+            val moved = movedFiles.size
             AppLog.i(TAG, "uploadCrash: ok path=$uploadedRepoPath pending=${pending.size} moved=$moved")
             moved
         }.onFailure { t ->
@@ -282,6 +262,16 @@ object GitHubLogUploadManager {
 
         val contentB64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
 
+        // Final sanity check on actual Base64 length.
+        if (contentB64.length > SOFT_MAX_B64_CHARS) {
+            return Result.failure(
+                IllegalStateException(
+                    "Bundle too large after Base64 expansion (actualB64Chars=${contentB64.length}). " +
+                            "Reduce bundle size; Contents API JSON payload becomes unstable."
+                )
+            )
+        }
+
         // Encode path safely for GitHub Contents API.
         val encodedPath = encodePathSegments(repoPath)
         val endpoint = "$API_BASE/repos/${cfg.owner}/${cfg.repo}/contents/$encodedPath"
@@ -310,7 +300,7 @@ object GitHubLogUploadManager {
                 try {
                     AppLog.d(TAG, "upload: attempt=$attemptNo/$MAX_RETRIES uploadId=$uploadId path=$repoPath")
 
-                    val body = JSONObject().apply {
+                    val bodyJson = JSONObject().apply {
                         put("message", buildCommitMessage(commitHint, repoPath))
                         put("content", contentB64)
                         put("branch", cfg.branch)
@@ -327,7 +317,7 @@ object GitHubLogUploadManager {
                     httpPutJson(
                         url = endpoint,
                         token = cfg.token,
-                        bodyJson = body
+                        bodyJson = bodyJson
                     )
 
                     val elapsed = SystemClock.elapsedRealtime() - uploadStartMs
@@ -434,6 +424,8 @@ object GitHubLogUploadManager {
     private fun httpPutJson(url: String, token: String, bodyJson: String) {
         val conn = (URL(url).openConnection() as HttpURLConnection)
         try {
+            val bodyBytes = bodyJson.toByteArray(Charsets.UTF_8)
+
             conn.requestMethod = "PUT"
             conn.doOutput = true
             conn.connectTimeout = CONNECT_TIMEOUT_MS
@@ -447,10 +439,10 @@ object GitHubLogUploadManager {
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
 
             // Best-effort: avoid internal buffering of the entire request body in some stacks.
-            runCatching { conn.setFixedLengthStreamingMode(bodyJson.toByteArray(Charsets.UTF_8).size) }
+            runCatching { conn.setFixedLengthStreamingMode(bodyBytes.size) }
 
             conn.outputStream.use { os ->
-                os.write(bodyJson.toByteArray(Charsets.UTF_8))
+                os.write(bodyBytes)
                 os.flush()
             }
 
@@ -512,10 +504,10 @@ object GitHubLogUploadManager {
             val msg = o.optString("message", "").trim()
             val doc = o.optString("documentation_url", "").trim()
             val err = o.optJSONArray("errors")
-            val e0 = if (err != null && err.length() > 0) err.opt(0)?.toString()?.take(300) else ""
+            val e0 = if (err != null && err.length() > 0) err.opt(0)?.toString()?.take(300).orEmpty() else ""
             buildString {
                 if (msg.isNotBlank()) append(msg) else append(s.take(600))
-                if (e0!!.isNotBlank()) append(" | errors[0]=").append(e0)
+                if (e0.isNotBlank()) append(" | errors[0]=").append(e0)
                 if (doc.isNotBlank()) append(" | doc=").append(doc)
             }.take(900)
         }.getOrElse {

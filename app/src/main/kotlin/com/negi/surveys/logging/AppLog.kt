@@ -38,6 +38,11 @@ import java.util.concurrent.atomic.AtomicLong
  * - Buffers pre-init lines in memory, flushes after init().
  * - Performs lightweight secret/PII redaction best-effort (including JSON-like logs).
  * - Avoids rotate filename collisions (unique suffix).
+ *
+ * Threading:
+ * - Safe to call from any thread.
+ * - Uses a single lock for file writes to keep lines intact and durable.
+ * - Timestamp formatter is ThreadLocal (SimpleDateFormat is not thread-safe).
  */
 object AppLog {
     private const val INTERNAL_TAG = "AppLog"
@@ -72,24 +77,22 @@ object AppLog {
     /** Ensure rotate filenames are unique even if timestamps collide. */
     private val rotateSeq = AtomicLong(0L)
 
-    private val ts: SimpleDateFormat = SimpleDateFormat(
-        "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'",
-        Locale.US
-    ).apply { timeZone = TimeZone.getTimeZone("UTC") }
+    /** Thread-local UTC timestamp formatter (SimpleDateFormat is not thread-safe). */
+    private val tsUtc: ThreadLocal<SimpleDateFormat> = ThreadLocal.withInitial {
+        SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }
+    }
 
     // ----------------------------
     // Redaction regexes (compiled once)
     // ----------------------------
 
     /** "Authorization: Bearer <token>" style header. */
-    private val reAuthBearerHeader = Regex(
-        "(?i)\\bauthorization\\b\\s*:\\s*bearer\\s+[^\\s]+"
-    )
+    private val reAuthBearerHeader = Regex("(?i)\\bauthorization\\b\\s*:\\s*bearer\\s+[^\\s]+")
 
     /** JSON-ish: "authorization": "Bearer <token>" */
-    private val reAuthBearerJson = Regex(
-        "(?i)\"authorization\"\\s*:\\s*\"\\s*bearer\\s+[^\"]+\""
-    )
+    private val reAuthBearerJson = Regex("(?i)\"authorization\"\\s*:\\s*\"\\s*bearer\\s+[^\"]+\"")
 
     /** key[:=]value patterns (keeps separator). */
     private val reKeyValue = Regex(
@@ -142,10 +145,7 @@ object AppLog {
             safeInstallId = runCatching { LogFiles.installId(app).take(8) }.getOrDefault("unknown")
         }
 
-        i(
-            INTERNAL_TAG,
-            "init: dir=$dirPath build=${LogFiles.buildLabelSafe()} installId=$safeInstallId"
-        )
+        i(INTERNAL_TAG, "init: dir=$dirPath build=${LogFiles.buildLabelSafe()} installId=$safeInstallId")
     }
 
     /**
@@ -183,14 +183,14 @@ object AppLog {
     fun getOrCreateCurrentLogFile(context: Context): File {
         ensureReady(context)
         synchronized(lock) {
-            ensureFileExistsLocked()
-            rotateIfNeededLocked()
-
             val dir = logDir ?: LogFiles.appLogDir(context.applicationContext).also { logDir = it }
             val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
 
             ensureFileExistsLocked()
-            return file
+            rotateIfNeededLocked()
+            ensureFileExistsLocked()
+
+            return currentFile ?: file
         }
     }
 
@@ -257,9 +257,10 @@ object AppLog {
     }
 
     private fun writeLineOrBuffer(level: Int, tag: String, msg: String, t: Throwable?) {
-        synchronized(lock) {
-            val line = buildLineLocked(level, tag, msg, t)
+        // Build the line outside the lock to reduce contention.
+        val line = buildLine(level, tag, msg, t)
 
+        synchronized(lock) {
             val dir = logDir
             if (dir == null) {
                 // Pre-init: keep a small best-effort buffer.
@@ -281,8 +282,12 @@ object AppLog {
         }
     }
 
-    private fun buildLineLocked(level: Int, tag: String, msg: String, t: Throwable?): String {
-        val now = ts.format(Date())
+    private fun buildLine(level: Int, tag: String, msg: String, t: Throwable?): String {
+        val fmt = tsUtc.get() ?: SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
+            timeZone = TimeZone.getTimeZone("UTC")
+        }.also { tsUtc.set(it) }
+
+        val now = fmt.format(Date())
         val lvl = when (level) {
             Log.VERBOSE -> 'V'
             Log.DEBUG -> 'D'
@@ -328,7 +333,6 @@ object AppLog {
 
         // JSON-ish: "token": "value" for sensitive keys.
         s = s.replace(reKeyValueJson) { m ->
-            // Preserve the original key spelling found in the match as much as possible.
             val key = Regex("(?i)\"\\s*([^\"]+)\\s*\"\\s*:").find(m.value)?.groupValues?.getOrNull(1) ?: "token"
             "\"$key\":\"<REDACTED>\""
         }
@@ -352,7 +356,7 @@ object AppLog {
 
         val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
         if (!file.exists()) {
-            runCatching { FileOutputStream(file, true).use { } }
+            runCatching { FileOutputStream(file, true).use { /* touch */ } }
         }
     }
 
@@ -393,7 +397,6 @@ object AppLog {
                         output.flush()
                     }
                 }
-                // Truncate the original file so future writes stay small.
                 FileOutputStream(file, false).use { /* truncate */ }
             }
         }
@@ -401,7 +404,7 @@ object AppLog {
         // Ensure app.log exists for new writes.
         currentFile = File(dir, "app.log").also { f ->
             if (!f.exists()) {
-                runCatching { FileOutputStream(f, true).use { } }
+                runCatching { FileOutputStream(f, true).use { /* touch */ } }
             }
         }
 

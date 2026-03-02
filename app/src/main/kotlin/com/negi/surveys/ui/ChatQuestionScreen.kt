@@ -102,6 +102,7 @@ import com.negi.surveys.chat.ChatRole
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatStreamState
 import com.negi.surveys.chat.DraftKey
+import com.negi.surveys.chat.FakeSlmRepository
 import com.negi.surveys.chat.InMemoryChatDraftStore
 import com.negi.surveys.chat.RepositoryI
 import com.negi.surveys.logging.AppLog
@@ -134,8 +135,8 @@ fun ChatQuestionScreen(
     val appContext = LocalContext.current.applicationContext
 
     val repo: RepositoryI = remember(appContext) {
-        SlmRepository(appContext)
-        // FakeSlmRepository()
+        //SlmRepository(appContext)
+        FakeSlmRepository()
     }
 
     val validator: AnswerValidatorI = remember(questionId, promptHash, repo, streamBridge) {

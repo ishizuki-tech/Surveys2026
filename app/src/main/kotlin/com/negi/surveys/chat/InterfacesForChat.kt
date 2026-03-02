@@ -23,6 +23,10 @@ import kotlinx.coroutines.flow.Flow
  * - Stable behavior across devices/locales (avoid locale surprises).
  * - Drop invisible/hostile formatting chars that can poison equality/logs/parsers.
  * - Collapse whitespace deterministically to reduce accidental drift from copy/paste.
+ *
+ * Notes:
+ * - This object is intentionally conservative and biased toward safety and determinism.
+ * - Do not log raw user answers; normalize first and/or log only metadata (length/hash).
  */
 internal object AnswerNormalization {
 
@@ -32,6 +36,9 @@ internal object AnswerNormalization {
      * Rationale:
      * - IDs are logical keys; whitespace/case differences should not fork storage.
      * - Locale.US avoids Turkish-I and other locale-specific casing surprises.
+     *
+     * Contract:
+     * - Empty input returns empty output. Call sites should treat empty IDs as invalid.
      */
     fun normalizeId(raw: String): String {
         return raw.trim().uppercase(Locale.US)
@@ -49,6 +56,7 @@ internal object AnswerNormalization {
      * - Converts any Unicode whitespace into a single ASCII space.
      * - Collapses consecutive spaces to one.
      * - Trims leading/trailing spaces deterministically.
+     * - Drops ISO control characters that are not whitespace (defensive against hostile input).
      *
      * What this does NOT do:
      * - No punctuation/casing/language-specific transformations.
@@ -219,7 +227,8 @@ interface AnswerValidatorI {
  * Keep this enum consistent across the validator/repository stack.
  * Any mismatch can lead to "wrong prompt shape" bugs that are painful to trace.
  *
- * If you already define this enum elsewhere, remove the duplicate and import it instead.
+ * Recommendation:
+ * - Prefer using this enum end-to-end (instead of string tags) to make mismatches type-safe.
  */
 enum class PromptPhase {
     /** Phase used when validating the main answer (first user response). */
@@ -236,6 +245,11 @@ enum class PromptPhase {
  * - Returned [Flow] is expected to be a token/text stream (delta chunks).
  * - Collectors should be able to cancel collection to stop generation.
  * - Implementations should document whether chunks are raw deltas or post-processed.
+ *
+ * Phase note:
+ * - [buildPrompt] is intentionally split into phase-less and phase-aware variants.
+ * - If your prompt shape differs by phase, override [buildPrompt] with [phase].
+ * - Otherwise, the default implementation delegates to phase-less [buildPrompt] for compatibility.
  */
 interface RepositoryI {
 

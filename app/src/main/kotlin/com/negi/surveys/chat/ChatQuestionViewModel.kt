@@ -13,6 +13,7 @@
 
 package com.negi.surveys.chat
 
+import android.os.Looper
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.negi.surveys.logging.AppLog
@@ -52,7 +53,7 @@ import kotlinx.coroutines.withContext
  * - Adopt the placeholder once a real stream session id appears (Begin/Delta).
  * - Close the "stream window" after validation completes to ignore late Begin/Delta.
  * - Gate late validator returns via attempt id to prevent transcript corruption after cancel.
- * - Synchronize mutable state snapshots for draft persistence (avoid ConcurrentModificationException).
+ * - Snapshot draft persistence on Main to avoid ConcurrentModificationException.
  */
 class ChatQuestionViewModel(
     private val questionId: String,
@@ -80,8 +81,8 @@ class ChatQuestionViewModel(
      * - Rebuilding a new List on every delta is O(N) and gets expensive as history grows.
      *
      * Threading:
-     * - All mutations are performed on Main (see [StreamCollector]).
-     * - The emitted list is a lightweight wrapper that changes identity via a version bump.
+     * - All mutations are performed on Main (see [StreamCollector] and submit flow).
+     * - Draft persistence is forced onto Main to avoid concurrent mutation hazards.
      */
     private val messagesBacking: ArrayList<ChatMessage> = ArrayList(128)
     private val messageIndexById: HashMap<String, Int> = HashMap(128)
@@ -430,10 +431,6 @@ class ChatQuestionViewModel(
         }
         logAnswerDigest("followup#${withStateLock { followUps.size }}", userAnswer)
 
-        // IMPORTANT:
-        // Always pass a follow-up payload that explicitly contains the current Q/A,
-        // in addition to any historical context. This prevents prompt templates that
-        // expect "the answer" from missing the latest user input.
         val followUpPayloadForValidator = withStateLock {
             buildFollowUpContextForValidator(
                 currentQuestion = q,
@@ -518,11 +515,6 @@ class ChatQuestionViewModel(
         AppLog.d(TAG, "stream window CLOSED reason=$reason")
     }
 
-    /**
-     * Close the stream window and remove placeholder only if the bridge has no active session.
-     *
-     * This prevents late Begin/Delta from creating new UI after validation completes.
-     */
     private fun tryCloseStreamWindowIfIdle(reason: String) {
         val bridgeActive = streamBridge.statsSnapshot().activeSessionId
         val vmActive = activeStreamSessionId
@@ -542,9 +534,6 @@ class ChatQuestionViewModel(
         safePersistDraft("stream.window.close:$reason")
     }
 
-    /**
-     * Ensures a TTFT placeholder MODEL bubble exists immediately after submit.
-     */
     private fun ensureStreamingPlaceholder(reason: String) {
         activeStreamMsgId?.let { oldId ->
             removeMessage(oldId)
@@ -579,14 +568,6 @@ class ChatQuestionViewModel(
         }.trim()
     }
 
-    /**
-     * Build a validator-friendly follow-up payload.
-     *
-     * Design:
-     * - Always includes CURRENT_FOLLOW_UP_Q/A at the top.
-     * - Also includes the full follow-up turn history using the legacy keys (FOLLOW_UP_1_Q/A...),
-     *   so older prompt templates can continue to work.
-     */
     private fun buildFollowUpContextForValidator(
         currentQuestion: String,
         currentAnswer: String,
@@ -767,7 +748,7 @@ class ChatQuestionViewModel(
                             is ChatStreamEvent.Begin -> onBegin(ev.sessionId)
                             is ChatStreamEvent.Delta -> onDelta(ev.sessionId, ev.text)
                             is ChatStreamEvent.End -> onEnd(ev.sessionId)
-                            is ChatStreamEvent.Error -> onError(ev.sessionId, ev.code!!)
+                            is ChatStreamEvent.Error -> onError(ev.sessionId, ev.token, ev.code)
                         }
                     }
                 } catch (t: CancellationException) {
@@ -841,14 +822,20 @@ class ChatQuestionViewModel(
             }
         }
 
-        private suspend fun onError(sessionId: Long, reason: String) {
+        /**
+         * Handle stream errors using the token for human/debug classification,
+         * and an optional stable code for programmatic suppression.
+         */
+        private suspend fun onError(sessionId: Long, token: String, code: String?) {
             if (sessionId != localActiveSession) return
 
-            val normalized = reason.trim().lowercase(Locale.US)
-            val isReplaced = (normalized == REPLACED_MESSAGE)
+            val tokenNorm = token.trim().lowercase(Locale.US)
+            val codeNorm = code?.trim()?.lowercase(Locale.US).orEmpty()
+
+            val isReplaced = (tokenNorm == REPLACED_MESSAGE || codeNorm == REPLACED_MESSAGE)
 
             val suppressedCancel =
-                (normalized == "cancelled" || normalized == "canceled") &&
+                (tokenNorm == CANCELLED_MESSAGE || codeNorm == CANCELLED_MESSAGE) &&
                         suppressNextCancelledError.getAndSet(false)
 
             val cancelledSession = isCancelledSession(sessionId)
@@ -865,7 +852,8 @@ class ChatQuestionViewModel(
                 }
             } else {
                 maybeUpdateUi(force = true)
-                finalizeAndRemoveModelBubble(state = ChatStreamState.ERROR, errorMessage = reason)
+                // Prefer token as a short, metadata-only error string.
+                finalizeAndRemoveModelBubble(state = ChatStreamState.ERROR, errorMessage = token)
             }
 
             withContext(Dispatchers.Main.immediate) {
@@ -994,9 +982,6 @@ class ChatQuestionViewModel(
         AppLog.d(TAG, "vm stream cleared reason=$reason")
     }
 
-    /**
-     * Adjusts a front-drop count to avoid leaving a low surrogate as the first char.
-     */
     private fun adjustDropForSurrogates(buf: StringBuilder, dropWanted: Int): Int {
         var drop = dropWanted.coerceAtLeast(0)
         if (drop <= 0) return 0
@@ -1070,9 +1055,6 @@ class ChatQuestionViewModel(
         safePersistDraft("seed")
     }
 
-    /**
-     * Sanitizes restored messages to avoid resurrecting in-flight streaming UI.
-     */
     private fun sanitizeRestoredMessages(raw: List<ChatMessage>): List<ChatMessage> {
         if (raw.isEmpty()) return raw
 
@@ -1110,7 +1092,10 @@ class ChatQuestionViewModel(
         return if (changed) out else raw
     }
 
-    private fun persistDraft() {
+    /**
+     * Persist must run on Main because messagesBacking is mutated on Main very frequently.
+     */
+    private fun persistDraftOnMain() {
         // Persist an immutable snapshot to avoid leaking the live backing list into storage.
         val messagesSnapshot = messagesBacking.toList()
         val snapshot = synchronized(stateLock) {
@@ -1128,10 +1113,21 @@ class ChatQuestionViewModel(
     }
 
     private fun safePersistDraft(reason: String) {
-        runCatching { persistDraft() }
-            .onFailure { t ->
-                AppLog.w(TAG, "persistDraft failed (non-fatal) reason=$reason err=${t.javaClass.simpleName}")
-            }
+        // Ensure snapshot is taken on Main to avoid ConcurrentModificationException.
+        if (Looper.getMainLooper().thread === Thread.currentThread()) {
+            runCatching { persistDraftOnMain() }
+                .onFailure { t ->
+                    AppLog.w(TAG, "persistDraft failed (non-fatal) reason=$reason err=${t.javaClass.simpleName}")
+                }
+            return
+        }
+
+        viewModelScope.launch(Dispatchers.Main.immediate) {
+            runCatching { persistDraftOnMain() }
+                .onFailure { t ->
+                    AppLog.w(TAG, "persistDraft failed (non-fatal) reason=$reason err=${t.javaClass.simpleName}")
+                }
+        }
     }
 
     private fun schedulePersistDraftForInput(reason: String) {

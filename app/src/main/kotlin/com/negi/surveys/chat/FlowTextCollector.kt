@@ -240,7 +240,13 @@ private fun clipToBudgetPreservingSurrogates(chunk: String, budget: Int): String
  * Avoid using exception messages because they may contain file paths or user content.
  */
 private fun sanitizeErrorToken(t: Throwable): String {
-    return t.javaClass.simpleName.ifBlank { "error" }.take(32)
+    val simple = t.javaClass.simpleName
+    if (simple.isNotBlank()) return simple.take(32)
+
+    // Fallback for anonymous/local classes: keep only the last segment, still non-PII.
+    val fqcn = t.javaClass.name
+    val last = fqcn.substringAfterLast('.').substringAfterLast('$')
+    return last.ifBlank { "error" }.take(32)
 }
 
 /**

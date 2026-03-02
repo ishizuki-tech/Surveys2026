@@ -43,29 +43,44 @@ import kotlinx.coroutines.flow.updateAndGet
  */
 class SurveySessionViewModel : ViewModel() {
 
+    /**
+     * In-memory store of per-question logs keyed by questionId.
+     *
+     * Important:
+     * - Keep the value immutable (Map + data classes) so StateFlow emissions are predictable.
+     * - Always create a new Map instance on accepted updates.
+     */
     private val _logsMap = MutableStateFlow<Map<String, ReviewQuestionLog>>(emptyMap())
 
     /**
      * Sorted list of logs for rendering and export.
      *
-     * Notes:
-     * - Uses "natural" ordering for IDs like Q1..Q10 (instead of lexical Q1,Q10,Q2).
-     * - If an ID doesn't match the expected pattern, it falls back to raw string ordering.
-     * - Prefix ordering is case-insensitive and locale-stable for determinism.
+     * Ordering:
+     * - Natural ordering for IDs like Q1..Q10 (instead of lexical Q1,Q10,Q2).
+     * - Case-insensitive prefix ordering using Locale.ROOT for determinism.
+     * - Fallback to raw string ordering when parsing fails.
      */
     val logs: StateFlow<List<ReviewQuestionLog>> =
         _logsMap
             .map { map ->
-                map.values
-                    .map { it to questionIdKey(it.questionId) }
-                    .sortedWith(
-                        compareBy<Pair<ReviewQuestionLog, QuestionIdKey>>(
-                            { it.second.prefixSort },
-                            { it.second.number },
-                            { it.second.raw }
-                        )
+                if (map.isEmpty()) return@map emptyList()
+
+                val items = ArrayList<SortItem>(map.size)
+                for (log in map.values) {
+                    items.add(SortItem(log = log, key = questionIdKey(log.questionId)))
+                }
+
+                items.sortWith(
+                    compareBy<SortItem>(
+                        { it.key.prefixSort },
+                        { it.key.number },
+                        { it.key.raw }
                     )
-                    .map { it.first }
+                )
+
+                val out = ArrayList<ReviewQuestionLog>(items.size)
+                for (it in items) out.add(it.log)
+                out
             }
             .flowOn(Dispatchers.Default)
             .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
@@ -120,49 +135,49 @@ class SurveySessionViewModel : ViewModel() {
             return
         }
 
-        // Snapshot potential mutable lists to avoid external mutation after insertion.
-        val normalized = normalizeIncomingLog(log, key)
+        // Snapshot transcript lines to avoid external mutation after insertion.
+        val incoming = normalizeIncomingLog(log = log, normalizedKey = key)
 
         val after = _logsMap.updateAndGet { prev ->
             val existing = prev[key]
-            val should = existing == null || shouldAcceptUpdate(existing, normalized)
+            val accept = existing == null || shouldAcceptUpdate(existing = existing, incoming = incoming)
+            if (!accept) return@updateAndGet prev
 
-            if (!should) return@updateAndGet prev
-
+            // Make a new Map instance (immutable snapshot).
             val next = prev.toMutableMap()
-            next[key] = normalized
+            next[key] = incoming
             next.toMap()
         }
 
         // Reference check is intentional: we want to know if *this exact incoming instance* won.
-        val accepted = after[key] === normalized
+        val accepted = after[key] === incoming
 
-        val lineChars = transcriptCharCount(normalized.lines)
-        val payloadLen = normalized.completionPayload.length
+        val lineChars = transcriptCharCount(incoming.lines)
+        val payloadLen = incoming.completionPayload.length
 
         if (accepted) {
             SafeLog.d(
                 TAG,
-                "upsertLog: accepted qid=$key skipped=${normalized.isSkipped} " +
-                        "lines=${normalized.lines.size} lineChars=$lineChars payloadLen=$payloadLen"
+                "upsertLog: accepted qid=$key skipped=${incoming.isSkipped} " +
+                        "lines=${incoming.lines.size} lineChars=$lineChars payloadLen=$payloadLen"
             )
         } else {
             val existing = after[key]
             if (existing != null) {
-                val inScore = completenessScore(normalized)
+                val inScore = completenessScore(incoming)
                 val exScore = completenessScore(existing)
-                val tie = inScore == exScore && existing.isSkipped == normalized.isSkipped
+                val tie = inScore == exScore && existing.isSkipped == incoming.isSkipped
                 val suffix = if (tie) " tieScore=$inScore" else " inScore=$inScore exScore=$exScore"
                 SafeLog.w(
                     TAG,
-                    "upsertLog: dropped(stale) qid=$key skipped=${normalized.isSkipped} " +
-                            "lines=${normalized.lines.size} lineChars=$lineChars payloadLen=$payloadLen$suffix"
+                    "upsertLog: dropped(stale) qid=$key skipped=${incoming.isSkipped} " +
+                            "lines=${incoming.lines.size} lineChars=$lineChars payloadLen=$payloadLen$suffix"
                 )
             } else {
                 SafeLog.w(
                     TAG,
-                    "upsertLog: dropped(stale) qid=$key skipped=${normalized.isSkipped} " +
-                            "lines=${normalized.lines.size} lineChars=$lineChars payloadLen=$payloadLen"
+                    "upsertLog: dropped(stale) qid=$key skipped=${incoming.isSkipped} " +
+                            "lines=${incoming.lines.size} lineChars=$lineChars payloadLen=$payloadLen"
                 )
             }
         }
@@ -176,6 +191,10 @@ class SurveySessionViewModel : ViewModel() {
         SafeLog.i(TAG, "clear: session cleared")
     }
 
+    // ---------------------------------------------------------------------
+    // Export / Timeline builders
+    // ---------------------------------------------------------------------
+
     /**
      * Export schema v1.
      *
@@ -183,6 +202,8 @@ class SurveySessionViewModel : ViewModel() {
      * - Use ReviewChatKind.wireName (stable) instead of enum.name (rename-unsafe).
      */
     private fun buildExportJsonV1(sortedLogs: List<ReviewQuestionLog>): String {
+        if (sortedLogs.isEmpty()) return EXPORT_JSON_EMPTY
+
         val sb = StringBuilder(4096)
         sb.append('{')
         sb.append("\"version\":1,")
@@ -250,6 +271,10 @@ class SurveySessionViewModel : ViewModel() {
         return out
     }
 
+    // ---------------------------------------------------------------------
+    // Update policy
+    // ---------------------------------------------------------------------
+
     /**
      * Decide whether to accept an incoming update for the same questionId.
      */
@@ -267,7 +292,6 @@ class SurveySessionViewModel : ViewModel() {
 
         // Tie-breaker policy:
         // - Prefer keeping existing to avoid late stale overwrites when concurrent producers exist.
-        // - If you later need "minor edits" to overwrite on ties, adjust here intentionally.
         return false
     }
 
@@ -279,10 +303,6 @@ class SurveySessionViewModel : ViewModel() {
      * - Transcript total character count
      * - Payload length
      * - Prompt length
-     *
-     * Rationale:
-     * - Line count alone can tie too often (different content, same number of lines).
-     * - Total transcript chars is a cheap proxy for "more content" without parsing semantics.
      */
     private fun completenessScore(log: ReviewQuestionLog): Long {
         val lineCount = log.lines.size.coerceAtLeast(0).toLong()
@@ -290,8 +310,7 @@ class SurveySessionViewModel : ViewModel() {
         val payload = log.completionPayload.length.coerceAtLeast(0).toLong()
         val prompt = log.prompt.length.coerceAtLeast(0).toLong()
 
-        // Weighting chosen to preserve priority order while staying far from Long overflow.
-        // lineCount dominates lineChars, lineChars dominates payload, payload dominates prompt.
+        // Weighting preserves priority while staying far from Long overflow for realistic sessions.
         return (lineCount * 1_000_000_000_000L) +
                 (lineChars * 1_000_000L) +
                 (payload * 1_000L) +
@@ -300,9 +319,6 @@ class SurveySessionViewModel : ViewModel() {
 
     /**
      * Computes the total character count across transcript lines.
-     *
-     * Note:
-     * - Int is enough for typical session sizes; we cast to Long in scoring.
      */
     private fun transcriptCharCount(lines: List<ReviewChatLine>): Int {
         var sum = 0
@@ -311,6 +327,86 @@ class SurveySessionViewModel : ViewModel() {
         }
         return sum
     }
+
+    // ---------------------------------------------------------------------
+    // Normalization / Sorting keys
+    // ---------------------------------------------------------------------
+
+    /**
+     * Normalize and snapshot an incoming log.
+     *
+     * Why:
+     * - Prevent external mutation of transcript lists after insertion.
+     * - Ensure key normalization is applied consistently.
+     *
+     * Policy:
+     * - Always snapshot lines via toList() (defensive copy).
+     * - Always write questionId as the normalized key.
+     */
+    private fun normalizeIncomingLog(log: ReviewQuestionLog, normalizedKey: String): ReviewQuestionLog {
+        val safeLines = log.lines.toList()
+        return if (log.questionId == normalizedKey && log.lines === safeLines) {
+            log
+        } else {
+            log.copy(questionId = normalizedKey, lines = safeLines)
+        }
+    }
+
+    private data class SortItem(
+        val log: ReviewQuestionLog,
+        val key: QuestionIdKey
+    )
+
+    private data class QuestionIdKey(
+        val prefixSort: String,
+        val number: Int,
+        val raw: String
+    )
+
+    /**
+     * Natural ordering key for question IDs like "Q1", "Q10", "A2".
+     *
+     * Parsing:
+     * - prefix: consecutive letters at start
+     * - number: consecutive digits after prefix
+     * - otherwise fallback to raw
+     */
+    private fun questionIdKey(id: String): QuestionIdKey {
+        val raw = id.trim()
+        if (raw.isEmpty()) {
+            return QuestionIdKey(prefixSort = "", number = Int.MAX_VALUE, raw = "")
+        }
+
+        var i = 0
+        val n = raw.length
+
+        while (i < n && raw[i].isLetter()) i++
+        if (i == 0 || i == n) {
+            val p = raw.lowercase(Locale.ROOT)
+            return QuestionIdKey(prefixSort = p, number = Int.MAX_VALUE, raw = raw)
+        }
+
+        var j = i
+        while (j < n && raw[j].isDigit()) j++
+        if (j != n) {
+            val p = raw.lowercase(Locale.ROOT)
+            return QuestionIdKey(prefixSort = p, number = Int.MAX_VALUE, raw = raw)
+        }
+
+        val prefix = raw.substring(0, i)
+        val numStr = raw.substring(i)
+        val number = numStr.toIntOrNull() ?: Int.MAX_VALUE
+
+        return QuestionIdKey(
+            prefixSort = prefix.lowercase(Locale.ROOT),
+            number = number,
+            raw = raw
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // JSON escaping
+    // ---------------------------------------------------------------------
 
     /**
      * Minimal JSON string escaping with control-char handling.
@@ -340,57 +436,8 @@ class SurveySessionViewModel : ViewModel() {
         return out.toString()
     }
 
-    /**
-     * Natural ordering key for question IDs like "Q1", "Q10", "A2".
-     */
-    private fun questionIdKey(id: String): QuestionIdKey {
-        val raw = id.trim()
-        val m = ID_PATTERN.matchEntire(raw)
-        if (m != null) {
-            val prefixRaw = m.groupValues[1]
-            val number = m.groupValues[2].toIntOrNull() ?: Int.MAX_VALUE
-            return QuestionIdKey(
-                prefixSort = prefixRaw.lowercase(Locale.ROOT),
-                prefixRaw = prefixRaw,
-                number = number,
-                raw = raw
-            )
-        }
-        return QuestionIdKey(
-            prefixSort = raw.lowercase(Locale.ROOT),
-            prefixRaw = raw,
-            number = Int.MAX_VALUE,
-            raw = raw
-        )
-    }
-
-    private data class QuestionIdKey(
-        val prefixSort: String,
-        val prefixRaw: String,
-        val number: Int,
-        val raw: String
-    )
-
-    /**
-     * Normalize and snapshot an incoming log.
-     *
-     * Why:
-     * - Prevent external mutation of transcript lists after insertion.
-     * - Ensure key normalization is applied consistently.
-     */
-    private fun normalizeIncomingLog(log: ReviewQuestionLog, normalizedKey: String): ReviewQuestionLog {
-        val fixedId = if (log.questionId == normalizedKey) log.questionId else normalizedKey
-        val fixedLines = log.lines.toList()
-        return if (fixedId == log.questionId && fixedLines === log.lines) {
-            log
-        } else {
-            log.copy(questionId = fixedId, lines = fixedLines)
-        }
-    }
-
     private companion object {
         private const val TAG = "SurveySessionVM"
-        private val ID_PATTERN = Regex("^([A-Za-z]+)(\\d+)$")
         private const val EXPORT_JSON_EMPTY = "{\"version\":1,\"questions\":[]}"
     }
 }

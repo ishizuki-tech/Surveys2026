@@ -27,21 +27,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.withContext
-
-private const val TAG = "SlmRepository"
-
-/** Max time the repository will wait for warmup compile before proceeding. */
-private const val COMPILE_BARRIER_TIMEOUT_MS: Long = 1_500L
-
-/** Two-step: max time budget for the first (main) generation. */
-private const val TWO_STEP_MAIN_TIMEOUT_MS: Long = 120_000L
-
-/** Two-step: cap the amount of main output included in the eval prompt (avoid huge prompts). */
-private const val TWO_STEP_EVAL_MAIN_ANSWER_MAX_CHARS: Int = 8_000
-
-/** Two-step: cap the amount of original prompt included in the eval prompt. */
-private const val TWO_STEP_EVAL_USER_PROMPT_MAX_CHARS: Int = 4_000
 
 class SlmRepository(
     context: Context,
@@ -75,9 +62,7 @@ class SlmRepository(
 
     override suspend fun request(prompt: String): Flow<String> {
         val p = prompt.trim()
-        if (p.isBlank()) {
-            return callbackFlow { close() }
-        }
+        if (p.isBlank()) return emptyFlow()
 
         val file = resolveModelFile()
         if (!file.exists() || !file.isFile || file.length() <= 0L) {
@@ -119,7 +104,7 @@ class SlmRepository(
         val mainResult = mainFlow.collectToTextResultWithBudget(
             timeoutBudgetMs = TWO_STEP_MAIN_TIMEOUT_MS,
             maxChars = 32_000,
-            onChunk = null
+            onChunk = null,
         )
 
         val questionId = extractQuestionId(userPrompt) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
@@ -128,15 +113,13 @@ class SlmRepository(
             userPrompt = userPrompt,
             mainAnswer = mainResult.text,
             mainStopReason = mainResult.reason.name,
-            mainErrorToken = mainResult.errorToken
+            mainErrorToken = mainResult.errorToken,
         )
 
         // Step 2: eval output streamed to caller.
         // Always reset to isolate eval from any SDK conversation state.
         resetConversationBestEffort(model, reason = "twoStepEval")
 
-        // Enforce eval time budget by collecting with a timeout on the consumer side if needed.
-        // Here we keep it streaming; upstream collectors may cap with FlowTextCollector if desired.
         return runInferenceAsFlow(model = model, input = evalPrompt)
     }
 
@@ -149,9 +132,7 @@ class SlmRepository(
      */
     private fun runInferenceAsFlow(model: Model, input: String): Flow<String> {
         val p = input.trim()
-        if (p.isBlank()) {
-            return callbackFlow { close() }
-        }
+        if (p.isBlank()) return emptyFlow()
 
         return callbackFlow {
             val closed = AtomicBoolean(false)
@@ -194,7 +175,7 @@ class SlmRepository(
                 },
                 images = emptyList(),
                 audioClips = emptyList(),
-                notifyCancelToOnError = false
+                notifyCancelToOnError = false,
             )
 
             awaitClose {
@@ -214,12 +195,15 @@ class SlmRepository(
                 supportAudio = false,
                 systemMessage = null,
                 tools = emptyList(),
-                timeoutMs = 5_000L
+                timeoutMs = RESET_CONVERSATION_TIMEOUT_MS,
             )
         }.getOrNull() == true
 
         if (!ok) {
-            AppLog.w(TAG, "resetConversationAndAwait failed or timed out; continuing: reason='$reason' model='${model.name}'")
+            AppLog.w(
+                TAG,
+                "resetConversationAndAwait failed or timed out; continuing: reason='$reason' model='${model.name}'",
+            )
         }
     }
 
@@ -253,28 +237,13 @@ class SlmRepository(
             ?.takeIf { it.isNotBlank() }
             ?: fallbackModelName
 
-        val accel = cfg?.slm?.accelerator
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: Accelerator.GPU.label
-
-        val maxTokens = cfg?.slm?.maxTokens ?: 4096
-        val topK = cfg?.slm?.topK ?: 40
-        val topP = (cfg?.slm?.topP ?: 0.9).toFloat()
-        val temp = (cfg?.slm?.temperature ?: 0.7).toFloat()
-
-        val config: Map<ConfigKey, Any> = mapOf(
-            ConfigKey.ACCELERATOR to accel,
-            ConfigKey.MAX_TOKENS to maxTokens,
-            ConfigKey.TOP_K to topK,
-            ConfigKey.TOP_P to topP,
-            ConfigKey.TEMPERATURE to temp
-        )
+        // Use the centralized config normalization/clamping defined in Model.
+        val modelConfig: Map<Model.ConfigKey, Any> = Model.buildModelConfigSafe(cfg?.slm)
 
         return Model(
             name = modelName,
             taskPath = file.absolutePath,
-            config = config
+            config = modelConfig,
         )
     }
 
@@ -289,7 +258,7 @@ class SlmRepository(
                 supportImage = false,
                 supportAudio = false,
                 systemMessage = null,
-                tools = emptyList()
+                tools = emptyList(),
             )
         }
     }
@@ -304,7 +273,7 @@ class SlmRepository(
         userPrompt: String,
         mainAnswer: String,
         mainStopReason: String,
-        mainErrorToken: String?
+        mainErrorToken: String?,
     ): String {
         val clippedUserPrompt = clipForEval(userPrompt, TWO_STEP_EVAL_USER_PROMPT_MAX_CHARS)
         val clippedMain = clipForEval(mainAnswer, TWO_STEP_EVAL_MAIN_ANSWER_MAX_CHARS)
@@ -339,24 +308,28 @@ class SlmRepository(
     }
 
     private fun clipForEval(text: String, maxChars: Int): String {
-        val t = text
         if (maxChars <= 0) return ""
-        if (t.length <= maxChars) return t
+        if (text.length <= maxChars) return text
 
-        var end = maxChars.coerceAtMost(t.length)
+        var end = maxChars.coerceAtMost(text.length)
         if (end <= 0) return ""
 
-        if (end < t.length) {
-            val last = t[end - 1]
-            val next = t[end]
+        // Avoid splitting a surrogate pair.
+        if (end < text.length) {
+            val last = text[end - 1]
+            val next = text[end]
             if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
                 end -= 1
             }
         }
 
         if (end <= 0) return ""
-        return t.take(end)
+        return text.take(end)
     }
+
+    // ---------------------------------------------------------------------
+    // Warmup compile barrier helpers (kept here so the file has no top-level clutter).
+    // ---------------------------------------------------------------------
 
     private fun SlmWarmup.CompileState.isTerminal(): Boolean {
         return this is SlmWarmup.CompileState.Compiled ||
@@ -383,9 +356,28 @@ class SlmRepository(
             else -> {
                 AppLog.d(
                     TAG,
-                    "compile barrier: state=${state::class.java.simpleName} elapsed=${state.elapsedMs}ms$suffix"
+                    "compile barrier: state=${state::class.java.simpleName} elapsed=${state.elapsedMs}ms$suffix",
                 )
             }
         }
+    }
+
+    companion object {
+        private const val TAG: String = "SlmRepository"
+
+        /** Max time the repository will wait for warmup compile before proceeding. */
+        private const val COMPILE_BARRIER_TIMEOUT_MS: Long = 1_500L
+
+        /** Two-step: max time budget for the first (main) generation. */
+        private const val TWO_STEP_MAIN_TIMEOUT_MS: Long = 120_000L
+
+        /** Two-step: cap the amount of main output included in the eval prompt (avoid huge prompts). */
+        private const val TWO_STEP_EVAL_MAIN_ANSWER_MAX_CHARS: Int = 8_000
+
+        /** Two-step: cap the amount of original prompt included in the eval prompt. */
+        private const val TWO_STEP_EVAL_USER_PROMPT_MAX_CHARS: Int = 4_000
+
+        /** Best-effort reset timeout. */
+        private const val RESET_CONVERSATION_TIMEOUT_MS: Long = 5_000L
     }
 }
