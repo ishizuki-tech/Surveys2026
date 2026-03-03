@@ -48,7 +48,7 @@ import kotlinx.coroutines.CancellationException
 object SLM {
 
     private const val TAG: String = "SLM"
-    private val DEBUG_SLM: Boolean = BuildConfig.DEBUG
+    private val DEBUG_SLM: Boolean = true //BuildConfig.DEBUG
 
     // ---------------------------------------------------------------------
     // Logging helpers
@@ -378,7 +378,7 @@ object SLM {
                 model = model,
                 input = input,
                 resultListener = { partialResult, done ->
-                    if (DEBUG_SLM && done) {
+                    if (DEBUG_SLM) {
                         SafeLog.i(
                             "SLM runInference",
                             "done=$done partialLen=${partialResult.length} :: ${partialResult.ellipsize(256)}",

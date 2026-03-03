@@ -78,7 +78,13 @@ object AppProcessServices {
             if (insideCur != null && insideMode == mode) return insideCur
 
             val created: RepositoryI = when (mode) {
-                RepoMode.ON_DEVICE -> SlmRepository(appCtx)
+                RepoMode.ON_DEVICE -> {
+                    SlmRepository(
+                        context = appCtx,
+                        enableTwoStepEval = true,
+                        debug = SlmRepository.DebugConfig(enabled = true, logFullText = true)
+                    )
+                }
                 RepoMode.FAKE -> FakeSlmRepository()
             }
 
