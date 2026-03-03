@@ -10,24 +10,20 @@
  *
  *  Summary:
  *  ---------------------------------------------------------------------
- *  One-shot, single-flight initializer for large model files or heavy assets.
- *  Handles download, resume, integrity check, and atomic replacement with
- *  coroutine cancellation propagation and friendly error reporting.
+ *  Process-wide, keyed single-flight initializer for heavy assets.
  *
- *  Key properties:
- *  ---------------------------------------------------------------------
- *  - Single-flight:
- *      Concurrent callers share the same in-flight Deferred<Result<File>>.
- *  - Resume (safe):
- *      Partial files are preserved across cancellations/timeouts and many IO failures
- *      when forceFresh=false, but only if meta matches the current URL/expected length.
- *  - Integrity:
- *      If Content-Length (or meta expectedLen) is known, final size must match exactly.
- *  - Replacement:
- *      Uses rename within the same directory when possible; falls back to
- *      a stream copy if rename fails.
+ *  Guarantees:
+ *  - Single-flight per key (default key: modelUrl + fileName).
+ *  - begin(...) returns a Handle immediately + a Deferred<Result<File>>.
+ *  - Targeted cancellation: cancel(handle) removes only that caller.
+ *  - Underlying job is cancelled only when no handles remain.
+ *
+ *  Privacy / Safety:
+ *  - Never log tokens, full URLs, file paths, or exception.message.
  * =====================================================================
  */
+
+@file:Suppress("unused")
 
 package com.negi.surveys.utils
 
@@ -39,35 +35,29 @@ import android.os.SystemClock
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.AppLog
 import java.io.File
-import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.io.IOException
 import java.io.InterruptedIOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 
-/**
- * Manages single-flight initialization for heavy assets (e.g., model download).
- *
- * This object is designed to be called from ViewModels or other lifecycle-aware layers.
- * The "owner" caller performs the work; all other callers wait on the same [CompletableDeferred].
- *
- * Threading contract:
- * - All disk/network IO runs on Dispatchers.IO.
- * - Progress callbacks are marshalled to the main thread to be Compose/UI safe.
- */
 object HeavyInitializer {
 
     private const val TAG = "HeavyInitializer"
@@ -80,328 +70,391 @@ object HeavyInitializer {
 
     /** Network timeouts (per request). */
     private const val CONNECT_TIMEOUT_MS = 20_000
-    private const val READ_TIMEOUT_MS = 20_000
+    private const val READ_TIMEOUT_MS = 60_000
 
     /** Copy buffer. */
     private const val BUFFER_BYTES = 64 * 1024
 
-    /** Debug watchdog (does not cancel; improves observability). */
-    private const val WATCHDOG_MS = 30_000L
+    /**
+     * Stall watchdog:
+     * - Logs only when we see no "beat" for this long while still running.
+     * - Does not cancel; it is observability only.
+     */
+    private const val STALL_THRESHOLD_MS = 30_000L
+    private const val STALL_CHECK_INTERVAL_MS = 5_000L
+
+    /** Progress throttling per listener (protect Compose/UI). */
+    private const val PROGRESS_MIN_INTERVAL_MS = 200L
+    private const val PROGRESS_MIN_DELTA_BYTES = 1L * 1024L * 1024L // 1 MiB
 
     private val nextRunId = AtomicLong(1L)
+    private val nextGeneration = AtomicLong(1L)
+    private val nextHandleId = AtomicLong(1L)
+
+    /** Key -> in-flight operation */
+    private val flights = ConcurrentHashMap<String, InFlight>()
+
+    /** Process-wide scope for heavy work (IO). */
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     /**
-     * Tracks a single in-flight initialization for all concurrent callers.
+     * Per-caller handle used for targeted cancellation.
      */
-    private val inFlight = AtomicReference<CompletableDeferred<Result<File>>?>(null)
-
-    /**
-     * The Job of the "owner" coroutine currently performing the initialization.
-     *
-     * cancel() will cancel this Job.
-     */
-    @Volatile
-    private var runningJob: Job? = null
-
-    /**
-     * Returns true if a download/initialization is currently in progress.
-     */
-    @JvmStatic
-    fun isInFlight(): Boolean = inFlight.get() != null
-
-    /**
-     * Checks if a valid file already exists and (when possible) matches remote size.
-     *
-     * NOTE:
-     * - This is synchronous best-effort. If called on the main thread, it will NOT block on network;
-     *   it falls back to "local file exists" behavior.
-     */
-    fun isAlreadyComplete(
-        context: Context,
-        modelUrl: String,
-        hfToken: String?,
-        fileName: String
-    ): Boolean {
-        val dst = resolveSafeFileUnder(context.applicationContext.filesDir, fileName)
-        if (!dst.exists() || !dst.isFile || dst.length() <= 0L) return false
-
-        val isMain = Looper.myLooper() == Looper.getMainLooper()
-        if (isMain) return true
-
-        val token = hfToken?.takeIf { it.isNotBlank() }
-        val remoteLen = runCatching { headContentLengthForVerify(modelUrl, token) }.getOrNull()
-
-        return when {
-            remoteLen != null -> remoteLen == dst.length()
-            else -> true
-        }
+    class Handle internal constructor(
+        val key: String,
+        internal val handleId: Long,
+        internal val generation: Long,
+        internal val runId: Long,
+    ) {
+        override fun toString(): String = "HeavyInitHandle(key=$key, hid=$handleId, gen=$generation, run=$runId)"
     }
 
     /**
-     * Ensure that the model or asset is initialized, downloading it if needed.
-     *
-     * @param timeoutMs <= 0 means "no timeout".
+     * Returned by begin(): handle + shared deferred.
      */
-    suspend fun ensureInitialized(
+    data class Operation(
+        val handle: Handle,
+        val deferred: CompletableDeferred<Result<File>>,
+    )
+
+    /**
+     * Returns true if a keyed in-flight operation exists.
+     */
+    @JvmStatic
+    fun isInFlight(key: String): Boolean = flights.containsKey(key)
+
+    /**
+     * Start or join a keyed single-flight initialization.
+     *
+     * Returns immediately:
+     * - a per-caller [Handle] (for targeted cancellation)
+     * - a shared [deferred] that completes with Result<File>
+     */
+    fun begin(
         context: Context,
         modelUrl: String,
         hfToken: String?,
         fileName: String,
         timeoutMs: Long,
         forceFresh: Boolean,
-        onProgress: (downloaded: Long, total: Long?) -> Unit
-    ): Result<File> {
-        // Fast path: join existing in-flight work.
-        inFlight.get()?.let { return it.await() }
-
-        val deferred = CompletableDeferred<Result<File>>()
-        if (!inFlight.compareAndSet(null, deferred)) {
-            val existing = inFlight.get()
-            return (existing ?: deferred).await()
-        }
-
-        val runId = nextRunId.getAndIncrement()
-        val ownerJob = currentCoroutineContext()[Job]
-        runningJob = ownerJob
-
+        onProgress: (downloaded: Long, total: Long?) -> Unit,
+        key: String? = null,
+    ): Operation {
         val app = context.applicationContext
         val token = hfToken?.takeIf { it.isNotBlank() }
+        val stableKey = key ?: defaultKey(modelUrl = modelUrl, fileName = fileName)
 
-        val dir = app.filesDir
-        val finalFile = resolveSafeFileUnder(dir, fileName)
-
-        val tmpFile = resolveSafeFileUnder(dir, "$fileName.tmp")
-        val tmpPartFile = File(tmpFile.parentFile, tmpFile.name + ".part")
-        val tmpMetaFile = File(tmpFile.parentFile, tmpPartFile.name + ".meta")
-
-        val phaseRef = AtomicReference(Phase.INIT)
-        val mainProgress = MainThreadProgress(onProgress)
-
-        val watchdog = startWatchdog(runId, phaseRef)
-
-        try {
-            currentCoroutineContext().ensureActive()
-            phaseRef.set(Phase.PREPARE)
-
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-                runCatching { finalFile.delete() }
-            }
-
-            // Read meta first (best-effort) to validate resume safety.
-            val meta = readMetaIfPresent(tmpMetaFile)
-            if (!forceFresh) {
-                // If meta exists but does not match the current URL, discard partial.
-                if (meta != null && meta.url != modelUrl) {
-                    AppLog.w(TAG, "run=$runId meta url mismatch -> discard part/meta")
-                    runCatching { tmpPartFile.delete() }
-                    runCatching { tmpMetaFile.delete() }
-                }
-            }
-
-            phaseRef.set(Phase.HEAD_PROBE)
-
-            // HEAD probe (best-effort). If it fails, fall back to meta expectedLen.
-            val remoteLen: Long? = withContext(Dispatchers.IO) {
-                runCatching { headContentLength(modelUrl, token) }
-                    .onFailure { e -> AppLog.w(TAG, "run=$runId HEAD content-length failed (non-fatal)", e) }
-                    .getOrNull()
-                    ?.takeIf { it > 0L }
-            }
-
-            val meta2 = readMetaIfPresent(tmpMetaFile)
-            val expectedLen: Long? = (remoteLen ?: meta2?.expectedLen)?.takeIf { it > 0L }
-
-            phaseRef.set(Phase.CHECK_EXISTING)
-
-            if (!forceFresh && finalFile.exists() && finalFile.length() > 0L) {
-                val ok = when {
-                    expectedLen != null -> finalFile.length() == expectedLen
-                    else -> true
-                }
-                if (ok) {
-                    val len = finalFile.length()
-                    mainProgress.emit(len, expectedLen ?: len)
-                    deferred.complete(Result.success(finalFile))
-                    return deferred.await()
-                }
-            }
-
-            if (!forceFresh && tmpPartFile.exists() && tmpPartFile.length() > 0L) {
-                if (expectedLen != null && tmpPartFile.length() > expectedLen) {
-                    AppLog.w(TAG, "run=$runId part > expectedLen -> discard part/meta")
-                    runCatching { tmpPartFile.delete() }
-                    runCatching { tmpMetaFile.delete() }
-                }
-            }
-
-            val existingPartial = tmpPartFile.takeIf { it.exists() }?.length() ?: 0L
-
-            phaseRef.set(Phase.CHECK_SPACE)
-
-            if (expectedLen != null) {
-                val remaining = max(0L, expectedLen - existingPartial)
-                val needed = remaining + FREE_SPACE_MARGIN_BYTES
-                if (dir.usableSpace < needed) {
-                    val msg =
-                        "Not enough free space. needed=${needed}B (remaining=$remaining + margin), usable=${dir.usableSpace}B"
-                    deferred.complete(Result.failure(IOException(msg)))
-                    return deferred.await()
-                }
-            }
-
-            AppLog.i(
-                TAG,
-                "run=$runId start forceFresh=$forceFresh expectedLen=${expectedLen ?: -1L} existingPartial=$existingPartial"
-            )
-
-            val runDownload: suspend () -> Unit = {
-                currentCoroutineContext().ensureActive()
-
-                // Write meta that binds the partial to this URL and expected length.
-                runCatching { writeMeta(tmpMetaFile, modelUrl, expectedLen) }
-
-                phaseRef.set(Phase.DOWNLOAD)
-
-                downloadToPartFile(
-                    url = modelUrl,
-                    hfToken = token,
-                    partFile = tmpPartFile,
-                    expectedTotalLen = expectedLen,
-                    onProgress = { cur, total -> mainProgress.emit(cur, total) }
-                )
-
-                currentCoroutineContext().ensureActive()
-                phaseRef.set(Phase.PROMOTE_TMP)
-
-                if (tmpFile.exists()) runCatching { tmpFile.delete() }
-
-                if (!tmpPartFile.renameTo(tmpFile)) {
-                    // Copy fallback with best-effort fsync.
-                    tmpPartFile.inputStream().use { input ->
-                        FileOutputStream(tmpFile, false).use { fos ->
-                            input.copyTo(fos, BUFFER_BYTES)
-                            fos.flush()
-                            trySync(fos)
-                        }
-                    }
-                    runCatching { tmpPartFile.delete() }
-                }
-
-                currentCoroutineContext().ensureActive()
-            }
-
-            if (timeoutMs > 0L) {
-                withTimeout(timeoutMs) { runDownload() }
-            } else {
-                runDownload()
-            }
-
-            phaseRef.set(Phase.VERIFY_TMP)
-
-            if (expectedLen != null) {
-                val got = tmpFile.length()
-                if (got != expectedLen) {
-                    throw IOException("Downloaded size mismatch. expected=$expectedLen, got=$got")
-                }
-            }
-
-            phaseRef.set(Phase.REPLACE_FINAL)
-
-            replaceFinalAtomic(tmpFile, finalFile)
-            runCatching { tmpMetaFile.delete() }
-
-            val outLen = finalFile.length()
-            mainProgress.emit(outLen, expectedLen ?: outLen)
-
-            phaseRef.set(Phase.DONE_OK)
-            deferred.complete(Result.success(finalFile))
-
-        } catch (ce: CancellationException) {
-            AppLog.w(TAG, "run=$runId ensureInitialized: cancelled", ce)
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-            }
-            // Keep partial/meta for resume when forceFresh=false.
-            deferred.complete(Result.failure(IOException("Canceled", ce)))
-
-        } catch (ie: InterruptedIOException) {
-            AppLog.w(TAG, "run=$runId ensureInitialized: interrupted", ie)
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-            }
-            deferred.complete(Result.failure(IOException("Canceled", ie)))
-
-        } catch (te: TimeoutCancellationException) {
-            AppLog.w(TAG, "run=$runId ensureInitialized: timeout after ${timeoutMs}ms", te)
-            if (forceFresh) {
-                runCatching { tmpFile.delete() }
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-            }
-            // Keep partial/meta for resume when forceFresh=false.
-            deferred.complete(Result.failure(IOException("Timeout ($timeoutMs ms)", te)))
-
-        } catch (t: Throwable) {
-            val msg = userFriendlyMessage(t)
-            AppLog.w(TAG, "run=$runId Initialization error: $msg", t)
-
-            val keepPartial = !forceFresh && shouldKeepPartialForResume(t)
-
-            // If we want to resume, keep .part and .meta; otherwise purge.
-            runCatching { tmpFile.delete() }
-
-            if (!keepPartial) {
-                runCatching { tmpPartFile.delete() }
-                runCatching { tmpMetaFile.delete() }
-            } else {
-                AppLog.w(TAG, "run=$runId Keeping partial for resume (forceFresh=false)")
-            }
-
-            deferred.complete(Result.failure(IOException(msg, t)))
-
-        } finally {
-            stopWatchdog(watchdog)
-
-            if (inFlight.get() === deferred) {
-                inFlight.set(null)
-            }
-            runningJob = null
+        // Join existing flight if present.
+        flights[stableKey]?.let { existing ->
+            val handle = existing.newHandle(onProgress)
+            return Operation(handle = handle, deferred = existing.deferred)
         }
 
-        return deferred.await()
+        // Create new flight record.
+        val runId = nextRunId.getAndIncrement()
+        val gen = nextGeneration.getAndIncrement()
+        val deferred = CompletableDeferred<Result<File>>()
+        val ownerJob = SupervisorJob()
+        val phaseRef = AtomicReference(Phase.INIT)
+        val lastBeatMs = AtomicLong(SystemClock.elapsedRealtime())
+
+        val created = InFlight(
+            key = stableKey,
+            runId = runId,
+            generation = gen,
+            deferred = deferred,
+            ownerJob = ownerJob,
+            phaseRef = phaseRef,
+            lastBeatMs = lastBeatMs,
+        )
+
+        // Race-safe install.
+        val prev = flights.putIfAbsent(stableKey, created)
+        if (prev != null) {
+            val handle = prev.newHandle(onProgress)
+            return Operation(handle = handle, deferred = prev.deferred)
+        }
+
+        // Owner also gets a handle (registered listener).
+        val ownerHandle = created.newHandle(onProgress)
+
+        // Launch heavy work now.
+        scope.launch(ownerJob) {
+            val dir = app.filesDir
+            val finalFile = resolveSafeFileUnder(dir, fileName)
+
+            val tmpFile = resolveSafeFileUnder(dir, "$fileName.tmp")
+            val tmpPartFile = File(tmpFile.parentFile, tmpFile.name + ".part")
+            val tmpMetaFile = File(tmpFile.parentFile, tmpPartFile.name + ".meta")
+
+            val watchdogJob = startStallWatchdog(runId, gen, stableKey, phaseRef, lastBeatMs, ownerJob)
+
+            try {
+                currentCoroutineContext().ensureActive()
+                phaseRef.set(Phase.PREPARE)
+
+                if (forceFresh) {
+                    runCatching { tmpFile.delete() }
+                    runCatching { tmpPartFile.delete() }
+                    runCatching { tmpMetaFile.delete() }
+                    runCatching { finalFile.delete() }
+                }
+
+                // Validate resume safety using meta.
+                val meta = readMetaIfPresent(tmpMetaFile)
+                if (!forceFresh) {
+                    if (meta != null && meta.url != modelUrl) {
+                        AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' meta url mismatch -> discard part/meta")
+                        runCatching { tmpPartFile.delete() }
+                        runCatching { tmpMetaFile.delete() }
+                    }
+                }
+
+                phaseRef.set(Phase.HEAD_PROBE)
+
+                // HEAD probe (best-effort).
+                val remoteLen: Long? = withContext(Dispatchers.IO) {
+                    runCatching { headContentLength(modelUrl, token) }.getOrNull()?.takeIf { it > 0L }
+                }
+
+                val meta2 = readMetaIfPresent(tmpMetaFile)
+                val expectedLen: Long? = (remoteLen ?: meta2?.expectedLen)?.takeIf { it > 0L }
+
+                phaseRef.set(Phase.CHECK_EXISTING)
+
+                // Final already exists and is acceptable.
+                if (!forceFresh && finalFile.exists() && finalFile.isFile && finalFile.length() > 0L) {
+                    val ok = when {
+                        expectedLen != null -> finalFile.length() == expectedLen
+                        else -> true
+                    }
+                    if (ok) {
+                        val len = finalFile.length()
+                        created.emitProgress(len, expectedLen ?: len)
+                        deferred.complete(Result.success(finalFile))
+                        return@launch
+                    }
+                }
+
+                // Part sanity.
+                if (!forceFresh && tmpPartFile.exists() && tmpPartFile.length() > 0L) {
+                    if (expectedLen != null && tmpPartFile.length() > expectedLen) {
+                        AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' part > expectedLen -> discard part/meta")
+                        runCatching { tmpPartFile.delete() }
+                        runCatching { tmpMetaFile.delete() }
+                    }
+                }
+
+                val existingPartial = tmpPartFile.takeIf { it.exists() }?.length() ?: 0L
+
+                phaseRef.set(Phase.CHECK_SPACE)
+
+                // Space check (only when expectedLen known).
+                if (expectedLen != null) {
+                    val remaining = max(0L, expectedLen - existingPartial)
+                    val needed = remaining + FREE_SPACE_MARGIN_BYTES
+                    if (dir.usableSpace < needed) {
+                        deferred.complete(Result.failure(IOException("Not enough free space")))
+                        return@launch
+                    }
+                }
+
+                AppLog.i(
+                    TAG,
+                    "run=$runId gen=$gen key='$stableKey' start forceFresh=$forceFresh expectedLen=${expectedLen ?: -1L} existingPartial=$existingPartial"
+                )
+
+                val runDownload: suspend () -> Unit = {
+                    currentCoroutineContext().ensureActive()
+
+                    // Bind partial to url/expectedLen.
+                    runCatching { writeMeta(tmpMetaFile, modelUrl, expectedLen) }
+
+                    phaseRef.set(Phase.DOWNLOAD)
+
+                    downloadToPartFile(
+                        url = modelUrl,
+                        hfToken = token,
+                        partFile = tmpPartFile,
+                        expectedTotalLen = expectedLen,
+                        onProgress = { cur, total -> created.emitProgress(cur, total) }
+                    )
+
+                    currentCoroutineContext().ensureActive()
+                    phaseRef.set(Phase.PROMOTE_TMP)
+
+                    if (tmpFile.exists()) runCatching { tmpFile.delete() }
+
+                    if (!tmpPartFile.renameTo(tmpFile)) {
+                        tmpPartFile.inputStream().use { input ->
+                            FileOutputStream(tmpFile, false).use { fos ->
+                                input.copyTo(fos, BUFFER_BYTES)
+                                fos.flush()
+                                trySync(fos)
+                            }
+                        }
+                        runCatching { tmpPartFile.delete() }
+                    }
+                }
+
+                if (timeoutMs > 0L) {
+                    withTimeout(timeoutMs) { runDownload() }
+                } else {
+                    runDownload()
+                }
+
+                phaseRef.set(Phase.VERIFY_TMP)
+
+                if (expectedLen != null) {
+                    val got = tmpFile.length()
+                    if (got != expectedLen) throw IOException("Downloaded size mismatch")
+                }
+
+                phaseRef.set(Phase.REPLACE_FINAL)
+
+                replaceFinalAtomic(tmpFile, finalFile)
+                runCatching { tmpMetaFile.delete() }
+
+                val outLen = finalFile.length()
+                created.emitProgress(outLen, expectedLen ?: outLen)
+
+                phaseRef.set(Phase.DONE_OK)
+                deferred.complete(Result.success(finalFile))
+
+            } catch (ce: CancellationException) {
+                AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' cancelled type=${ce::class.java.simpleName}")
+                if (forceFresh) {
+                    runCatching { tmpFile.delete() }
+                    runCatching { tmpPartFile.delete() }
+                    runCatching { tmpMetaFile.delete() }
+                }
+                deferred.complete(Result.failure(IOException("Canceled", ce)))
+
+            } catch (ie: InterruptedIOException) {
+                AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' interrupted type=${ie::class.java.simpleName}")
+                if (forceFresh) {
+                    runCatching { tmpFile.delete() }
+                    runCatching { tmpPartFile.delete() }
+                    runCatching { tmpMetaFile.delete() }
+                }
+                deferred.complete(Result.failure(IOException("Canceled", ie)))
+
+            } catch (te: TimeoutCancellationException) {
+                AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' timeout after ${timeoutMs}ms")
+                if (forceFresh) {
+                    runCatching { tmpFile.delete() }
+                    runCatching { tmpPartFile.delete() }
+                    runCatching { tmpMetaFile.delete() }
+                }
+                deferred.complete(Result.failure(IOException("Timeout", te)))
+
+            } catch (t: Throwable) {
+                val safe = userFriendlyMessage(t)
+                AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' error: $safe type=${t::class.java.simpleName}")
+
+                val keepPartial = !forceFresh && shouldKeepPartialForResume(t)
+                runCatching { tmpFile.delete() }
+
+                if (!keepPartial) {
+                    runCatching { tmpPartFile.delete() }
+                    runCatching { tmpMetaFile.delete() }
+                } else {
+                    AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' keeping partial for resume")
+                }
+
+                deferred.complete(Result.failure(IOException(safe, t)))
+
+            } finally {
+                watchdogJob.cancel()
+                // Remove the flight record if still current.
+                flights[stableKey]?.let { cur ->
+                    if (cur.generation == gen && cur.deferred === deferred) {
+                        flights.remove(stableKey, cur)
+                    }
+                }
+                ownerJob.cancel()
+            }
+        }
+
+        return Operation(handle = ownerHandle, deferred = deferred)
     }
 
     /**
-     * Cancels any running initialization.
+     * Targeted cancel: cancels only this handle's participation.
+     * Underlying job is cancelled only when no handles remain.
      */
-    fun cancel() {
-        runningJob?.cancel(CancellationException("canceled by user"))
-        AppLog.w(TAG, "Initialization cancel requested.")
-    }
+    fun cancel(handle: Handle, reason: String = "cancel") {
+        val f = flights[handle.key]
+        if (f == null) {
+            AppLog.d(TAG, "cancel: no flight hid=${handle.handleId} reason='${sanitizeLabel(reason)}'")
+            return
+        }
+        if (f.generation != handle.generation) {
+            AppLog.d(TAG, "cancel: stale handle hid=${handle.handleId} activeGen=${f.generation} reason='${sanitizeLabel(reason)}'")
+            return
+        }
 
-    /**
-     * Clears all in-flight and debug state.
-     */
-    fun resetForDebug() {
-        val cur = inFlight.get()
-        cur?.complete(Result.failure(IOException("resetForDebug")))
-        inFlight.compareAndSet(cur, null)
+        // Remove progress listener first.
+        f.removeListener(handle.handleId)
 
-        runningJob?.cancel(CancellationException("resetForDebug"))
-        runningJob = null
-        AppLog.w(TAG, "resetForDebug(): cleared in-flight state")
+        val remaining = f.activeHandles.decrementAndGet().coerceAtLeast(0)
+        AppLog.d(
+            TAG,
+            "cancel: hid=${handle.handleId} run=${handle.runId} gen=${handle.generation} key='${handle.key}' reason='${sanitizeLabel(reason)}' remaining=$remaining phase=${f.phaseRef.get()}"
+        )
+
+        if (remaining == 0) {
+            f.ownerJob.cancel(CancellationException("canceled"))
+        }
     }
 
     // ---------------------------------------------------------------------
-    // Phase + watchdog (debug/observability)
+    // InFlight (internal)
     // ---------------------------------------------------------------------
+
+    private class InFlight(
+        val key: String,
+        val runId: Long,
+        val generation: Long,
+        val deferred: CompletableDeferred<Result<File>>,
+        val ownerJob: Job,
+        val phaseRef: AtomicReference<Phase>,
+        val lastBeatMs: AtomicLong,
+    ) {
+        val activeHandles = java.util.concurrent.atomic.AtomicInteger(0)
+        private val listeners = ConcurrentHashMap<Long, MainThreadProgress>()
+
+        fun newHandle(onProgress: (Long, Long?) -> Unit): Handle {
+            val hid = nextHandleId.getAndIncrement()
+            activeHandles.incrementAndGet()
+
+            listeners[hid] = MainThreadProgress(
+                onProgress = onProgress,
+                lastBeatMs = lastBeatMs,
+                minIntervalMs = PROGRESS_MIN_INTERVAL_MS,
+                minDeltaBytes = PROGRESS_MIN_DELTA_BYTES
+            )
+
+            return Handle(
+                key = key,
+                handleId = hid,
+                generation = generation,
+                runId = runId,
+            )
+        }
+
+        fun removeListener(handleId: Long) {
+            listeners.remove(handleId)
+        }
+
+        fun emitProgress(downloaded: Long, total: Long?) {
+            // Beat must be updated on every progress signal (independent of UI throttling).
+            lastBeatMs.set(SystemClock.elapsedRealtime())
+            for (p in listeners.values) {
+                p.emit(downloaded, total)
+            }
+        }
+    }
 
     private enum class Phase {
         INIT,
@@ -416,36 +469,44 @@ object HeavyInitializer {
         DONE_OK
     }
 
-    private data class WatchdogHandle(
-        val thread: Thread
-    )
-
-    private fun startWatchdog(runId: Long, phaseRef: AtomicReference<Phase>): WatchdogHandle {
-        val t0 = SystemClock.elapsedRealtime()
-        val th = Thread.currentThread()
-
-        val wd = Thread(
-            {
-                try {
-                    Thread.sleep(WATCHDOG_MS)
-                    val dt = SystemClock.elapsedRealtime() - t0
-                    AppLog.w(
-                        TAG,
-                        "run=$runId watchdog timeout after ${WATCHDOG_MS}ms elapsed=${dt}ms phase=${phaseRef.get()} state=${th.state}"
-                    )
-                } catch (_: InterruptedException) {
-                    // Stop silently.
-                }
-            },
-            "HeavyInit-Watchdog"
-        ).apply { isDaemon = true }
-
-        wd.start()
-        return WatchdogHandle(wd)
+    private fun defaultKey(modelUrl: String, fileName: String): String {
+        return "heavy|" + modelUrl.trim() + "|" + fileName.trim()
     }
 
-    private fun stopWatchdog(handle: WatchdogHandle) {
-        runCatching { handle.thread.interrupt() }
+    // ---------------------------------------------------------------------
+    // Stall watchdog (observability)
+    // ---------------------------------------------------------------------
+
+    private fun startStallWatchdog(
+        runId: Long,
+        gen: Long,
+        key: String,
+        phaseRef: AtomicReference<Phase>,
+        lastBeatMs: AtomicLong,
+        ownerJob: Job,
+    ): Job {
+        return scope.launch(Dispatchers.Default) {
+            var warnedAtMs = 0L
+            while (ownerJob.isActive) {
+                delay(STALL_CHECK_INTERVAL_MS)
+                val phase = phaseRef.get()
+                val now = SystemClock.elapsedRealtime()
+                val since = now - lastBeatMs.get()
+
+                val downloading = (phase == Phase.DOWNLOAD)
+                val stalled = downloading && since >= STALL_THRESHOLD_MS
+
+                if (stalled) {
+                    // Avoid spamming; warn at most once per threshold window.
+                    if (warnedAtMs == 0L || (now - warnedAtMs) >= STALL_THRESHOLD_MS) {
+                        warnedAtMs = now
+                        AppLog.w(TAG, "run=$runId gen=$gen key='$key' stall phase=$phase noBeatFor=${since}ms")
+                    }
+                } else {
+                    warnedAtMs = 0L
+                }
+            }
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -454,26 +515,23 @@ object HeavyInitializer {
 
     /**
      * Decide whether we should keep the partial file on failure to allow resume.
-     *
-     * Policy:
-     * - Keep on transient/network IO errors.
-     * - Discard on "integrity" errors (size mismatch, resume refused, etc.).
      */
     private fun shouldKeepPartialForResume(t: Throwable): Boolean {
-        val msg = (t.message ?: "").lowercase()
         if (t is InterruptedIOException) return true
+        if (t is TimeoutCancellationException) return true
+        if (t is CancellationException) return true
 
-        // Integrity-ish failures -> discard to avoid reusing corrupt partial.
+        val msg = (t.message ?: "").lowercase()
+
+        // Integrity-ish failures -> discard.
         if ("size mismatch" in msg) return false
         if ("downloaded size mismatch" in msg) return false
         if ("resume failed" in msg) return false
         if ("refused range" in msg) return false
         if ("416" in msg) return false
 
-        // HTTP failures can be transient; keep partial (resume later) unless integrity-specific.
-        if (t is IOException) return true
-
-        return false
+        // IO failures often transient -> keep.
+        return t is IOException
     }
 
     // ---------------------------------------------------------------------
@@ -551,13 +609,13 @@ object HeavyInitializer {
     // HEAD probe
     // ---------------------------------------------------------------------
 
-    private fun headContentLength(srcUrl: String, hfToken: String?): Long? =
-        headContentLengthForVerify(srcUrl, hfToken)
-
-    private fun headContentLengthForVerify(srcUrl: String, hfToken: String?): Long? {
+    private fun headContentLength(srcUrl: String, hfToken: String?): Long? {
         var current = srcUrl
+        var redirects = 0
 
-        repeat(MAX_REDIRECTS) {
+        while (true) {
+            if (redirects++ >= MAX_REDIRECTS) return null
+
             val u = URL(current)
             val conn = (u.openConnection() as HttpURLConnection).apply {
                 requestMethod = "HEAD"
@@ -581,7 +639,7 @@ object HeavyInitializer {
                 if (code in 300..399) {
                     val loc = conn.getHeaderField("Location") ?: return null
                     current = URL(u, loc).toString()
-                    return@repeat
+                    continue
                 }
 
                 if (code !in 200..299) return null
@@ -592,8 +650,6 @@ object HeavyInitializer {
                 conn.disconnect()
             }
         }
-
-        return null
     }
 
     // ---------------------------------------------------------------------
@@ -614,7 +670,7 @@ object HeavyInitializer {
             currentCoroutineContext().ensureActive()
 
             val u = URL(current)
-            val already = partFile.takeIf { it.exists() }?.length() ?: 0L
+            val existingLen = partFile.takeIf { it.exists() }?.length() ?: 0L
 
             val conn = (u.openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
@@ -630,8 +686,8 @@ object HeavyInitializer {
                 ) {
                     setRequestProperty("Authorization", "Bearer $hfToken")
                 }
-                if (already > 0L) {
-                    setRequestProperty("Range", "bytes=$already-")
+                if (existingLen > 0L) {
+                    setRequestProperty("Range", "bytes=$existingLen-")
                 }
             }
 
@@ -639,38 +695,42 @@ object HeavyInitializer {
                 val code = conn.responseCode
 
                 if (code in 300..399) {
-                    if (redirects++ >= MAX_REDIRECTS) throw IOException("Too many redirects.")
-                    val loc = conn.getHeaderField("Location") ?: throw IOException("Redirect with no Location header.")
+                    if (redirects++ >= MAX_REDIRECTS) throw IOException("Too many redirects")
+                    val loc = conn.getHeaderField("Location") ?: throw IOException("Redirect with no Location header")
                     current = URL(u, loc).toString()
                     continue
                 }
 
                 if (code == 416) {
-                    // Server refused the range. Discard partial to allow a clean restart next time.
                     runCatching { partFile.delete() }
-                    throw IOException("Resume failed (server refused range).")
+                    throw IOException("Resume failed (server refused range)")
                 }
 
                 if (code !in 200..299) {
                     throw IOException("HTTP $code")
                 }
 
+                // If we requested Range but server returned 200, treat it as full restart (truncate).
+                val resumeHonored = (existingLen > 0L && code == 206)
+                val already = if (resumeHonored) existingLen else 0L
+
                 val totalFromContentRange = parseTotalFromContentRange(conn.getHeaderField("Content-Range"))
                 val contentLen = conn.contentLengthLong.takeIf { it > 0L }
+
                 val total = expectedTotalLen ?: totalFromContentRange ?: run {
                     if (code == 206 && contentLen != null) already + contentLen else contentLen
                 }
 
                 partFile.parentFile?.mkdirs()
 
-                // Append only if we requested Range and server honored it (206).
-                val append = already > 0L && code == 206
+                val append = resumeHonored
                 val startWritten = if (append) already else 0L
 
                 conn.inputStream.use { input ->
                     FileOutputStream(partFile, append).use { fos ->
                         val buf = ByteArray(BUFFER_BYTES)
                         var written = startWritten
+
                         onProgressSafe(onProgress, written, total)
 
                         while (true) {
@@ -689,7 +749,7 @@ object HeavyInitializer {
                 if (total != null) {
                     val got = partFile.length()
                     if (got != total) {
-                        throw IOException("Downloaded size mismatch. expected=$total, got=$got")
+                        throw IOException("Downloaded size mismatch")
                     }
                 }
 
@@ -721,44 +781,69 @@ object HeavyInitializer {
     }
 
     // ---------------------------------------------------------------------
-    // Progress marshalling (UI-safe)
+    // Progress marshalling + throttling
     // ---------------------------------------------------------------------
 
     private class MainThreadProgress(
-        private val onProgress: (Long, Long?) -> Unit
+        private val onProgress: (Long, Long?) -> Unit,
+        private val lastBeatMs: AtomicLong,
+        private val minIntervalMs: Long,
+        private val minDeltaBytes: Long,
     ) {
         private val mainHandler: Handler? =
             if (Looper.getMainLooper() != null) Handler(Looper.getMainLooper()) else null
 
-        /** Emit progress on the main thread to keep Compose/UI updates safe. */
+        private val lastUiAt = AtomicLong(0L)
+        private val lastUiBytes = AtomicLong(0L)
+
+        /**
+         * Emit progress on the main thread with throttling.
+         *
+         * Important:
+         * - Beat update must NOT be throttled (stall watchdog depends on it).
+         */
         fun emit(downloaded: Long, total: Long?) {
+            lastBeatMs.set(SystemClock.elapsedRealtime())
+
+            val now = SystemClock.elapsedRealtime()
+            val prevAt = lastUiAt.get()
+            val prevB = lastUiBytes.get()
+
+            val timeOk = (now - prevAt) >= minIntervalMs
+            val bytesOk = (downloaded - prevB) >= minDeltaBytes
+
+            if (!(timeOk || bytesOk || prevAt == 0L)) return
+
+            lastUiAt.set(now)
+            lastUiBytes.set(downloaded)
+
             val h = mainHandler
             if (h == null || Looper.myLooper() == Looper.getMainLooper()) {
                 runCatching { onProgress(downloaded, total) }
                 return
             }
-            h.post {
-                runCatching { onProgress(downloaded, total) }
-            }
+            h.post { runCatching { onProgress(downloaded, total) } }
         }
     }
 
     // ---------------------------------------------------------------------
-    // Error messaging
+    // Error messaging (safe)
     // ---------------------------------------------------------------------
 
     private fun userFriendlyMessage(t: Throwable): String {
-        val raw = t.message ?: t::class.java.simpleName
-        val s = raw.lowercase()
+        // Never return exception.message directly (it may contain URLs).
+        val klass = t::class.java.simpleName.ifBlank { "Error" }
+        val raw = (t.message ?: "").lowercase()
 
         return when {
-            "unauthorized" in s || "401" in s -> "Authorization failed (HF token?)"
-            "forbidden" in s || "403" in s -> "Access denied (token/permissions?)"
-            "timeout" in s -> "Network timeout"
-            "space" in s -> "Not enough free space"
-            "content-range" in s || "416" in s || "refused range" in s -> "Resume failed (server refused range)"
-            "unknown host" in s || "dns" in s -> "Unknown host (check connectivity)"
-            else -> raw
+            "unauthorized" in raw || "401" in raw -> "Authorization failed (HF token?)"
+            "forbidden" in raw || "403" in raw -> "Access denied (token/permissions?)"
+            "timeout" in raw -> "Network timeout"
+            "space" in raw -> "Not enough free space"
+            "content-range" in raw || "416" in raw || "refused range" in raw -> "Resume failed (server refused range)"
+            "unknown host" in raw || "dns" in raw -> "Unknown host (check connectivity)"
+            "http 4" in raw || "http 5" in raw -> "HTTP error"
+            else -> klass
         }
     }
 
@@ -768,13 +853,13 @@ object HeavyInitializer {
 
     private fun replaceFinalAtomic(tmp: File, dst: File) {
         if (!tmp.exists() || tmp.length() <= 0L) {
-            throw IOException("Temp file missing or empty: ${tmp.absolutePath}")
+            throw IOException("Temp file missing or empty")
         }
 
         dst.parentFile?.mkdirs()
 
         if (dst.exists() && !dst.delete()) {
-            AppLog.w(TAG, "replaceFinalAtomic: failed to delete existing ${dst.absolutePath}")
+            AppLog.w(TAG, "replaceFinalAtomic: failed to delete existing destination")
         }
 
         if (tmp.renameTo(dst)) {
@@ -798,7 +883,19 @@ object HeavyInitializer {
         }
 
         if (!dst.exists() || dst.length() <= 0L) {
-            throw IOException("replaceFinalAtomic: destination invalid after copy: ${dst.absolutePath}")
+            throw IOException("replaceFinalAtomic: destination invalid after copy")
         }
+    }
+
+    private fun sanitizeLabel(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return "unknown"
+        val safe = buildString {
+            for (c in trimmed) {
+                if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') append(c)
+                if (length >= 32) break
+            }
+        }
+        return if (safe.isNotBlank()) safe else "unknown"
     }
 }

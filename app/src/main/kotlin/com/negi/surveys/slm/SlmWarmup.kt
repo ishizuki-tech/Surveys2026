@@ -22,8 +22,12 @@ import android.opengl.EGLSurface
 import android.os.Process
 import android.os.SystemClock
 import com.google.ai.edge.litertlm.Message
+import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
+import com.negi.surveys.logging.SafeLog
+import com.negi.surveys.slm.SlmWarmup.Const.CONFIG_ASSET_NAME
+import com.negi.surveys.slm.SlmWarmup.Const.TAG
 import java.io.Closeable
 import java.io.File
 import java.io.FileInputStream
@@ -705,16 +709,25 @@ object SlmWarmup {
 
     /* ───────────────────────────── Config + resolve ───────────────────────────── */
 
-    private fun getConfigBestEffort(appContext: Context): com.negi.surveys.config.SurveyConfig? {
+
+    private fun getConfigBestEffort(appContext: Context): SurveyConfig? {
+        // Prefer the process-installed config from SurveyAppRoot (single source of truth).
+        SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
+            cachedConfigRef.set(cfg)
+            return cfg
+        }
+
         val existing = cachedConfigRef.get()
         if (existing != null) return existing
 
         val loaded = runCatching {
-            SurveyConfigLoader.fromAssetsValidated(appContext.applicationContext, Const.CONFIG_ASSET_NAME)
+            SurveyConfigLoader.fromAssetsValidated(appContext.applicationContext, CONFIG_ASSET_NAME)
+        }.onFailure { t ->
+            SafeLog.e(TAG, "getConfigBestEffort: load failed type=${t::class.java.simpleName}", t)
         }.getOrNull()
 
-        if (loaded != null) cachedConfigRef.compareAndSet(null, loaded)
-        return cachedConfigRef.get()
+        if (loaded != null) cachedConfigRef.set(loaded)
+        return loaded
     }
 
     private fun resolveActiveOrBestEffort(appContext: Context): SlmModelResolver.Resolved? {

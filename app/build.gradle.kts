@@ -402,6 +402,7 @@ dependencies {
 
     // Tooling (preview/debug)
     implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.ui.text)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     // Icons

@@ -41,6 +41,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
@@ -68,6 +69,7 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import com.negi.surveys.chat.ChatStreamBridge
+import com.negi.surveys.chat.RepositoryI
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
@@ -80,7 +82,6 @@ import com.negi.surveys.nav.Home
 import com.negi.surveys.nav.Question
 import com.negi.surveys.nav.Review
 import com.negi.surveys.nav.SurveyStart
-import com.negi.surveys.ui.ChatQuestionScreen
 import com.negi.surveys.ui.DebugInfo
 import com.negi.surveys.ui.DebugRow
 import com.negi.surveys.ui.ExportScreen
@@ -88,6 +89,8 @@ import com.negi.surveys.ui.HomeScreen
 import com.negi.surveys.ui.LocalChatStreamBridge
 import com.negi.surveys.ui.ReviewScreen
 import com.negi.surveys.ui.SurveyStartScreen
+import com.negi.surveys.ui.chat.ChatQuestionScreen
+import com.negi.surveys.ui.chat.LocalRepositoryI
 import com.negi.surveys.utils.CompileState
 import com.negi.surveys.utils.ModelDownloadController
 import com.negi.surveys.utils.PrefetchState
@@ -113,6 +116,15 @@ private object SurveyAppRootInternal {
     const val TAG: String = "SurveyAppRoot"
     const val CONFIG_ASSET_NAME: String = "survey.yaml"
 
+    /**
+     * Hard guard for switching repository mode.
+     *
+     * NOTE:
+     * - Replace this with BuildConfig / SurveyConfig / dev menu toggle as needed.
+     * - MUST NOT depend on secrets / tokens.
+     */
+    private const val FORCE_FAKE_REPO: Boolean = false
+
     // ---------------------------------------------------------------------
     // Models / Formatting
     // ---------------------------------------------------------------------
@@ -120,7 +132,11 @@ private object SurveyAppRootInternal {
     sealed interface ConfigState {
         data object Loading : ConfigState
         data class Ready(val cfg: SurveyConfig) : ConfigState
-        data class Failed(val message: String) : ConfigState
+
+        /**
+         * Failure message MUST be safe (no exception.message).
+         */
+        data class Failed(val safeReason: String) : ConfigState
     }
 
     private data class WarmupUiFormat(
@@ -152,6 +168,23 @@ private object SurveyAppRootInternal {
         MODEL_PREFETCH_COMPILE
     }
 
+    /**
+     * Stable key for deciding whether the downloader should be recreated.
+     *
+     * Why:
+     * - ModelDownloadController is stateful (has a SupervisorJob scope).
+     * - We MUST recreate it when effective config changes, otherwise it stays "NotConfigured".
+     * - We also MUST close the previous instance to avoid scope leaks.
+     */
+    private data class ModelSpecKey(
+        val url: String,
+        val fileName: String,
+        val timeoutMs: Long,
+        val forceFreshOnStart: Boolean,
+        val uiThrottleMs: Long,
+        val uiMinDeltaBytes: Long,
+    )
+
     // ---------------------------------------------------------------------
     // Entry Point (Render)
     // ---------------------------------------------------------------------
@@ -176,7 +209,10 @@ private object SurveyAppRootInternal {
         }
 
         BackHandler(enabled = canPop) {
-            SafeLog.d(TAG, "BackHandler: pop requested stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}")
+            SafeLog.d(
+                TAG,
+                "BackHandler: pop requested stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}"
+            )
             nav.pop()
         }
 
@@ -199,8 +235,16 @@ private object SurveyAppRootInternal {
             )
         }
 
+        /**
+         * Stream bridge logger MUST NOT output raw content.
+         */
         val streamBridge: ChatStreamBridge = remember {
-            ChatStreamBridge(logger = { msg -> SafeLog.d("StreamBridge", msg) })
+            ChatStreamBridge(
+                logger = { msg ->
+                    // Log only metadata to avoid leaking prompts/answers/deltas.
+                    SafeLog.d("StreamBridge", "eventLen=${msg.length}")
+                }
+            )
         }
         val streamStats: ChatStreamBridge.StreamStats by streamBridge.stats.collectAsStateWithLifecycle()
 
@@ -222,15 +266,27 @@ private object SurveyAppRootInternal {
             value = res.fold(
                 onSuccess = {
                     SafeLog.i(TAG, "Config: ready in ${SystemClock.elapsedRealtime() - t0}ms")
+                    SurveyConfigLoader.installProcessConfig(it)
                     ConfigState.Ready(it)
                 },
-                onFailure = {
-                    SafeLog.e(TAG, "Config: failed in ${SystemClock.elapsedRealtime() - t0}ms", it)
-                    ConfigState.Failed("${it.javaClass.simpleName}(${it.message})")
+                onFailure = { t ->
+                    // NEVER log t.message; it can include sensitive content.
+                    SafeLog.e(
+                        TAG,
+                        "Config: failed in ${SystemClock.elapsedRealtime() - t0}ms type=${t::class.java.simpleName}",
+                        t
+                    )
+                    ConfigState.Failed(safeThrowableReason(t))
                 }
             )
         }
 
+        /**
+         * IMPORTANT:
+         * - We resolve ModelDownloadSpec whenever config is ready, regardless of repo mode.
+         * - This enables "FAKEでも設定は読む" observability (url/file present in logs/UI).
+         * - Actual download is still gated by onDeviceEnabled (see LaunchedEffect below).
+         */
         val modelSpec: ModelDownloadSpec? = remember(configState) {
             when (val st = configState) {
                 is ConfigState.Ready -> st.cfg.resolveModelDownloadSpec()
@@ -238,35 +294,108 @@ private object SurveyAppRootInternal {
             }
         }
 
-        LaunchedEffect(modelSpec) {
-            val spec = modelSpec
-            if (spec == null) {
-                SafeLog.w(TAG, "ModelSpec: null (config not ready or not configured)")
-                return@LaunchedEffect
+        /**
+         * Build a stable "effective key" that decides downloader recreation.
+         * Keep it strict: if URL/fileName changes, we MUST recreate.
+         */
+        val modelSpecKey: ModelSpecKey? = remember(modelSpec) {
+            val s = modelSpec ?: return@remember null
+            val url = s.modelUrl?.trim().orEmpty()
+            val name = s.fileName.trim().orEmpty()
+            if (url.isBlank() || name.isBlank()) return@remember null
+
+            ModelSpecKey(
+                url = url,
+                fileName = name,
+                timeoutMs = s.timeoutMs,
+                forceFreshOnStart = false, // Keep false by default for resume friendliness.
+                uiThrottleMs = s.uiThrottleMs,
+                uiMinDeltaBytes = s.uiMinDeltaBytes,
+            )
+        }
+
+        // -------------------------------------------------------------
+        // Repo Mode Decision
+        // -------------------------------------------------------------
+
+        /**
+         * Decide repository mode in one place.
+         *
+         * Assumption:
+         * - In production you will replace this with a safe config/build flag.
+         */
+        val repoMode: AppProcessServices.RepoMode = remember(configState) {
+            if (FORCE_FAKE_REPO) AppProcessServices.RepoMode.FAKE else AppProcessServices.RepoMode.ON_DEVICE
+        }
+
+        val onDeviceEnabled: Boolean = remember(repoMode) { repoMode == AppProcessServices.RepoMode.ON_DEVICE }
+
+        LaunchedEffect(repoMode) {
+            SafeLog.i(TAG, "RepoMode: $repoMode onDeviceEnabled=$onDeviceEnabled")
+        }
+
+        // -------------------------------------------------------------
+        // Process-scoped services (Repo/Warmup/Downloader)
+        // -------------------------------------------------------------
+
+        val repo: RepositoryI = remember(appContext, repoMode) {
+            AppProcessServices.repository(appContext, repoMode)
+        }
+
+        val warmup: WarmupController = remember(appContext, repoMode) {
+            AppProcessServices.warmupController(appContext, repoMode)
+        }
+
+        /**
+         * CRITICAL BEHAVIOR (requested):
+         * - Even in FAKE mode, we create a "configured" ModelDownloadController if config has URL/fileName.
+         * - This makes logs/UI reflect the real config ("FAKEでも設定は読む").
+         * - We still NEVER start downloads unless onDeviceEnabled == true (startup effects below).
+         */
+        val modelDownloader: ModelDownloadController = remember(appContext, repoMode, modelSpecKey) {
+            val specToUse: ModelDownloadSpec? = modelSpecKey?.let { modelSpec }
+
+            AppProcessServices.modelDownloader(appContext, spec = specToUse).also {
+                val key = modelSpecKey
+                SafeLog.i(
+                    TAG,
+                    "ModelDownloader: created onDevice=$onDeviceEnabled " +
+                            "cfgUrlPresent=${key != null} cfgFilePresent=${key != null} " +
+                            "specPresent=${specToUse != null}"
+                )
             }
-            // Do not log tokens. Keep it non-sensitive.
-            SafeLog.i(TAG, "ModelSpec: file=${spec.fileName} throttleMs=${spec.uiThrottleMs} minDelta=${spec.uiMinDeltaBytes}")
         }
 
-        // -------------------------------------------------------------
-        // Process-scoped controllers (AppProcessServices)
-        // -------------------------------------------------------------
-
-        val warmup: WarmupController = remember(appContext) { AppProcessServices.warmupController(appContext) }
-        val modelDownloader: ModelDownloadController = remember(appContext, modelSpec) {
-            AppProcessServices.modelDownloader(appContext, modelSpec)
+        DisposableEffect(modelDownloader) {
+            onDispose {
+                // Ensure no leaking scopes across recompositions / config swaps.
+                runCatching { modelDownloader.close() }
+                    .onFailure { t ->
+                        SafeLog.e(
+                            TAG,
+                            "ModelDownloader: close failed (non-fatal) type=${t::class.java.simpleName}",
+                            t
+                        )
+                    }
+            }
         }
 
+        // Collect state ONCE at root to avoid duplicate subscriptions.
         val rootPrefetchState: PrefetchState by warmup.prefetchState.collectAsStateWithLifecycle()
         val rootCompileState: CompileState by warmup.compileState.collectAsStateWithLifecycle()
-        val modelState: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
+        val rootModelState: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
+
+        // Keep stable state containers for NavEntry lambdas (avoid entryProvider recreation).
+        val rootModelStateState: State<ModelDownloadController.ModelState> = rememberUpdatedState(rootModelState)
+        val rootPrefetchStateState: State<PrefetchState> = rememberUpdatedState(rootPrefetchState)
+        val rootCompileStateState: State<CompileState> = rememberUpdatedState(rootCompileState)
 
         // -------------------------------------------------------------
         // Debug: log transitions (centralized)
         // -------------------------------------------------------------
 
         LogStateTransitions(
-            modelState = modelState,
+            modelState = rootModelState,
             prefetchState = rootPrefetchState,
             compileState = rootCompileState
         )
@@ -275,61 +404,114 @@ private object SurveyAppRootInternal {
         // Retry (model + warmup) unified
         // -------------------------------------------------------------
 
-        val launchRetryAll: (String) -> Unit = remember(scope, warmup, modelDownloader, modelSpec) {
-            { from ->
+        val launchRetryAll: (String) -> Unit = remember(
+            scope,
+            warmup,
+            modelDownloader,
+            modelSpecKey,
+            onDeviceEnabled
+        ) {
+            { fromRaw ->
+                val from = sanitizeLabel(fromRaw)
+
                 scope.launch(Dispatchers.IO) {
-                    val spec = modelSpec
-                    SafeLog.w(TAG, "RetryAll requested from=$from specNull=${spec == null}")
+                    val key = modelSpecKey
+                    SafeLog.w(
+                        TAG,
+                        "RetryAll requested from=$from onDevice=$onDeviceEnabled keyPresent=${key != null}"
+                    )
 
-                    runCatching { modelDownloader.resetForRetry(reason = "uiRetry:$from") }
-                        .onFailure { t -> SafeLog.e(TAG, "RetryAll: model resetForRetry failed (non-fatal)", t) }
+                    if (onDeviceEnabled) {
+                        runCatching { modelDownloader.resetForRetry(reason = "uiRetry") }
+                            .onFailure { t ->
+                                SafeLog.e(
+                                    TAG,
+                                    "RetryAll: model resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
+                                    t
+                                )
+                            }
 
-                    if (spec != null) {
-                        runCatching {
-                            modelDownloader.ensureModelOnce(timeoutMs = spec.timeoutMs, reason = "uiRetry:$from")
-                        }.onFailure { t ->
-                            SafeLog.e(TAG, "RetryAll: model ensure failed (uiRetry, non-fatal)", t)
+                        if (key != null) {
+                            runCatching {
+                                modelDownloader.ensureModelOnce(
+                                    timeoutMs = key.timeoutMs,
+                                    forceFresh = false,
+                                    reason = "uiRetry"
+                                )
+                            }.onFailure { t ->
+                                SafeLog.e(
+                                    TAG,
+                                    "RetryAll: model ensure failed (non-fatal) type=${t::class.java.simpleName}",
+                                    t
+                                )
+                            }
                         }
-                    } else {
-                        SafeLog.w(TAG, "RetryAll: modelSpec is null (config not ready)")
                     }
 
-                    runCatching { warmup.resetForRetry(reason = "uiRetry:$from") }
-                        .onFailure { t -> SafeLog.e(TAG, "RetryAll: warmup resetForRetry failed (non-fatal)", t) }
+                    runCatching { warmup.resetForRetry(reason = "uiRetry") }
+                        .onFailure { t ->
+                            SafeLog.e(
+                                TAG,
+                                "RetryAll: warmup resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
+                                t
+                            )
+                        }
 
-                    runCatching { warmup.requestCompileAfterPrefetch(reason = "uiRetry:$from") }
-                        .onFailure { t -> SafeLog.e(TAG, "RetryAll: warmup requestCompileAfterPrefetch failed (non-fatal)", t) }
+                    if (onDeviceEnabled) {
+                        runCatching { warmup.requestCompileAfterPrefetch(reason = "uiRetry") }
+                            .onFailure { t ->
+                                SafeLog.e(
+                                    TAG,
+                                    "RetryAll: warmup requestCompileAfterPrefetch failed (non-fatal) type=${t::class.java.simpleName}",
+                                    t
+                                )
+                            }
+                    }
                 }
             }
         }
 
         // -------------------------------------------------------------
         // Startup effects (single pipeline)
-        // - Wait first frame
-        // - Wait small delay
-        // - Then ensure model when spec exists
         // -------------------------------------------------------------
 
-        LaunchedEffect(modelSpec) {
-            val spec = modelSpec ?: return@LaunchedEffect
+        /**
+         * Start model download once config is ready and controller is created.
+         *
+         * Why:
+         * - Ensures we do not attempt downloads in FAKE mode.
+         * - Ensures we do not run using a stale "NotConfigured" controller.
+         */
+        LaunchedEffect(onDeviceEnabled, modelSpecKey, modelDownloader) {
+            if (!onDeviceEnabled) return@LaunchedEffect
+            val key = modelSpecKey ?: return@LaunchedEffect
 
+            // Wait for the first frame to avoid blocking initial composition.
             withFrameNanos { /* first frame */ }
             delay(150L)
 
             runCatching {
-                modelDownloader.ensureModelOnce(timeoutMs = spec.timeoutMs, reason = "startupAfterFirstFrame")
+                modelDownloader.ensureModelOnce(
+                    timeoutMs = key.timeoutMs,
+                    forceFresh = key.forceFreshOnStart,
+                    reason = "startupAfterFirstFrame"
+                )
             }.onFailure { t ->
-                SafeLog.e(TAG, "Model ensure failed (startupAfterFirstFrame, non-fatal)", t)
+                SafeLog.e(TAG, "Model ensure failed (non-fatal) type=${t::class.java.simpleName}", t)
             }
         }
 
-        LaunchedEffect(modelState) {
-            if (modelState is ModelDownloadController.ModelState.Ready) {
+        /**
+         * Warmup should start after model is ready.
+         */
+        LaunchedEffect(rootModelState, onDeviceEnabled, warmup) {
+            if (!onDeviceEnabled) return@LaunchedEffect
+            if (rootModelState is ModelDownloadController.ModelState.Ready) {
                 SafeLog.i(TAG, "Model Ready -> request warmup compileAfterPrefetch")
                 runCatching {
                     warmup.requestCompileAfterPrefetch(reason = "modelReady")
                 }.onFailure { t ->
-                    SafeLog.e(TAG, "Warmup request failed (non-fatal)", t)
+                    SafeLog.e(TAG, "Warmup request failed (non-fatal) type=${t::class.java.simpleName}", t)
                 }
             }
         }
@@ -345,14 +527,14 @@ private object SurveyAppRootInternal {
             format = WARMUP_UI_FORMAT_HOME
         )
 
-        val modelUiLabel: String = remember(modelState) { modelLabelForUi(modelState) }
+        val modelUiLabel: String = remember(rootModelState) { modelLabelForUi(rootModelState) }
         val buildLabel = remember { buildLabelSafe() }
 
         val cfgLabel = remember(configState) {
             when (val st = configState) {
                 is ConfigState.Loading -> "Loading"
                 is ConfigState.Ready -> "Ready"
-                is ConfigState.Failed -> "Failed (${st.message})"
+                is ConfigState.Failed -> "Failed (${st.safeReason})"
             }
         }
 
@@ -371,7 +553,9 @@ private object SurveyAppRootInternal {
             streamStats.ignoredCancel,
             modelUiLabel,
             prefetchUiLabel,
-            compileUiLabel
+            compileUiLabel,
+            repoMode,
+            onDeviceEnabled,
         ) {
             val ignoredTotal =
                 streamStats.ignoredDelta + streamStats.ignoredEnd + streamStats.ignoredError + streamStats.ignoredCancel
@@ -384,6 +568,8 @@ private object SurveyAppRootInternal {
                     DebugRow("SDK", Build.VERSION.SDK_INT.toString()),
                     DebugRow("Device", "${Build.MANUFACTURER}/${Build.MODEL}"),
                     DebugRow("Config", cfgLabel),
+                    DebugRow("RepoMode", repoMode.name),
+                    DebugRow("OnDevice", onDeviceEnabled.toString()),
                     DebugRow("Logs", logs.size.toString()),
                     DebugRow("ExportLen", exportText.length.toString()),
                     DebugRow("StreamActive", streamStats.activeSessionId.toString()),
@@ -392,6 +578,8 @@ private object SurveyAppRootInternal {
                     DebugRow("SLM Model", modelUiLabel),
                     DebugRow("SLM Prefetch", prefetchUiLabel),
                     DebugRow("SLM Compile", compileUiLabel),
+                    DebugRow("RepoId", System.identityHashCode(repo).toString()),
+                    DebugRow("RepoType", repo.javaClass.simpleName),
                 )
             )
         }
@@ -406,9 +594,11 @@ private object SurveyAppRootInternal {
         val uploadStatusState: State<String?> = rememberUpdatedState(uploadStatus)
 
         val startManualUpload: (String) -> Unit = remember(appContext, scope) {
-            { from ->
+            { fromRaw ->
+                val from = sanitizeLabel(fromRaw)
+
                 scope.launch(Dispatchers.IO) {
-                    val reason = "manual:$from"
+                    val reason = "manual"
                     val gh = runCatching {
                         if (GitHubLogUploadManager.isConfigured()) {
                             GitHubLogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
@@ -416,11 +606,11 @@ private object SurveyAppRootInternal {
                             null
                         }
                     }.onFailure { t ->
-                        SafeLog.e(TAG, "manual upload failed (non-fatal)", t)
+                        SafeLog.e(TAG, "manual upload failed (non-fatal) type=${t::class.java.simpleName}", t)
                     }.getOrNull()
 
                     val summary = "gh=" + (gh ?: "fail")
-                    SafeLog.i(TAG, "manual upload: $summary")
+                    SafeLog.i(TAG, "manual upload: $summary from=$from")
 
                     withContext(Dispatchers.Main) {
                         uploadStatus = summary
@@ -431,7 +621,7 @@ private object SurveyAppRootInternal {
         }
 
         // -------------------------------------------------------------
-        // Nav3 entries (dedup via GateOrContent)
+        // Nav3 entries (stable entryProvider + updated state refs)
         // -------------------------------------------------------------
 
         val entries: (NavKey) -> NavEntry<NavKey> = remember(
@@ -441,9 +631,12 @@ private object SurveyAppRootInternal {
             startManualUpload,
             debugInfoState,
             warmup,
-            modelDownloader,
             launchRetryAll,
             uploadStatusState,
+            onDeviceEnabled,
+            rootModelStateState,
+            rootPrefetchStateState,
+            rootCompileStateState,
         ) {
             entryProvider {
                 entry<Home> {
@@ -455,15 +648,12 @@ private object SurveyAppRootInternal {
                 }
 
                 entry<SurveyStart> {
-                    val ms: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
-                    val ps: PrefetchState by warmup.prefetchState.collectAsStateWithLifecycle()
-                    val cs: CompileState by warmup.compileState.collectAsStateWithLifecycle()
-
                     GateOrContent(
+                        enabled = onDeviceEnabled,
                         policy = GatePolicy.MODEL_ONLY,
-                        modelState = ms,
-                        prefetchState = ps,
-                        compileState = cs,
+                        modelState = rootModelStateState.value,
+                        prefetchState = rootPrefetchStateState.value,
+                        compileState = rootCompileStateState.value,
                         onBack = { nav.pop() },
                         onRetryAll = { launchRetryAll("surveyStartGate") },
                     ) {
@@ -479,17 +669,14 @@ private object SurveyAppRootInternal {
                 entry<Question> { key ->
                     val prompt = prompts[key.id] ?: "Question prompt for ${key.id} (placeholder)"
 
-                    val ms: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
-                    val ps: PrefetchState by warmup.prefetchState.collectAsStateWithLifecycle()
-                    val cs: CompileState by warmup.compileState.collectAsStateWithLifecycle()
-
                     GateOrContent(
+                        enabled = onDeviceEnabled,
                         policy = GatePolicy.MODEL_PREFETCH_COMPILE,
-                        modelState = ms,
-                        prefetchState = ps,
-                        compileState = cs,
+                        modelState = rootModelStateState.value,
+                        prefetchState = rootPrefetchStateState.value,
+                        compileState = rootCompileStateState.value,
                         onBack = { nav.pop() },
-                        onRetryAll = { launchRetryAll("questionGate:${key.id}") },
+                        onRetryAll = { launchRetryAll("questionGate") },
                     ) {
                         ChatQuestionScreen(
                             questionId = key.id,
@@ -548,8 +735,10 @@ private object SurveyAppRootInternal {
                     .fillMaxSize()
                     .padding(innerPadding)
             ) {
-                // NOTE: SlmWarmupEntry is intentionally NOT used.
-                CompositionLocalProvider(LocalChatStreamBridge provides streamBridge) {
+                CompositionLocalProvider(
+                    LocalChatStreamBridge provides streamBridge,
+                    LocalRepositoryI provides repo,
+                ) {
                     NavDisplay(
                         backStack = backStack,
                         entryProvider = entries,
@@ -566,6 +755,7 @@ private object SurveyAppRootInternal {
 
     @Composable
     private fun GateOrContent(
+        enabled: Boolean,
         policy: GatePolicy,
         modelState: ModelDownloadController.ModelState,
         prefetchState: PrefetchState,
@@ -574,6 +764,12 @@ private object SurveyAppRootInternal {
         onRetryAll: () -> Unit,
         content: @Composable () -> Unit,
     ) {
+        // Fake/Server mode MUST NOT block on local model readiness.
+        if (!enabled) {
+            content()
+            return
+        }
+
         val modelBlocking = modelState !is ModelDownloadController.ModelState.Ready
         val prefetchBusy = isPrefetchInProgress(prefetchState)
         val compileBusy = compileState is CompileState.WaitingForPrefetch || compileState is CompileState.Compiling
@@ -610,8 +806,9 @@ private object SurveyAppRootInternal {
     ) {
         val prefetchInProgress = isPrefetchInProgress(prefetchState)
         val compileInProgress = compileState is CompileState.WaitingForPrefetch || compileState is CompileState.Compiling
-        val modelInProgress = modelState is ModelDownloadController.ModelState.Checking ||
-                modelState is ModelDownloadController.ModelState.Downloading
+        val modelInProgress =
+            modelState is ModelDownloadController.ModelState.Checking ||
+                    modelState is ModelDownloadController.ModelState.Downloading
 
         val nowMs = rememberWarmupUiNowMs(
             inProgress = modelInProgress || prefetchInProgress || compileInProgress,
@@ -632,9 +829,21 @@ private object SurveyAppRootInternal {
         val primary = remember(modelState, prefetchState, compileState, prefetchElapsedMs, compileElapsedMs) {
             when {
                 modelState !is ModelDownloadController.ModelState.Ready -> modelLabelForUi(modelState)
-                prefetchInProgress -> prefetchLabelForUi(prefetchState, elapsedMs = prefetchElapsedMs, format = WARMUP_UI_FORMAT_GATE)
-                compileState is CompileState.WaitingForPrefetch -> compileLabelForUi(compileState, elapsedMs = compileElapsedMs, format = WARMUP_UI_FORMAT_GATE)
-                compileState is CompileState.Compiling -> compileLabelForUi(compileState, elapsedMs = compileElapsedMs, format = WARMUP_UI_FORMAT_GATE)
+                prefetchInProgress -> prefetchLabelForUi(
+                    prefetchState,
+                    elapsedMs = prefetchElapsedMs,
+                    format = WARMUP_UI_FORMAT_GATE
+                )
+                compileState is CompileState.WaitingForPrefetch -> compileLabelForUi(
+                    compileState,
+                    elapsedMs = compileElapsedMs,
+                    format = WARMUP_UI_FORMAT_GATE
+                )
+                compileState is CompileState.Compiling -> compileLabelForUi(
+                    compileState,
+                    elapsedMs = compileElapsedMs,
+                    format = WARMUP_UI_FORMAT_GATE
+                )
                 else -> WARMUP_UI_FORMAT_GATE.idleLabel
             }
         }
@@ -681,9 +890,9 @@ private object SurveyAppRootInternal {
                         is ModelDownloadController.ModelState.Checking ->
                             "Checking local model file…"
                         is ModelDownloadController.ModelState.NotConfigured ->
-                            "Model URL is not configured in SurveyConfig (model_defaults.default_model_url)."
+                            "Model URL is not configured in SurveyConfig."
                         is ModelDownloadController.ModelState.Failed ->
-                            "Download failed. Check connectivity / token / URL."
+                            "Download failed. Check connectivity / credentials / configuration."
                         is ModelDownloadController.ModelState.Cancelled ->
                             "Download cancelled."
                         else -> when (compileState) {
@@ -850,14 +1059,16 @@ private object SurveyAppRootInternal {
             is ModelDownloadController.ModelState.Downloading -> {
                 val total = state.total
                 if (total != null && total > 0L) {
-                    val pct = ((state.downloaded.toDouble() / total.toDouble()) * 100.0).toInt().coerceIn(0, 100)
-                    "Downloading ${pct}% (${state.downloaded}/${total}B) ${formatElapsed(state.elapsedMs)}"
+                    val pct = ((state.downloaded.toDouble() / total.toDouble()) * 100.0)
+                        .toInt()
+                        .coerceIn(0, 100)
+                    "Downloading ${pct}% ${formatElapsed(state.elapsedMs)}"
                 } else {
-                    "Downloading ${state.downloaded}B ${formatElapsed(state.elapsedMs)}"
+                    "Downloading ${formatElapsed(state.elapsedMs)}"
                 }
             }
-            is ModelDownloadController.ModelState.Ready -> "Ready (${state.file.name})"
-            is ModelDownloadController.ModelState.Failed -> "Failed (${state.message})"
+            is ModelDownloadController.ModelState.Ready -> "Ready"
+            is ModelDownloadController.ModelState.Failed -> "Failed"
             is ModelDownloadController.ModelState.Cancelled -> "Cancelled"
         }
     }
@@ -981,5 +1192,33 @@ private object SurveyAppRootInternal {
         val m = (ms / 60_000L)
         val s = (ms / 1_000L) % 60
         return String.format(Locale.US, "%dm %02ds", m, s)
+    }
+
+    /**
+     * Returns a safe, non-sensitive failure reason.
+     *
+     * IMPORTANT:
+     * - Do NOT include exception.message.
+     */
+    private fun safeThrowableReason(t: Throwable): String {
+        return t::class.java.simpleName.ifBlank { "Error" }
+    }
+
+    /**
+     * Sanitizes a short label for logs/metrics.
+     *
+     * Notes:
+     * - Avoids leaking arbitrary user-derived strings into logs.
+     */
+    private fun sanitizeLabel(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return "unknown"
+        val safe = buildString {
+            for (c in trimmed) {
+                if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') append(c)
+                if (length >= 32) break
+            }
+        }
+        return if (safe.isNotBlank()) safe else "unknown"
     }
 }
