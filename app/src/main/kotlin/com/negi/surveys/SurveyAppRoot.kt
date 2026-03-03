@@ -114,7 +114,6 @@ private object SurveyAppRootInternal {
     // ---------------------------------------------------------------------
 
     const val TAG: String = "SurveyAppRoot"
-    const val CONFIG_ASSET_NAME: String = "survey.yaml"
 
     /**
      * Hard guard for switching repository mode.
@@ -124,6 +123,16 @@ private object SurveyAppRootInternal {
      * - MUST NOT depend on secrets / tokens.
      */
     private const val FORCE_FAKE_REPO: Boolean = false
+
+    /**
+     * How long the UI should wait for Application-installed config to appear.
+     *
+     * Why:
+     * - In most cases, SurveyApplication installs config before first composition.
+     * - However, there are edge cases where Compose starts before install is visible.
+     */
+    private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
+    private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
 
     // ---------------------------------------------------------------------
     // Models / Formatting
@@ -249,7 +258,7 @@ private object SurveyAppRootInternal {
         val streamStats: ChatStreamBridge.StreamStats by streamBridge.stats.collectAsStateWithLifecycle()
 
         // -------------------------------------------------------------
-        // Config + ModelSpec
+        // Config (installed-only, Application-owned)
         // -------------------------------------------------------------
 
         val configState: ConfigState by produceState<ConfigState>(
@@ -257,35 +266,31 @@ private object SurveyAppRootInternal {
             key1 = appContext
         ) {
             val t0 = SystemClock.elapsedRealtime()
-            SafeLog.i(TAG, "Config: loading asset=$CONFIG_ASSET_NAME")
+            SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
 
-            val res = withContext(Dispatchers.IO) {
-                runCatching { SurveyConfigLoader.fromAssetsValidated(appContext, CONFIG_ASSET_NAME) }
+            val deadline = t0 + INSTALLED_CONFIG_WAIT_MS
+            var cfg: SurveyConfig? = null
+
+            while (SystemClock.elapsedRealtime() < deadline && cfg == null) {
+                cfg = SurveyConfigLoader.getInstalledConfigOrNull()
+                if (cfg != null) break
+                delay(INSTALLED_CONFIG_POLL_MS)
             }
 
-            value = res.fold(
-                onSuccess = {
-                    SafeLog.i(TAG, "Config: ready in ${SystemClock.elapsedRealtime() - t0}ms")
-                    SurveyConfigLoader.installProcessConfig(it)
-                    ConfigState.Ready(it)
-                },
-                onFailure = { t ->
-                    // NEVER log t.message; it can include sensitive content.
-                    SafeLog.e(
-                        TAG,
-                        "Config: failed in ${SystemClock.elapsedRealtime() - t0}ms type=${t::class.java.simpleName}",
-                        t
-                    )
-                    ConfigState.Failed(safeThrowableReason(t))
-                }
-            )
+            if (cfg != null) {
+                val dt = SystemClock.elapsedRealtime() - t0
+                SafeLog.i(TAG, "Config: ready (installed) in ${dt}ms")
+                value = ConfigState.Ready(cfg)
+            } else {
+                val dt = SystemClock.elapsedRealtime() - t0
+                SafeLog.e(TAG, "Config: missing (installed config not found) after ${dt}ms")
+                value = ConfigState.Failed("InstalledConfigMissing")
+            }
         }
 
         /**
-         * IMPORTANT:
-         * - We resolve ModelDownloadSpec whenever config is ready, regardless of repo mode.
-         * - This enables "FAKEでも設定は読む" observability (url/file present in logs/UI).
-         * - Actual download is still gated by onDeviceEnabled (see LaunchedEffect below).
+         * Resolve ModelDownloadSpec only when config is ready.
+         * No casts, no assumptions.
          */
         val modelSpec: ModelDownloadSpec? = remember(configState) {
             when (val st = configState) {
@@ -318,12 +323,6 @@ private object SurveyAppRootInternal {
         // Repo Mode Decision
         // -------------------------------------------------------------
 
-        /**
-         * Decide repository mode in one place.
-         *
-         * Assumption:
-         * - In production you will replace this with a safe config/build flag.
-         */
         val repoMode: AppProcessServices.RepoMode = remember(configState) {
             if (FORCE_FAKE_REPO) AppProcessServices.RepoMode.FAKE else AppProcessServices.RepoMode.ON_DEVICE
         }
@@ -347,10 +346,8 @@ private object SurveyAppRootInternal {
         }
 
         /**
-         * CRITICAL BEHAVIOR (requested):
-         * - Even in FAKE mode, we create a "configured" ModelDownloadController if config has URL/fileName.
-         * - This makes logs/UI reflect the real config ("FAKEでも設定は読む").
-         * - We still NEVER start downloads unless onDeviceEnabled == true (startup effects below).
+         * Even in FAKE mode, we create a "configured" ModelDownloadController if config has URL/fileName.
+         * We still NEVER start downloads unless onDeviceEnabled == true (startup effects below).
          */
         val modelDownloader: ModelDownloadController = remember(appContext, repoMode, modelSpecKey) {
             val specToUse: ModelDownloadSpec? = modelSpecKey?.let { modelSpec }
@@ -360,8 +357,7 @@ private object SurveyAppRootInternal {
                 SafeLog.i(
                     TAG,
                     "ModelDownloader: created onDevice=$onDeviceEnabled " +
-                            "cfgUrlPresent=${key != null} cfgFilePresent=${key != null} " +
-                            "specPresent=${specToUse != null}"
+                            "cfgUrlPresent=${key != null} cfgFilePresent=${key != null} specPresent=${specToUse != null}"
                 )
             }
         }
@@ -476,11 +472,9 @@ private object SurveyAppRootInternal {
         // -------------------------------------------------------------
 
         /**
-         * Start model download once config is ready and controller is created.
-         *
-         * Why:
-         * - Ensures we do not attempt downloads in FAKE mode.
-         * - Ensures we do not run using a stale "NotConfigured" controller.
+         * Start model download only when:
+         * - on-device mode is enabled
+         * - config is Ready (modelSpecKey present)
          */
         LaunchedEffect(onDeviceEnabled, modelSpecKey, modelDownloader) {
             if (!onDeviceEnabled) return@LaunchedEffect
@@ -1192,16 +1186,6 @@ private object SurveyAppRootInternal {
         val m = (ms / 60_000L)
         val s = (ms / 1_000L) % 60
         return String.format(Locale.US, "%dm %02ds", m, s)
-    }
-
-    /**
-     * Returns a safe, non-sensitive failure reason.
-     *
-     * IMPORTANT:
-     * - Do NOT include exception.message.
-     */
-    private fun safeThrowableReason(t: Throwable): String {
-        return t::class.java.simpleName.ifBlank { "Error" }
     }
 
     /**

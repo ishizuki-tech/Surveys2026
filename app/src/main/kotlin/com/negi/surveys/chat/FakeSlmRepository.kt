@@ -457,7 +457,7 @@ $userPrompt
             }
 
             awaitClose {
-                producer?.cancel()
+                producer.cancel()
             }
         }
     }
