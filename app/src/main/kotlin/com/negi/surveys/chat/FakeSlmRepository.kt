@@ -13,28 +13,32 @@
 
 package com.negi.surveys.chat
 
+import com.negi.surveys.chat.collectToTextResultWithBudget
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
-import kotlinx.coroutines.flow.flow
+import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.flow.emptyFlow
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 /**
- * A minimal fake "SLM" repository that returns streaming chunks as Flow<String>.
+ * A fake "SLM" repository that can mimic both:
+ * - One-step generation: stream natural text output.
+ * - Two-step pipeline (real-like):
+ *    Step 1 (Eval, internal): score judgment JSON.
+ *    Step 2 (Main, streamed): follow-up question JSON (or ACCEPTED).
  *
  * Goals:
  * - Behave like a streaming LLM backend (delta chunk stream).
- * - Produce deterministic JSON-only outputs compatible with validator flows.
- * - Support BOTH follow-up formats used across SmallSteps:
- *   (A) Single follow-up:
- *       FOLLOW_UP_ANSWER_BEGIN ... FOLLOW_UP_ANSWER_END
- *   (B) Multi follow-up history:
- *       FOLLOW_UP_HISTORY_BEGIN ... FOLLOW_UP_HISTORY_END
- *       with lines like "FOLLOW_UP_1_A: ..."
- *
- * Test hooks:
- * - requestSetupDelayMs: simulate slow request preparation (before Flow is returned).
- * - firstChunkDelayMs: simulate time-to-first-token (delay before first emit).
- * - throwOnRequestSetup / throwAfterEmits: inject failures to exercise ERROR paths.
+ * - Provide deterministic behaviors for testing pipelines.
+ * - Keep prompt building explicit and readable (EvalPrompt vs FollowUpPrompt).
  *
  * Privacy:
  * - Do NOT log raw prompts/answers. If you pass [logger], keep it metadata-only.
@@ -45,50 +49,67 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
         /** Delay before returning the Flow to simulate request preparation latency. */
         val requestSetupDelayMs: Long = 0L,
 
-        /**
-         * Delay before emitting the first chunk to simulate time-to-first-token latency.
-         *
-         * Notes:
-         * - This differs from [requestSetupDelayMs]. It affects the first `emit(...)` timing.
-         * - Useful for reproducing cold start / warmup behavior in streaming pipelines.
-         */
-        val firstChunkDelayMs: Long = 3_000L,
+        /** Delay before emitting the first chunk to simulate time-to-first-token latency. */
+        val firstChunkDelayMs: Long = 0L,
+
+        /** Delay per chunk to simulate streaming latency. */
+        val chunkDelayMs: Long = 0L,
+
+        /** Chunk size in characters emitted per Flow emission. Must be >= 1. */
+        val chunkSizeChars: Int = 32,
 
         /** If true, throw during request setup (before Flow is returned). */
         val throwOnRequestSetup: Boolean = false,
 
-        /** If >= 0, throw after emitting this many chunks (0 => throw before first emit). */
+        /**
+         * If >= 0, throw after emitting this many chunks (0 => throw before first emit).
+         *
+         * Notes:
+         * - Applies to the *returned* stream (one-step output or step-2 stream).
+         */
         val throwAfterEmits: Int = -1,
 
-        /** Delay per chunk to simulate streaming latency. */
-        val chunkDelayMs: Long = 30L,
+        /**
+         * If true, inject failure into the internal Step-1 Eval collection stream.
+         *
+         * Notes:
+         * - Useful to test: eval timeout / eval failure / fallback behaviors.
+         */
+        val throwOnEvalInternal: Boolean = false,
 
-        /** Chunk size in characters emitted per Flow emission. Must be >= 1. */
-        val chunkSizeChars: Int = 2,
+        /** If >= 0, throw after this many chunks in the internal Eval stream. */
+        val throwAfterEmitsOnEvalInternal: Int = -1,
 
         /**
-         * If true, sometimes prefix output with non-JSON text to test validator robustness.
+         * If true, sometimes prefix output with non-JSON text to test robustness.
          *
-         * Implementation detail:
-         * - We decide "sometimes" deterministically using a prompt fingerprint,
-         *   so tests are reproducible across runs.
+         * Deterministic using a seed fingerprint, so tests are reproducible.
          */
         val occasionallyPrependNonJson: Boolean = false,
 
         /** Add a trailing newline after JSON. */
         val appendTrailingNewline: Boolean = true,
 
-        /** Minimum chars for main answer to avoid needing follow-ups. */
-        val minMainAnswerChars: Int = 12,
+        /** Enable the repository-level two-step behavior like real SlmRepository. */
+        val enableTwoStepEval: Boolean = true,
 
-        /** Base required follow-ups when main answer is short. */
-        val requiredFollowUps: Int = 3,
+        /** Reset conversation per request (no-op in fake, but logged as meta). */
+        val resetConversationEachRequest: Boolean = true,
 
-        /** Minimum chars per follow-up answer to be considered "useful". */
-        val minFollowUpAnswerChars: Int = 12,
+        /** Step-1 Eval: timeout budget for internal collection. */
+        val evalTimeoutMs: Long = 8_000L,
+
+        /** Step-1 Eval: max chars collected. */
+        val evalMaxChars: Int = 8_192,
+
+        /** Step-2 FollowUp: max chars for streamed JSON (defensive). */
+        val followUpMaxChars: Int = 4_096,
+
+        /** Score threshold: score >= threshold => ACCEPTED. */
+        val acceptScoreThreshold: Int = 70,
 
         /** Optional metadata logger (do not log raw prompts/answers). */
-        val logger: ((String) -> Unit)? = null
+        val logger: ((String) -> Unit)? = null,
     ) {
         /** Normalize config to safe operational values. */
         fun normalized(): Config {
@@ -97,9 +118,10 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
                 firstChunkDelayMs = firstChunkDelayMs.coerceAtLeast(0L),
                 chunkDelayMs = chunkDelayMs.coerceAtLeast(0L),
                 chunkSizeChars = chunkSizeChars.coerceAtLeast(1),
-                minMainAnswerChars = minMainAnswerChars.coerceAtLeast(1),
-                requiredFollowUps = requiredFollowUps.coerceAtLeast(1),
-                minFollowUpAnswerChars = minFollowUpAnswerChars.coerceAtLeast(1)
+                evalTimeoutMs = evalTimeoutMs.coerceAtLeast(1L),
+                evalMaxChars = evalMaxChars.coerceAtLeast(128),
+                followUpMaxChars = followUpMaxChars.coerceAtLeast(128),
+                acceptScoreThreshold = acceptScoreThreshold.coerceIn(0, 100),
             )
         }
     }
@@ -107,50 +129,24 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
     private val cfg: Config = config.normalized()
 
     override fun buildPrompt(userPrompt: String): String {
-        return buildPromptInternal(userPrompt = userPrompt, phase = null)
+        // Compatibility: legacy callers may use this.
+        return PromptBuilder.buildAnswerLikePrompt(userPrompt = userPrompt, phase = null)
     }
 
     override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
         // IMPORTANT:
         // - Do NOT introduce a nullable overload (PromptPhase?) because JVM signatures collide.
-        return buildPromptInternal(userPrompt = userPrompt, phase = phase)
-    }
-
-    /**
-     * Internal builder that may accept null.
-     *
-     * IMPORTANT:
-     * - Keep this PRIVATE to avoid JVM signature clashes with public overloads.
-     */
-    private fun buildPromptInternal(userPrompt: String, phase: PromptPhase?): String {
-        val phaseLine = phase?.let {
-            val tag = when (it) {
-                PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
-                PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
-            }
-            "\nPHASE=$tag\n"
-        }.orEmpty()
-
-        // NOTE:
-        // - This wrapper simulates a "system + user" envelope.
-        // - Keep it strict: JSON-only, single object, no analysis.
-        return """
-SYSTEM:
-You are a JSON-only assistant.
-Output MUST be exactly one JSON object.
-No markdown. No extra text. No analysis.$phaseLine
-USER:
-$userPrompt
-""".trimIndent()
+        return PromptBuilder.buildAnswerLikePrompt(userPrompt = userPrompt, phase = phase)
     }
 
     override suspend fun request(prompt: String): Flow<String> {
-        val promptLen = prompt.length
+        val raw = prompt.trim()
+        if (raw.isBlank()) return emptyFlow()
+
         val setupDelay = cfg.requestSetupDelayMs
         val firstDelay = cfg.firstChunkDelayMs
-
         cfg.logger?.invoke(
-            "FakeSlmRepository.request: setup (chars=$promptLen setupDelayMs=$setupDelay firstChunkDelayMs=$firstDelay)"
+            "FakeSlmRepository.request: setup (chars=${raw.length} setupDelayMs=$setupDelay firstChunkDelayMs=$firstDelay twoStep=${cfg.enableTwoStepEval})",
         )
 
         if (cfg.throwOnRequestSetup) {
@@ -159,229 +155,543 @@ $userPrompt
 
         if (setupDelay > 0L) delay(setupDelay)
 
-        val safeChunkSize = cfg.chunkSizeChars
-        val safeChunkDelay = cfg.chunkDelayMs
-        val throwAfter = cfg.throwAfterEmits
-
-        return flow {
-            cfg.logger?.invoke("FakeSlmRepository.request: stream start")
-
-            val phase = detectPhase(prompt)
-
-            // Extract the main answer from delimiter blocks (multi-line safe).
-            val mainAnswer = extractBlockAny(
-                text = prompt,
-                candidates = listOf(
-                    MarkerPair("MAIN_ANSWER_BEGIN", "MAIN_ANSWER_END")
-                )
-            ).orEmpty()
-
-            // Extract follow-ups from either:
-            // (A) history block or (B) single follow-up block.
-            val followUpHistory = extractBlockAny(
-                text = prompt,
-                candidates = listOf(
-                    MarkerPair("FOLLOW_UP_HISTORY_BEGIN", "FOLLOW_UP_HISTORY_END")
-                )
+        // If an explicit PHASE marker exists, behave like "validator-style" request and stream JSON directly.
+        // This keeps old tests working.
+        val explicitPhase = detectPhaseFromPrompt(raw)
+        if (explicitPhase != null) {
+            val json = buildLegacyValidatorJsonFromPrompt(prompt = raw, phase = explicitPhase)
+            return streamTextAsCallbackFlow(
+                seed = raw,
+                fullText = jsonWithOptionalNoise(seed = raw, json = json),
+                throwAfterEmits = cfg.throwAfterEmits,
+                firstChunkDelayMs = cfg.firstChunkDelayMs,
+                chunkDelayMs = cfg.chunkDelayMs,
+                chunkSizeChars = cfg.chunkSizeChars,
             )
+        }
 
-            val singleFollowUp = extractBlockAny(
-                text = prompt,
-                candidates = listOf(
-                    MarkerPair("FOLLOW_UP_ANSWER_BEGIN", "FOLLOW_UP_ANSWER_END")
-                )
-            )
-
-            val followUpAnswers = when {
-                !followUpHistory.isNullOrBlank() -> parseFollowUpAnswersFromHistory(followUpHistory)
-
-                !singleFollowUp.isNullOrBlank() -> {
-                    val s = singleFollowUp.trim()
-                    if (looksLikeFollowUpHistory(s)) {
-                        parseFollowUpAnswersFromHistory(s)
-                    } else {
-                        listOf(s).filter { it.isNotBlank() }
-                    }
-                }
-
-                else -> emptyList()
-            }
-
-            val prependNonJson = shouldPrependNonJson(prompt)
-
-            val json = when (phase) {
-                PromptPhase.VALIDATE_MAIN -> validateMain(mainAnswer, followUpAnswers)
-                PromptPhase.VALIDATE_FOLLOW_UP -> validateFollowUp(mainAnswer, followUpAnswers)
-            }
-
-            val finalText = buildString {
-                if (prependNonJson) {
-                    // Intentionally invalid output for robustness testing.
-                    append("analysis: (fake) streaming output begins\n")
-                }
-                append(json)
-                if (cfg.appendTrailingNewline) append('\n')
-            }
-
-            cfg.logger?.invoke(
-                "FakeSlmRepository.request: meta phase=$phase mainLen=${mainAnswer.trim().length} " +
-                        "followUps=${followUpAnswers.size} outChars=${finalText.length} prependNonJson=$prependNonJson"
-            )
-
-            // Preserve the documented behavior: 0 => throw before first emit (no artificial delay).
-            if (throwAfter == 0) throw RuntimeException("fake_stream_error")
-
-            // Simulate time-to-first-token latency.
-            if (firstDelay > 0L) delay(firstDelay)
-
-            var emitCount = 0
-            var i = 0
-
-            while (i < finalText.length) {
-                if (throwAfter >= 0 && emitCount >= throwAfter) {
-                    throw RuntimeException("fake_stream_error")
-                }
-
-                val end = min(i + safeChunkSize, finalText.length)
-                emit(finalText.substring(i, end))
-                emitCount++
-
-                i = end
-                if (safeChunkDelay > 0L) delay(safeChunkDelay)
-            }
-
-            cfg.logger?.invoke("FakeSlmRepository.request: stream done (chunks=$emitCount)")
+        // Real-like behavior:
+        // - One-step: stream answer-like text.
+        // - Two-step: (1) eval JSON internal collect -> (2) follow-up JSON stream.
+        val userPrompt = extractUserPromptBestEffort(raw)
+        return if (cfg.enableTwoStepEval) {
+            requestTwoStepEvalThenFollowUp(userPrompt = userPrompt, rawSeed = raw)
+        } else {
+            requestOneStepLikeReal(userPrompt = userPrompt, rawSeed = raw)
         }
     }
 
-    private fun detectPhase(prompt: String): PromptPhase {
-        return when {
-            prompt.contains("PHASE=VALIDATE_FOLLOW_UP") -> PromptPhase.VALIDATE_FOLLOW_UP
-            prompt.contains("PHASE=VALIDATE_MAIN") -> PromptPhase.VALIDATE_MAIN
+    // ---------------------------------------------------------------------
+    // Prompt building (readable + aligned with real repository intent)
+    // ---------------------------------------------------------------------
+
+    private object PromptBuilder {
+
+        /**
+         * Step-1 Eval prompt: must output exactly one JSON object with a score.
+         *
+         * Expected JSON:
+         * {
+         *   "status": "ACCEPTED" | "NEED_FOLLOW_UP",
+         *   "score": 0..100,
+         *   "reason": "short string"
+         * }
+         */
+        fun buildEvalScorePrompt(questionId: String, userPrompt: String, threshold: Int): String {
+            return """
+Return exactly ONE JSON object and nothing else.
+- No markdown, no code fences, no backticks.
+- Output must start with "{" and end with "}".
+- Use double quotes for all JSON strings.
+- Do not include trailing commas.
+
+Required keys:
+- "status": either "ACCEPTED" or "NEED_FOLLOW_UP"
+- "score": integer from 0 to 100
+- "reason": short string (<= 160 chars)
+
+Decision rule:
+- If score >= $threshold => status="ACCEPTED"
+- Else => status="NEED_FOLLOW_UP"
+
+QUESTION_ID: $questionId
+
+USER_PROMPT:
+$userPrompt
+""".trimIndent()
+        }
+
+        /**
+         * Step-2 Follow-up prompt: must output exactly one JSON object.
+         *
+         * Valid shapes:
+         * 1) {"status":"ACCEPTED","followUpQuestion":""}
+         * 2) {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
+         */
+        fun buildFollowUpPrompt(
+            questionId: String,
+            userPrompt: String,
+            evalJson: String,
+            threshold: Int,
+        ): String {
+            return """
+Return exactly ONE JSON object and nothing else.
+- No markdown, no code fences, no backticks.
+- Output must start with "{" and end with "}".
+- Use double quotes for all JSON strings.
+- Do not include trailing commas.
+
+Valid shapes:
+1) {"status":"ACCEPTED","followUpQuestion":""}
+2) {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
+
+Rules:
+- Read EVAL_JSON and USER_PROMPT.
+- If EVAL_JSON.score >= $threshold:
+  - Return ACCEPTED with followUpQuestion="".
+- Else:
+  - Return NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
+  - The question must target the most important missing constraint.
+
+QUESTION_ID: $questionId
+
+EVAL_JSON:
+$evalJson
+
+USER_PROMPT:
+$userPrompt
+""".trimIndent()
+        }
+
+        /**
+         * Legacy wrapper to keep old behavior stable.
+         */
+        fun buildAnswerLikePrompt(userPrompt: String, phase: PromptPhase?): String {
+            val phaseLine = phase?.let {
+                val tag = when (it) {
+                    PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
+                    PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
+                }
+                "\nPHASE=$tag\n"
+            }.orEmpty()
+
+            return """
+SYSTEM:
+You are a helpful assistant.$phaseLine
+USER:
+$userPrompt
+""".trimIndent()
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // One-step (legacy-ish): stream answer-like text
+    // ---------------------------------------------------------------------
+
+    private fun requestOneStepLikeReal(userPrompt: String, rawSeed: String): Flow<String> {
+        if (cfg.resetConversationEachRequest) {
+            cfg.logger?.invoke("FakeSlmRepository: resetConversation (oneStep) metaOnly=true")
+        }
+
+        val main = generateAnswerLikeText(userPrompt = userPrompt, seed = rawSeed)
+        cfg.logger?.invoke("FakeSlmRepository.oneStep: outChars=${main.length}")
+
+        return streamTextAsCallbackFlow(
+            seed = rawSeed,
+            fullText = main,
+            throwAfterEmits = cfg.throwAfterEmits,
+            firstChunkDelayMs = cfg.firstChunkDelayMs,
+            chunkDelayMs = cfg.chunkDelayMs,
+            chunkSizeChars = cfg.chunkSizeChars,
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // Two-step (NEW SPEC): Eval internal -> FollowUp stream
+    // ---------------------------------------------------------------------
+
+    private suspend fun requestTwoStepEvalThenFollowUp(userPrompt: String, rawSeed: String): Flow<String> {
+        val u = userPrompt.trim()
+        if (u.isBlank()) return emptyFlow()
+
+        val questionId = extractQuestionIdFromUserPrompt(u) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
+
+        // Step 1: Eval internal collect (JSON)
+        if (cfg.resetConversationEachRequest) {
+            cfg.logger?.invoke("FakeSlmRepository: resetConversation (evalScore) metaOnly=true")
+        }
+
+        val evalPrompt = PromptBuilder.buildEvalScorePrompt(
+            questionId = questionId,
+            userPrompt = u,
+            threshold = cfg.acceptScoreThreshold,
+        )
+
+        val evalJsonIdeal = generateEvalScoreJson(
+            seed = rawSeed + "#EVAL",
+            questionId = questionId,
+            userPrompt = u,
+            threshold = cfg.acceptScoreThreshold,
+        )
+
+        val evalInternalFlow = streamTextAsCallbackFlow(
+            seed = rawSeed + "#EVAL_INTERNAL",
+            fullText = jsonWithOptionalNoise(seed = rawSeed + "#EVAL_INTERNAL", json = evalJsonIdeal),
+            throwAfterEmits = if (cfg.throwOnEvalInternal) cfg.throwAfterEmitsOnEvalInternal else -1,
+            firstChunkDelayMs = cfg.firstChunkDelayMs,
+            chunkDelayMs = cfg.chunkDelayMs,
+            chunkSizeChars = cfg.chunkSizeChars,
+        )
+
+        val evalCollected = evalInternalFlow.collectToTextResultWithBudget(
+            timeoutBudgetMs = cfg.evalTimeoutMs,
+            maxChars = cfg.evalMaxChars,
+            onChunk = null,
+        )
+
+        val evalJsonRecovered = extractFirstJsonObjectBestEffort(evalCollected.text) ?: evalJsonIdeal
+        val evalScore = parseScoreBestEffort(evalJsonRecovered)
+
+        cfg.logger?.invoke(
+            "FakeSlmRepository.twoStep: evalCollectedChars=${evalCollected.text.length} evalReason=${evalCollected.reason.name} score=${evalScore ?: -1}",
+        )
+
+        // Step 2: FollowUp stream (JSON)
+        if (cfg.resetConversationEachRequest) {
+            cfg.logger?.invoke("FakeSlmRepository: resetConversation (followUp) metaOnly=true")
+        }
+
+        val followUpPrompt = PromptBuilder.buildFollowUpPrompt(
+            questionId = questionId,
+            userPrompt = u,
+            evalJson = evalJsonRecovered,
+            threshold = cfg.acceptScoreThreshold,
+        )
+
+        val followUpJson = generateFollowUpJson(
+            seed = rawSeed + "#FOLLOWUP",
+            questionId = questionId,
+            userPrompt = u,
+            evalJson = evalJsonRecovered,
+            threshold = cfg.acceptScoreThreshold,
+        )
+
+        val streamed = clipForSafety(followUpJson, cfg.followUpMaxChars)
+
+        cfg.logger?.invoke(
+            "FakeSlmRepository.twoStep: followUpOutChars=${streamed.length} (promptChars=${followUpPrompt.length})",
+        )
+
+        return streamTextAsCallbackFlow(
+            seed = rawSeed + "#FOLLOWUP_STREAM",
+            fullText = jsonWithOptionalNoise(seed = rawSeed + "#FOLLOWUP_STREAM", json = streamed),
+            throwAfterEmits = cfg.throwAfterEmits,
+            firstChunkDelayMs = cfg.firstChunkDelayMs,
+            chunkDelayMs = cfg.chunkDelayMs,
+            chunkSizeChars = cfg.chunkSizeChars,
+        )
+    }
+
+    // ---------------------------------------------------------------------
+    // Streaming engine (callbackFlow) to mimic cancellation semantics
+    // ---------------------------------------------------------------------
+
+    private fun streamTextAsCallbackFlow(
+        seed: String,
+        fullText: String,
+        throwAfterEmits: Int,
+        firstChunkDelayMs: Long,
+        chunkDelayMs: Long,
+        chunkSizeChars: Int,
+    ): Flow<String> {
+        val safeChunkSize = chunkSizeChars.coerceAtLeast(1)
+        val safeChunkDelay = chunkDelayMs.coerceAtLeast(0L)
+        val safeFirstDelay = firstChunkDelayMs.coerceAtLeast(0L)
+
+        return callbackFlow {
+            val closed = AtomicBoolean(false)
+            var producer: Job? = null
+
+            fun closeOnce(cause: Throwable? = null) {
+                if (closed.compareAndSet(false, true)) {
+                    if (cause == null) close() else close(cause)
+                }
+            }
+
+            producer = launch(Dispatchers.Default) {
+                try {
+                    // 0 => throw before first emit (no artificial delay).
+                    if (throwAfterEmits == 0) throw RuntimeException("fake_stream_error")
+
+                    if (safeFirstDelay > 0L) delay(safeFirstDelay)
+
+                    var emitCount = 0
+                    var i = 0
+                    while (i < fullText.length) {
+                        if (throwAfterEmits >= 0 && emitCount >= throwAfterEmits) {
+                            throw RuntimeException("fake_stream_error")
+                        }
+
+                        val end = min(i + safeChunkSize, fullText.length)
+                        val chunk = fullText.substring(i, end)
+                        trySend(chunk)
+                        emitCount++
+
+                        i = end
+                        if (safeChunkDelay > 0L) delay(safeChunkDelay)
+                    }
+
+                    cfg.logger?.invoke(
+                        "FakeSlmRepository.stream: done (seedFp=${promptFingerprint(seed)} outChars=${fullText.length})",
+                    )
+                    closeOnce()
+                } catch (ce: CancellationException) {
+                    cfg.logger?.invoke("FakeSlmRepository.stream: cancelled (seedFp=${promptFingerprint(seed)})")
+                    closeOnce()
+                } catch (t: Throwable) {
+                    cfg.logger?.invoke(
+                        "FakeSlmRepository.stream: error type=${t::class.java.simpleName} (seedFp=${promptFingerprint(seed)})",
+                    )
+                    closeOnce(t)
+                }
+            }
+
+            awaitClose {
+                producer?.cancel()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Eval / FollowUp deterministic generators (NEW SPEC)
+    // ---------------------------------------------------------------------
+
+    /**
+     * Generate eval score JSON deterministically.
+     *
+     * Scoring heuristic for fake:
+     * - If prompt is short => lower score.
+     * - If prompt contains QUESTION_ID marker => slight boost (more structured).
+     */
+    private fun generateEvalScoreJson(
+        seed: String,
+        questionId: String,
+        userPrompt: String,
+        threshold: Int,
+    ): String {
+        val base = (userPrompt.trim().length * 4).coerceIn(0, 100)
+        val boost = if (userPrompt.contains("QUESTION_ID:")) 5 else 0
+        val jitter = (promptFingerprint(seed) % 11) - 5 // [-5..+5]
+        val score = (base + boost + jitter).coerceIn(0, 100)
+
+        val status = if (score >= threshold) "ACCEPTED" else "NEED_FOLLOW_UP"
+        val reason = if (status == "ACCEPTED") {
+            "Prompt is sufficiently specified for the next step."
+        } else {
+            "Prompt is missing key constraints; follow-up is required."
+        }
+
+        return """
+{
+  "status": "$status",
+  "score": $score,
+  "reason": ${reason.jsonQuote()}
+}
+""".trimIndent()
+    }
+
+    /**
+     * Generate follow-up JSON deterministically based on eval JSON.
+     *
+     * Rules:
+     * - If score >= threshold => ACCEPTED with empty followUpQuestion.
+     * - Else NEED_FOLLOW_UP with one concise question.
+     */
+    private fun generateFollowUpJson(
+        seed: String,
+        questionId: String,
+        userPrompt: String,
+        evalJson: String,
+        threshold: Int,
+    ): String {
+        val score = parseScoreBestEffort(evalJson) ?: 0
+        if (score >= threshold) {
+            return """
+{
+  "status": "ACCEPTED",
+  "followUpQuestion": ""
+}
+""".trimIndent()
+        }
+
+        val q = pickFollowUpQuestion(seed = seed, userPrompt = userPrompt, score = score)
+
+        return """
+{
+  "status": "NEED_FOLLOW_UP",
+  "followUpQuestion": ${q.jsonQuote()}
+}
+""".trimIndent()
+    }
+
+    private fun pickFollowUpQuestion(seed: String, userPrompt: String, score: Int): String {
+        val t = userPrompt.trim()
+
+        // Heuristic: choose question type based on prompt characteristics.
+        val idx = kotlin.math.abs(promptFingerprint(seed) + score + t.length) % 4
+        return when (idx) {
+            0 -> "What is the exact goal/output you want (one sentence)?"
+            1 -> "What constraints matter most (time, budget, device, language, format)?"
+            2 -> "Can you provide one concrete example input and the expected output?"
+            else -> "What is the success criteria (how do we judge it’s correct)?"
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Legacy validator compatibility path (PHASE=... requests)
+    // ---------------------------------------------------------------------
+
+    private fun buildLegacyValidatorJsonFromPrompt(prompt: String, phase: PromptPhase): String {
+        // Backward-compatible behavior: old validator flows expect ACCEPTED/NEED_FOLLOW_UP with followUpQuestion.
+        val mainAnswer = extractBlockAny(
+            text = prompt,
+            candidates = listOf(MarkerPair("MAIN_ANSWER_BEGIN", "MAIN_ANSWER_END")),
+        ).orEmpty()
+
+        return when (phase) {
+            PromptPhase.VALIDATE_MAIN -> {
+                if (mainAnswer.trim().length >= 12) {
+                    """
+{
+  "status": "ACCEPTED",
+  "assistantMessage": "Looks good. Thanks!"
+}
+""".trimIndent()
+                } else {
+                    """
+{
+  "status": "NEED_FOLLOW_UP",
+  "assistantMessage": "Thanks. I need more detail to validate your answer.",
+  "followUpQuestion": "Add one concrete example (what/where/when)."
+}
+""".trimIndent()
+                }
+            }
+            PromptPhase.VALIDATE_FOLLOW_UP -> {
+                """
+{
+  "status": "NEED_FOLLOW_UP",
+  "assistantMessage": "Good. One more concrete detail would make this answer complete.",
+  "followUpQuestion": "Add one measurable detail (number, duration, frequency, or cost)."
+}
+""".trimIndent()
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Phase / ID / prompt extraction
+    // ---------------------------------------------------------------------
+
+    private fun detectPhaseFromPrompt(prompt: String): PromptPhase? {
+        val m = Regex("""(?m)^\s*PHASE=(VALIDATE_MAIN|VALIDATE_FOLLOW_UP)\s*$""").find(prompt) ?: return null
+        return when (m.groupValues.getOrNull(1)) {
+            "VALIDATE_FOLLOW_UP" -> PromptPhase.VALIDATE_FOLLOW_UP
             else -> PromptPhase.VALIDATE_MAIN
         }
     }
 
-    /**
-     * Fake validation logic for main answer.
-     *
-     * Behavior:
-     * - If main answer is long enough, ACCEPTED.
-     * - Otherwise, ask follow-up #1.
-     */
-    private fun validateMain(mainAnswer: String, followUpAnswers: List<String>): String {
-        val a = mainAnswer.trim()
-        return if (a.length >= cfg.minMainAnswerChars) {
-            jsonAccepted("Looks good. Thanks!")
-        } else {
-            jsonNeedFollowUp(
-                assistantMessage = "Thanks. I need more detail to validate your answer.",
-                followUpQuestion = nextFollowUpQuestion(index = 1)
-            )
-        }
+    private fun extractQuestionIdFromUserPrompt(prompt: String): String? {
+        val m = Regex("""(?m)^\s*QUESTION_ID:\s*([^\s]+)\s*$""").find(prompt) ?: return null
+        return m.groupValues.getOrNull(1)?.trim()?.takeIf { it.isNotBlank() }
     }
 
-    /**
-     * Fake validation logic for follow-up cycles.
-     *
-     * Behavior:
-     * - If main answer is already long enough, ACCEPTED immediately.
-     * - Otherwise, require N follow-ups (N may scale slightly based on main length).
-     * - Each follow-up must be "useful" (min length) to count.
-     *
-     * Strategy (deterministic):
-     * - If any provided follow-up is non-empty but too short, request clarification of that slot first.
-     * - Otherwise, if not enough useful follow-ups, ask the next follow-up question.
-     */
-    private fun validateFollowUp(mainAnswer: String, followUpAnswers: List<String>): String {
-        val a = mainAnswer.trim()
-        val requiresFollowUp = a.length < cfg.minMainAnswerChars
-
-        if (!requiresFollowUp) {
-            return jsonAccepted("Looks good. Thanks!")
+    private fun extractUserPromptBestEffort(prompt: String): String {
+        val lines = prompt.lines()
+        val idx = lines.indexOfFirst { it.trim() == "USER:" }
+        if (idx >= 0 && idx + 1 < lines.size) {
+            return lines.subList(idx + 1, lines.size).joinToString("\n").trim()
         }
-
-        val required = requiredFollowUpsForMain(a)
-
-        val shortIdx = followUpAnswers.indexOfFirst {
-            val t = it.trim()
-            t.isNotEmpty() && t.length < cfg.minFollowUpAnswerChars
-        }
-        if (shortIdx >= 0) {
-            val q = "Could you make follow-up #${shortIdx + 1} more concrete (numbers, place, or example)?"
-            return jsonNeedFollowUp(
-                assistantMessage = "That detail is still a bit vague.",
-                followUpQuestion = q
-            )
-        }
-
-        val useful = followUpAnswers.filter { it.trim().length >= cfg.minFollowUpAnswerChars }
-
-        if (useful.size < required) {
-            return jsonNeedFollowUp(
-                assistantMessage = "Good. One more concrete detail would make this answer complete.",
-                followUpQuestion = nextFollowUpQuestion(index = useful.size + 1)
-            )
-        }
-
-        return jsonAccepted("Great. Now your answer is complete.")
+        return prompt.trim()
     }
 
-    /**
-     * Compute required follow-ups based on how short the main answer is.
-     *
-     * Rationale:
-     * - For extremely short answers, require slightly more detail to simulate stricter validation.
-     * - Keep this deterministic and simple for SmallStep testing.
-     */
-    private fun requiredFollowUpsForMain(main: String): Int {
-        val base = cfg.requiredFollowUps.coerceAtLeast(1)
-        val veryShortThreshold = (cfg.minMainAnswerChars / 2).coerceAtLeast(1)
-        return if (main.length < veryShortThreshold) base + 1 else base
-    }
+    private fun clipForSafety(text: String, maxChars: Int): String {
+        if (maxChars <= 0) return ""
+        if (text.length <= maxChars) return text
+        var end = maxChars.coerceAtMost(text.length)
+        if (end <= 0) return ""
 
-    private fun nextFollowUpQuestion(index: Int): String {
-        return when (index) {
-            1 -> "Add one concrete example (what/where/when)."
-            2 -> "Add one measurable detail (number, duration, frequency, or cost)."
-            3 -> "Clarify one constraint or exception case."
-            4 -> "State one cause-and-effect detail (why it happened / why it matters)."
-            else -> "Add one more concrete detail to remove ambiguity."
+        // Avoid splitting a surrogate pair.
+        if (end < text.length) {
+            val last = text[end - 1]
+            val next = text[end]
+            if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
+                end -= 1
+            }
         }
-    }
-
-    private fun jsonAccepted(msg: String): String {
-        return """
-{
-  "status": "ACCEPTED",
-  "assistantMessage": ${msg.jsonQuote()}
-}
-""".trimIndent()
-    }
-
-    private fun jsonNeedFollowUp(assistantMessage: String, followUpQuestion: String): String {
-        return """
-{
-  "status": "NEED_FOLLOW_UP",
-  "assistantMessage": ${assistantMessage.jsonQuote()},
-  "followUpQuestion": ${followUpQuestion.jsonQuote()}
-}
-""".trimIndent()
+        if (end <= 0) return ""
+        return text.take(end)
     }
 
     // ---------------------------------------------------------------------
-    // Block extraction helpers
+    // JSON helpers
+    // ---------------------------------------------------------------------
+
+    private fun extractFirstJsonObjectBestEffort(text: String): String? {
+        val t = text.trim()
+        if (t.isEmpty()) return null
+        val start = t.indexOf('{')
+        if (start < 0) return null
+        val end = t.lastIndexOf('}')
+        if (end <= start) return null
+        return t.substring(start, end + 1)
+    }
+
+    private fun parseScoreBestEffort(json: String): Int? {
+        val s = json.trim()
+        if (s.isEmpty()) return null
+        return runCatching {
+            val obj = JSONObject(s)
+            if (!obj.has("score")) return@runCatching null
+            val score = obj.optInt("score", -1)
+            score.takeIf { it in 0..100 }
+        }.getOrNull()
+    }
+
+    private fun jsonWithOptionalNoise(seed: String, json: String): String {
+        val prependNonJson = shouldPrependNonJson(seed)
+        return buildString {
+            if (prependNonJson) {
+                append("analysis: (fake) streaming output begins\n")
+            }
+            append(json)
+            if (cfg.appendTrailingNewline) append('\n')
+        }
+    }
+
+    private fun shouldPrependNonJson(seed: String): Boolean {
+        if (!cfg.occasionallyPrependNonJson) return false
+        val fp = promptFingerprint(seed)
+        return (fp % 5) == 0
+    }
+
+    private fun promptFingerprint(prompt: String): Int {
+        var h = 17
+        val step = (prompt.length / 64).coerceAtLeast(1)
+        var i = 0
+        while (i < prompt.length) {
+            h = 31 * h + prompt[i].code
+            i += step
+        }
+        return h
+    }
+
+    // ---------------------------------------------------------------------
+    // Legacy block extraction helpers (for PHASE paths)
     // ---------------------------------------------------------------------
 
     private data class MarkerPair(val begin: String, val end: String)
 
-    /**
-     * Extract a multi-line block between markers (line-bounded).
-     *
-     * Why line-bounded:
-     * - Prevent accidental matches if a user answer contains marker substrings.
-     * - Treat markers as standalone lines only.
-     */
     private fun extractBlock(text: String, begin: String, end: String): String? {
         var inside = false
         val out = StringBuilder()
@@ -403,139 +713,34 @@ $userPrompt
         return null
     }
 
-    /**
-     * Try multiple marker pairs and return the first match.
-     *
-     * Why:
-     * - Different SmallSteps may evolve prompt markers.
-     * - The fake repository should be tolerant so integration doesn't break.
-     */
     private fun extractBlockAny(text: String, candidates: List<MarkerPair>): String? {
         for (p in candidates) {
             val v = extractBlock(text, p.begin, p.end)
-            if (!v.isNullOrBlank()) return v
+            if (v != null) return v
         }
         return null
     }
 
     // ---------------------------------------------------------------------
-    // Follow-up parsing
+    // Answer-like generator (one-step)
     // ---------------------------------------------------------------------
 
-    /**
-     * Parse follow-up answers from the history string produced by the VM/validator.
-     *
-     * Expected format examples:
-     *   FOLLOW_UP_1_Q: ...
-     *   FOLLOW_UP_1_A: ...
-     *   FOLLOW_UP_2_Q: ...
-     *   FOLLOW_UP_2_A: ...
-     *
-     * Notes:
-     * - We only collect "_A:" entries.
-     * - Supports multi-line answers: continuation lines are included until the next "FOLLOW_UP_" marker.
-     * - Handles answers that start on the next line (e.g., "FOLLOW_UP_1_A:" then body lines).
-     */
-    private fun parseFollowUpAnswersFromHistory(history: String): List<String> {
-        val h = history.trim()
-        if (h.isEmpty() || h == "(none)") return emptyList()
-
-        val out = mutableListOf<String>()
-        val current = StringBuilder()
-        var collectingAnswer = false
-
-        fun flush() {
-            val s = current.toString().trim()
-            if (s.isNotBlank()) out += s
-            current.setLength(0)
-            collectingAnswer = false
-        }
-
-        h.lineSequence().forEach { line ->
-            val t = line.trim()
-
-            if (t.startsWith("FOLLOW_UP_")) {
-                if (collectingAnswer) flush()
-
-                val aIdx = t.indexOf("_A:")
-                if (aIdx > 0) {
-                    collectingAnswer = true
-                    val inline = t.substring(aIdx + 3).trim()
-                    if (inline.isNotBlank()) {
-                        current.append(inline)
-                    }
-                } else {
-                    collectingAnswer = false
-                }
-                return@forEach
+    private fun generateAnswerLikeText(userPrompt: String, seed: String): String {
+        val fp = promptFingerprint(seed)
+        val firstLine = userPrompt.lineSequence().firstOrNull().orEmpty().trim().take(48)
+        return buildString {
+            append("Fake answer (fp=").append(fp).append("). ")
+            if (firstLine.isNotBlank()) {
+                append("TopicHint=").append(firstLine.replace("{", "").replace("}", "").replace("\"", "")).append(". ")
             }
-
-            if (collectingAnswer) {
-                if (current.isNotEmpty()) current.append('\n')
-                current.append(line)
-            }
+            append("This is a deterministic streaming response used for integration testing.")
         }
-
-        if (collectingAnswer) flush()
-        return out
-    }
-
-    /**
-     * Heuristic: detect whether a text blob looks like VM follow-up history content.
-     */
-    private fun looksLikeFollowUpHistory(text: String): Boolean {
-        val t = text.trim()
-        if (t.isEmpty()) return false
-        return t.contains("FOLLOW_UP_") && t.contains("_A:")
-    }
-
-    // ---------------------------------------------------------------------
-    // Robustness testing behavior
-    // ---------------------------------------------------------------------
-
-    /**
-     * Decide whether to prepend non-JSON text deterministically.
-     *
-     * Rationale:
-     * - Random behavior is annoying in tests.
-     * - Deterministic "pseudo-random" based on prompt fingerprint is reproducible.
-     */
-    private fun shouldPrependNonJson(prompt: String): Boolean {
-        if (!cfg.occasionallyPrependNonJson) return false
-        val fp = promptFingerprint(prompt)
-        // Roughly 1 out of 5 requests will prepend non-JSON text.
-        return (fp % 5) == 0
-    }
-
-    /**
-     * A tiny, deterministic fingerprint for a prompt string.
-     *
-     * NOTE:
-     * - This is NOT cryptographic. It is only used to drive reproducible fake behaviors.
-     */
-    private fun promptFingerprint(prompt: String): Int {
-        var h = 17
-        val step = (prompt.length / 64).coerceAtLeast(1)
-        var i = 0
-        while (i < prompt.length) {
-            h = 31 * h + prompt[i].code
-            i += step
-        }
-        return h
     }
 
     // ---------------------------------------------------------------------
     // JSON escaping
     // ---------------------------------------------------------------------
 
-    /**
-     * JSON-string-escape and wrap with quotes.
-     *
-     * Notes:
-     * - Escapes common control chars.
-     * - Escapes any other control character (< 0x20) as \\uXXXX.
-     * - Keeps output safe for org.json parsing in the validator.
-     */
     private fun String.jsonQuote(): String {
         val sb = StringBuilder(this.length + 2)
         sb.append('"')
