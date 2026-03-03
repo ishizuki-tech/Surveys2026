@@ -34,7 +34,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
@@ -45,9 +47,10 @@ import org.json.JSONObject
  * 1) Eval (internal): Judge if the prompt is answerable / sufficient and return a JSON score.
  * 2) Follow-up (streamed): Generate the next follow-up question as JSON (or ACCEPTED).
  *
- * Debug:
- * - Can emit Step1/Step2 prompt + result diagnostics (clipped + sha256 by default).
- * - Full prompt/result logging is OFF by default for privacy.
+ * Design notes:
+ * - buildPrompt() MUST NOT perform I/O (it is non-suspend and may be called on main thread).
+ * - SurveyConfig should come from a single source (installed config).
+ * - Optional asset fallback is allowed ONLY in suspend paths and must never auto-install config.
  */
 class SlmRepository(
     context: Context,
@@ -61,6 +64,16 @@ class SlmRepository(
 
     /** Score threshold below which we must ask a follow-up question. */
     private val acceptScoreThreshold: Int = 70,
+
+    /**
+     * If true, allow loading config from assets when installed config is not available.
+     *
+     * IMPORTANT:
+     * - This is executed ONLY from suspend paths (request()).
+     * - This must never call installProcessConfig() here; Application is the owner.
+     * - Prefer keeping this false in production to guarantee single-source behavior.
+     */
+    private val allowAssetConfigFallback: Boolean = false,
 
     /** Debug options (safe defaults). */
     debug: DebugConfig = DebugConfig(),
@@ -92,32 +105,62 @@ class SlmRepository(
 
     private val dbg: DebugConfig = debug.normalized()
     private val appContext: Context = context.applicationContext
+
+    /**
+     * Cached config reference for fast paths.
+     *
+     * NOTE:
+     * - Do not assume cached config is always present.
+     * - Installed config should be the canonical source.
+     */
     private val cachedConfig = AtomicReference<SurveyConfig?>(null)
+    private val configLoadMutex = Mutex()
+
+    /** Model cache keyed by "name::absolutePath". */
+    private val modelCache = ConcurrentHashMap<String, ModelHolder>()
 
     class ModelNotReadyException(message: String) : IllegalStateException(message)
 
     override fun buildPrompt(userPrompt: String): String {
-        return PromptBuilder.buildAnswerLikePrompt(
-            systemPrompt = getSystemPromptBestEffort(),
-            userPrompt = userPrompt,
-        )
+        val u = userPrompt.trim()
+        if (u.isBlank()) return ""
+
+        // IMPORTANT: No I/O here. Only use already-installed or cached config.
+        val sys = getSystemPromptFromCacheOnly()
+        return PromptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
     }
 
     override suspend fun request(prompt: String): Flow<String> {
         val userPrompt = prompt.trim()
         if (userPrompt.isBlank()) return emptyFlow()
 
-        val file = resolveModelFile()
-        if (!file.exists() || !file.isFile || file.length() <= 0L) {
+        val cfg = getConfigSuspendBestEffort()
+
+        val file = resolveModelFile(cfg)
+        val stat = safeFileStat(file)
+
+        if (!stat.exists || !stat.isFile || stat.length <= 0L) {
+            AppLog.w(
+                TAG,
+                "Model not ready: exists=${stat.exists} isFile=${stat.isFile} len=${stat.length} " +
+                        "name=${file.name} path=${file.absolutePath}",
+            )
             throw ModelNotReadyException("Model file missing or empty: ${file.name}")
         }
 
-        val model = buildModel(file)
+        val model = getOrCreateModel(cfg = cfg, file = file)
+        awaitInitializedModelOnce(model)
 
         return if (enableTwoStepEval) {
             requestEvalScoreThenFollowUp(model = model, userPrompt = userPrompt)
         } else {
-            requestOneStep(model = model, prompt = buildPrompt(userPrompt))
+            val sys = runCatching { cfg?.composeSystemPrompt() }
+                .getOrNull()
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+
+            val p = PromptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = userPrompt)
+            requestOneStep(model = model, prompt = p)
         }
     }
 
@@ -130,6 +173,7 @@ class SlmRepository(
         fun buildEvalScorePrompt(
             questionId: String,
             userPrompt: String,
+            acceptScoreThreshold: Int,
         ): String {
             val clippedUser = clipForEval(userPrompt, EVAL_USER_PROMPT_MAX_CHARS)
 
@@ -155,7 +199,7 @@ class SlmRepository(
                 - 0-39: very unclear; must ask follow-up.
 
                 Decision rule:
-                - If score >= 70 => status="ACCEPTED"
+                - If score >= $acceptScoreThreshold => status="ACCEPTED"
                 - Else => status="NEED_FOLLOW_UP"
 
                 QUESTION_ID: $questionId
@@ -229,6 +273,7 @@ class SlmRepository(
             var end = maxChars.coerceAtMost(text.length)
             if (end <= 0) return ""
 
+            // Prevent cutting surrogate pairs.
             if (end < text.length) {
                 val last = text[end - 1]
                 val next = text[end]
@@ -242,8 +287,12 @@ class SlmRepository(
         }
     }
 
-    private fun getSystemPromptBestEffort(): String? {
-        val cfg = getConfigBestEffort()
+    /**
+     * Returns system prompt only if it is already available without I/O.
+     * This protects buildPrompt() from accidental blocking calls.
+     */
+    private fun getSystemPromptFromCacheOnly(): String? {
+        val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: cachedConfig.get()
         return runCatching { cfg?.composeSystemPrompt() }
             .getOrNull()
             ?.trim()
@@ -275,10 +324,7 @@ class SlmRepository(
                 val traceId = UUID.randomUUID().toString().take(8)
                 try {
                     gate.withPermit {
-
                         gatePermit.complete(Unit)
-
-                        awaitInitializedModel(model)
 
                         val questionId = extractQuestionId(u) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
 
@@ -292,11 +338,12 @@ class SlmRepository(
                         val evalPrompt = PromptBuilder.buildEvalScorePrompt(
                             questionId = questionId,
                             userPrompt = u,
+                            acceptScoreThreshold = acceptScoreThreshold,
                         )
 
                         dbgLogPrompt(
                             traceId = traceId,
-                            step = "S1_EVAL",
+                            step = "EVAL PHASE",
                             questionId = questionId,
                             prompt = evalPrompt,
                         )
@@ -310,19 +357,19 @@ class SlmRepository(
 
                         dbgLogResult(
                             traceId = traceId,
-                            step = "S1_EVAL",
+                            step = "EVAL PHASE",
                             questionId = questionId,
                             reason = evalResult.reason,
                             isEarlyStop = evalResult.isEarlyStop,
                             text = evalResult.text,
                         )
 
-                        val evalJsonRaw = extractFirstJsonObjectBestEffort(evalResult.text)
+                        val evalJsonRaw = extractFirstCompleteJsonObjectBestEffort(evalResult.text)
                         val evalParsed = parseEvalScoreBestEffort(evalJsonRaw)
 
                         dbgLogJsonExtraction(
                             traceId = traceId,
-                            step = "S1_EVAL",
+                            step = "EVAL PHASE",
                             questionId = questionId,
                             raw = evalResult.text,
                             extractedJson = evalJsonRaw,
@@ -356,12 +403,11 @@ class SlmRepository(
 
                         dbgLogPrompt(
                             traceId = traceId,
-                            step = "S2_FOLLOWUP",
+                            step = "FOLLOWUP PHASE",
                             questionId = questionId,
                             prompt = followUpPrompt,
                         )
 
-                        // Stream S2 result to caller; also capture for debug log.
                         val s2Buffer = if (dbg.enabled) StringBuilder(1024) else null
                         val s2MaxCapture = if (dbg.enabled) (EVAL_MAX_CHARS.coerceAtLeast(1024)) else 0
 
@@ -384,7 +430,7 @@ class SlmRepository(
                                 if (s2Buffer != null) {
                                     dbgLogResult(
                                         traceId = traceId,
-                                        step = "S2_FOLLOWUP",
+                                        step = "FOLLOWUP PHASE",
                                         questionId = questionId,
                                         reason = msg,
                                         isEarlyStop = false,
@@ -397,7 +443,7 @@ class SlmRepository(
                                 if (s2Buffer != null) {
                                     dbgLogResult(
                                         traceId = traceId,
-                                        step = "S2_FOLLOWUP",
+                                        step = "FOLLOWUP PHASE",
                                         questionId = questionId,
                                         reason = "ERROR:$msg",
                                         isEarlyStop = true,
@@ -426,7 +472,7 @@ class SlmRepository(
     }
 
     // ---------------------------------------------------------------------
-    // One-step (legacy)
+    // One-step
     // ---------------------------------------------------------------------
 
     private fun requestOneStep(model: Model, prompt: String): Flow<String> {
@@ -451,8 +497,6 @@ class SlmRepository(
                     gate.withPermit {
                         gatePermit.complete(Unit)
 
-                        awaitInitializedModel(model)
-
                         if (resetConversationEachRequest) {
                             resetConversationBestEffort(model, reason = "oneStep")
                         }
@@ -463,7 +507,7 @@ class SlmRepository(
                             onDelta = { chunk ->
                                 if (chunk.isNotEmpty()) trySend(chunk)
                             },
-                            onTerminal = { mes ->
+                            onTerminal = {
                                 closeOnce()
                             },
                             onError = { msg ->
@@ -505,15 +549,30 @@ class SlmRepository(
             return
         }
 
+        // The SDK may signal completion via multiple callbacks.
+        val ended = AtomicBoolean(false)
+
+        fun terminalOnce(reason: String) {
+            if (ended.compareAndSet(false, true)) {
+                onTerminal(reason)
+            }
+        }
+
+        fun errorOnce(msg: String) {
+            if (ended.compareAndSet(false, true)) {
+                onError(msg)
+            }
+        }
+
         SLM.runInference(
             model = model,
             input = p,
             resultListener = { partialResult, done ->
                 if (partialResult.isNotEmpty()) onDelta(partialResult)
-                if (done) onTerminal("done on resultListener")
+                if (done) terminalOnce("done on resultListener")
             },
-            cleanUpListener = { onTerminal("done on cleanUpListener") },
-            onError = { msg -> onError(msg) },
+            cleanUpListener = { terminalOnce("done on cleanUpListener") },
+            onError = { msg -> errorOnce(msg) },
             images = emptyList(),
             audioClips = emptyList(),
             notifyCancelToOnError = false,
@@ -536,16 +595,20 @@ class SlmRepository(
             )
         }
 
-        val out = StringBuilder(minOf(maxChars.coerceAtLeast(0), 4_096))
+        val safeMax = maxChars.coerceAtLeast(0)
+        val out = StringBuilder(minOf(safeMax, 4_096))
         val done = CompletableDeferred<Unit>()
         val errRef = AtomicReference<String?>(null)
         val reasonRef = AtomicReference("UNKNOWN")
         val earlyStopRef = AtomicBoolean(false)
+        val finished = AtomicBoolean(false)
 
-        fun finish(reason: String, earlyStop: Boolean) {
-            reasonRef.set(reason)
-            if (earlyStop) earlyStopRef.set(true)
-            if (!done.isCompleted) done.complete(Unit)
+        fun finishOnce(reason: String, earlyStop: Boolean) {
+            if (finished.compareAndSet(false, true)) {
+                reasonRef.set(reason)
+                if (earlyStop) earlyStopRef.set(true)
+                if (!done.isCompleted) done.complete(Unit)
+            }
         }
 
         runSdkAndStream(
@@ -553,7 +616,7 @@ class SlmRepository(
             input = p,
             onDelta = { chunk ->
                 if (chunk.isEmpty()) return@runSdkAndStream
-                val remaining = maxChars - out.length
+                val remaining = safeMax - out.length
                 if (remaining <= 0) {
                     earlyStopRef.set(true)
                     reasonRef.set("MAX_CHARS")
@@ -572,15 +635,15 @@ class SlmRepository(
             },
             onTerminal = { mes ->
                 val current = reasonRef.get()
-                if (current == "MAX_CHARS") finish(reason = current + mes, earlyStop = true)
-                else finish(reason = "COMPLETED $mes", earlyStop = false)
+                if (current == "MAX_CHARS") finishOnce(reason = "MAX_CHARS; $mes", earlyStop = true)
+                else finishOnce(reason = "COMPLETED; $mes", earlyStop = false)
             },
             onError = { msg ->
                 if (msg.equals("Cancelled", ignoreCase = true)) {
-                    finish(reason = "CANCELLED", earlyStop = true)
+                    finishOnce(reason = "CANCELLED", earlyStop = true)
                 } else {
                     errRef.set(msg)
-                    finish(reason = "ERROR", earlyStop = true)
+                    finishOnce(reason = "ERROR", earlyStop = true)
                 }
             },
         )
@@ -621,14 +684,64 @@ class SlmRepository(
         val reason: String?,
     )
 
-    private fun extractFirstJsonObjectBestEffort(text: String): String? {
-        val t = text.trim()
-        if (t.isEmpty()) return null
-        val start = t.indexOf('{')
-        if (start < 0) return null
-        val end = t.lastIndexOf('}')
-        if (end <= start) return null
-        return t.substring(start, end + 1)
+    /**
+     * Extracts the first complete JSON object from a text stream.
+     *
+     * Why:
+     * - LLMs sometimes emit prefixes/suffixes (whitespace, stray tokens).
+     * - "first '{' to last '}'" is unsafe when multiple objects or braces exist.
+     */
+    private fun extractFirstCompleteJsonObjectBestEffort(text: String): String? {
+        val s = text
+        if (s.isBlank()) return null
+
+        var start = -1
+        var depth = 0
+        var inString = false
+        var escape = false
+
+        for (i in s.indices) {
+            val c = s[i]
+
+            if (start < 0) {
+                if (c == '{') {
+                    start = i
+                    depth = 1
+                    inString = false
+                    escape = false
+                }
+                continue
+            }
+
+            if (escape) {
+                escape = false
+                continue
+            }
+
+            if (c == '\\' && inString) {
+                escape = true
+                continue
+            }
+
+            if (c == '"') {
+                inString = !inString
+                continue
+            }
+
+            if (inString) continue
+
+            when (c) {
+                '{' -> depth += 1
+                '}' -> {
+                    depth -= 1
+                    if (depth == 0) {
+                        return s.substring(start, i + 1).trim()
+                    }
+                }
+            }
+        }
+
+        return null
     }
 
     private fun parseEvalScoreBestEffort(json: String?): EvalScore {
@@ -731,13 +844,15 @@ class SlmRepository(
 
     private fun clipForLog(text: String, maxChars: Int): String {
         if (maxChars <= 0) return ""
-        val t = text
-        if (t.length <= maxChars) return t
+        if (text.length <= maxChars) return text
+
         val head = (maxChars * 0.7).toInt().coerceAtLeast(0)
         val tail = (maxChars - head - 64).coerceAtLeast(0)
-        val h = t.take(head)
-        val suffix = if (tail > 0) t.takeLast(tail) else ""
-        val omitted = t.length - (h.length + suffix.length)
+
+        val h = text.take(head)
+        val suffix = if (tail > 0) text.takeLast(tail) else ""
+        val omitted = (text.length - (h.length + suffix.length)).coerceAtLeast(0)
+
         return buildString {
             append(h)
             append("\n…(omitted ").append(omitted).append(" chars)…\n")
@@ -750,8 +865,9 @@ class SlmRepository(
         val dig = MessageDigest.getInstance("SHA-256").digest(bytes)
         val sb = StringBuilder(dig.size * 2)
         for (b in dig) {
-            sb.append(((b.toInt() shr 4) and 0xF).toString(16))
-            sb.append((b.toInt() and 0xF).toString(16))
+            val v = b.toInt() and 0xFF
+            sb.append("0123456789abcdef"[v ushr 4])
+            sb.append("0123456789abcdef"[v and 0x0F])
         }
         return sb.toString()
     }
@@ -759,6 +875,162 @@ class SlmRepository(
     // ---------------------------------------------------------------------
     // Config + model resolution
     // ---------------------------------------------------------------------
+
+    /**
+     * Best-effort config fetch:
+     * - Prefer installed config (single source).
+     * - If missing and fallback enabled, load from assets on Dispatchers.IO (suspend path only).
+     *
+     * IMPORTANT:
+     * - This function must never install config.
+     */
+    private suspend fun getConfigSuspendBestEffort(): SurveyConfig? {
+        SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
+            cachedConfig.set(cfg)
+            return cfg
+        }
+
+        cachedConfig.get()?.let { return it }
+
+        if (!allowAssetConfigFallback) {
+            SafeLog.w(TAG, "Config missing: installed=null; assetFallback=false")
+            return null
+        }
+
+        return configLoadMutex.withLock {
+            SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
+                cachedConfig.set(cfg)
+                return@withLock cfg
+            }
+            cachedConfig.get()?.let { return@withLock it }
+
+            val loaded = withContext(Dispatchers.IO) {
+                runCatching {
+                    SurveyConfigLoader.fromAssetsValidated(appContext, configAssetName)
+                }.onFailure { t ->
+                    SafeLog.e(TAG, "Config fallback load failed type=${t::class.java.simpleName}", t)
+                }.getOrNull()
+            }
+
+            if (loaded != null) {
+                SafeLog.w(TAG, "Config loaded from assets as fallback (NOT installed): asset=$configAssetName")
+                cachedConfig.set(loaded)
+            }
+            loaded
+        }
+    }
+
+    /**
+     * Resolves model file under app filesDir.
+     *
+     * Security:
+     * - Prevent path traversal by accepting only a simple file name.
+     */
+    private fun resolveModelFile(cfg: SurveyConfig?): File {
+        val rawFileName = cfg?.modelDefaults?.defaultFileName
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: fallbackModelFileName
+
+        val safeName = sanitizeSimpleFileName(rawFileName) ?: fallbackModelFileName
+        return File(appContext.filesDir, safeName)
+    }
+
+    private fun sanitizeSimpleFileName(name: String): String? {
+        val n = name.trim()
+        if (n.isBlank()) return null
+        if (n.contains('/') || n.contains('\\')) return null
+        if (n.contains("..")) return null
+        if (n.length > 200) return null
+        return n
+    }
+
+    private data class FileStat(
+        val exists: Boolean,
+        val isFile: Boolean,
+        val length: Long,
+    )
+
+    private fun safeFileStat(file: File): FileStat {
+        return runCatching {
+            FileStat(
+                exists = file.exists(),
+                isFile = file.isFile,
+                length = file.length(),
+            )
+        }.getOrElse {
+            FileStat(exists = false, isFile = false, length = 0L)
+        }
+    }
+
+    private fun getOrCreateModel(cfg: SurveyConfig?, file: File): Model {
+        val modelName = cfg?.modelDefaults?.modelName
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: fallbackModelName
+
+        val key = "$modelName::${file.absolutePath}"
+        val holder = modelCache.getOrPut(key) {
+            val modelConfig: Map<Model.ConfigKey, Any> = Model.buildModelConfigSafe(cfg?.slm)
+            AppLog.d(TAG, "ModelCache create: key=$key cfgPresent=${cfg != null} file=${file.name}")
+            ModelHolder(
+                model = Model(
+                    name = modelName,
+                    taskPath = file.absolutePath,
+                    config = modelConfig,
+                ),
+            )
+        }
+        return holder.model
+    }
+
+    private data class ModelHolder(
+        val model: Model,
+        val initMutex: Mutex = Mutex(),
+        val initialized: AtomicBoolean = AtomicBoolean(false),
+    )
+
+    /**
+     * Ensures the SDK is initialized once per model key.
+     * This reduces redundant init calls and log noise.
+     */
+    private suspend fun awaitInitializedModelOnce(model: Model) {
+        val key = "${model.name}::${model.taskPath}"
+        val holder = modelCache[key]
+        if (holder == null) {
+            // Fall back to direct init if the model was not created via cache (should be rare).
+            awaitInitializedModel(model)
+            return
+        }
+
+        if (holder.initialized.get()) return
+
+        holder.initMutex.withLock {
+            if (holder.initialized.get()) return@withLock
+            awaitInitializedModel(model)
+            holder.initialized.set(true)
+        }
+    }
+
+    private suspend fun awaitInitializedModel(model: Model) {
+        withContext(Dispatchers.Default) {
+            runCatching { SLM.setApplicationContext(appContext) }
+
+            AppLog.d(
+                TAG,
+                "initializeIfNeeded: model='${model.name}' file='${File(model.taskPath).name}' path='${model.taskPath}'",
+            )
+
+            SLM.initializeIfNeeded(
+                context = appContext,
+                model = model,
+                supportImage = false,
+                supportAudio = false,
+                systemMessage = null,
+                tools = emptyList(),
+            )
+        }
+    }
 
     private suspend fun resetConversationBestEffort(model: Model, reason: String) {
         val ok = runCatching {
@@ -776,68 +1048,6 @@ class SlmRepository(
             AppLog.w(
                 TAG,
                 "resetConversationAndAwait failed or timed out; continuing: reason='$reason' model='${model.name}'",
-            )
-        }
-    }
-
-    private fun getConfigBestEffort(): SurveyConfig? {
-        SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
-            cachedConfig.set(cfg)
-            return cfg
-        }
-
-        val existing = cachedConfig.get()
-        if (existing != null) return existing
-
-        val loaded = runCatching {
-            SurveyConfigLoader.fromAssetsValidated(appContext, configAssetName)
-        }.onFailure { t ->
-            SafeLog.e(TAG, "getConfigBestEffort: load failed type=${t::class.java.simpleName}", t)
-        }.getOrNull()
-
-        if (loaded != null) cachedConfig.set(loaded)
-        return loaded
-    }
-
-    private fun resolveModelFile(): File {
-        val cfg = getConfigBestEffort()
-        val fileName = cfg?.modelDefaults?.defaultFileName
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: fallbackModelFileName
-
-        return File(appContext.filesDir, fileName)
-    }
-
-    private fun buildModel(file: File): Model {
-        val cfg = getConfigBestEffort()
-
-        val modelName = cfg?.modelDefaults?.modelName
-            ?.trim()
-            ?.takeIf { it.isNotBlank() }
-            ?: fallbackModelName
-
-        val modelConfig: Map<Model.ConfigKey, Any> = Model.buildModelConfigSafe(cfg?.slm)
-
-        return Model(
-            name = modelName,
-            taskPath = file.absolutePath,
-            config = modelConfig,
-        )
-    }
-
-    private suspend fun awaitInitializedModel(model: Model) {
-        withContext(Dispatchers.Default) {
-            runCatching { SLM.setApplicationContext(appContext) }
-
-            AppLog.d(TAG, "initializeIfNeeded: model='${model.name}' file='${File(model.taskPath).name}'")
-            SLM.initializeIfNeeded(
-                context = appContext,
-                model = model,
-                supportImage = false,
-                supportAudio = false,
-                systemMessage = null,
-                tools = emptyList(),
             )
         }
     }
