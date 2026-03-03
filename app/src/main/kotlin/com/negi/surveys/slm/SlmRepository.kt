@@ -19,6 +19,7 @@ import com.negi.surveys.chat.collectToTextResultWithBudget
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
+import com.negi.surveys.logging.SafeLog
 import java.io.File
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
@@ -207,16 +208,25 @@ class SlmRepository(
         }
     }
 
+
     private fun getConfigBestEffort(): SurveyConfig? {
+        // Prefer the process-installed config from SurveyAppRoot (single source of truth).
+        SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
+            cachedConfig.set(cfg)
+            return cfg
+        }
+
         val existing = cachedConfig.get()
         if (existing != null) return existing
 
         val loaded = runCatching {
             SurveyConfigLoader.fromAssetsValidated(appContext, configAssetName)
+        }.onFailure { t ->
+            SafeLog.e(TAG, "getConfigBestEffort: load failed type=${t::class.java.simpleName}", t)
         }.getOrNull()
 
-        if (loaded != null) cachedConfig.compareAndSet(null, loaded)
-        return cachedConfig.get()
+        if (loaded != null) cachedConfig.set(loaded)
+        return loaded
     }
 
     private fun resolveModelFile(): File {

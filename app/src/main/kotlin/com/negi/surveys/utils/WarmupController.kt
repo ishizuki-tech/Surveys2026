@@ -2,6 +2,9 @@ package com.negi.surveys.utils
 
 import java.io.File
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 
 /**
  * SDK-agnostic system prompt definition used by warmup/compile runs.
@@ -177,5 +180,99 @@ interface WarmupController {
 
     companion object {
         const val DEFAULT_ENSURE_TIMEOUT_MS: Long = 120_000L
+    }
+}
+
+/**
+ * Lightweight fake warmup controller.
+ *
+ * Purpose:
+ * - Allows the app to run in FAKE repo mode without blocking on model prefetch/compile.
+ * - Exposes stable StateFlows for UI (always terminal / skipped).
+ *
+ * Contract:
+ * - Never throws.
+ * - All operations are no-ops and update state to "SkippedNotConfigured" or keep terminal snapshots.
+ */
+class FakeWarmupController : WarmupController {
+
+    private val _prefetchState = MutableStateFlow<PrefetchState>(
+        PrefetchState.SkippedNotConfigured(reason = "fakeMode")
+    )
+    private val _compileState = MutableStateFlow<CompileState>(
+        CompileState.SkippedNotConfigured(reason = "fakeMode")
+    )
+
+    override val prefetchState: StateFlow<PrefetchState> = _prefetchState
+    override val compileState: StateFlow<CompileState> = _compileState
+
+    private var options: Options = Options()
+
+    private data class Options(
+        val supportImage: Boolean = false,
+        val supportAudio: Boolean = false,
+        val systemPrompt: SystemPrompt? = null,
+        val tools: List<Any> = emptyList(),
+    )
+
+    override fun setWarmupConversationOptions(
+        supportImage: Boolean,
+        supportAudio: Boolean,
+        systemPrompt: SystemPrompt?,
+        tools: List<Any>,
+    ) {
+        // Store for debugging / parity; does not affect behavior.
+        options = Options(
+            supportImage = supportImage,
+            supportAudio = supportAudio,
+            systemPrompt = systemPrompt,
+            tools = tools,
+        )
+    }
+
+    override fun prefetchOnce() {
+        // No-op: remain terminal.
+        _prefetchState.value = PrefetchState.SkippedNotConfigured(reason = "fakeMode")
+    }
+
+    override fun compileOnce() {
+        // No-op: remain terminal.
+        _compileState.value = CompileState.SkippedNotConfigured(reason = "fakeMode")
+    }
+
+    override fun warmupOnce() {
+        // No-op: remain terminal.
+        _prefetchState.value = PrefetchState.SkippedNotConfigured(reason = "fakeMode")
+        _compileState.value = CompileState.SkippedNotConfigured(reason = "fakeMode")
+    }
+
+    override fun requestCompileAfterPrefetch(reason: String) {
+        // No-op: remain terminal.
+        _compileState.value = CompileState.SkippedNotConfigured(reason = "fakeMode")
+    }
+
+    override fun cancelAll(reason: String) {
+        // No-op: keep terminal.
+        _prefetchState.value = PrefetchState.SkippedNotConfigured(reason = "fakeMode")
+        _compileState.value = CompileState.SkippedNotConfigured(reason = "fakeMode")
+    }
+
+    override fun resetForRetry(reason: String) {
+        // No-op: keep terminal.
+        _prefetchState.value = PrefetchState.SkippedNotConfigured(reason = "fakeMode")
+        _compileState.value = CompileState.SkippedNotConfigured(reason = "fakeMode")
+    }
+
+    override suspend fun ensureCompiled(timeoutMs: Long?, reason: String): CompileState {
+        // Already terminal.
+        return _compileState.value
+    }
+
+    override suspend fun awaitPrefetchTerminal(timeoutMs: Long?): PrefetchState {
+        return _prefetchState.value
+    }
+
+    override suspend fun awaitCompileTerminal(timeoutMs: Long?): CompileState {
+        return _compileState.value
     }
 }

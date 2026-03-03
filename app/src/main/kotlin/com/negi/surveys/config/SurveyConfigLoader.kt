@@ -47,6 +47,7 @@ import com.negi.surveys.logging.AppLog
 import java.io.File
 import java.nio.charset.Charset
 import java.util.ArrayDeque
+import java.util.concurrent.atomic.AtomicReference
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.SerializationException
@@ -1005,6 +1006,35 @@ enum class NodeType {
 enum class ConfigFormat { JSON, YAML, AUTO }
 
 object SurveyConfigLoader {
+
+    // ---------------------------------------------------------------------
+// Process-wide config singleton (installed by SurveyAppRoot)
+// ---------------------------------------------------------------------
+    private val installedConfig: AtomicReference<SurveyConfig?> = AtomicReference(null)
+
+    /**
+     * Installs a process-wide SurveyConfig loaded by the app root.
+     *
+     * Why:
+     * - Avoid re-reading assets multiple times (e.g., warmup/modelResolver paths).
+     * - Make SurveyAppRoot the single source of truth.
+     *
+     * Notes:
+     * - Safe to call multiple times; latest wins.
+     * - Intended for single-process app usage (not multi-process sharing).
+     */
+    fun installProcessConfig(cfg: SurveyConfig) {
+        installedConfig.set(cfg)
+    }
+
+    /** Returns the installed process config if present, otherwise null. */
+    fun getInstalledConfigOrNull(): SurveyConfig? = installedConfig.get()
+
+    /** Clears the installed config (tests only). */
+    fun clearInstalledConfigForTests() {
+        installedConfig.set(null)
+    }
+
 
     internal data class FormatDecision(
         val format: ConfigFormat,
