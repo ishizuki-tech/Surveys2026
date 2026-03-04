@@ -13,7 +13,6 @@
 
 package com.negi.surveys.chat
 
-import com.negi.surveys.chat.collectToTextResultWithBudget
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
@@ -43,7 +42,11 @@ import org.json.JSONObject
  * Privacy:
  * - Do NOT log raw prompts/answers. If you pass [logger], keep it metadata-only.
  */
-class FakeSlmRepository(config: Config = Config()) : RepositoryI {
+class FakeSlmRepository(
+    config: Config = Config(),
+    /** Shared prompt builder to keep prompt contract aligned with the real repository. */
+    private val promptBuilder: SlmPromptBuilder = DefaultSlmPromptBuilder,
+) : RepositoryI {
 
     data class Config(
         /** Delay before returning the Flow to simulate request preparation latency. */
@@ -130,13 +133,15 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
 
     override fun buildPrompt(userPrompt: String): String {
         // Compatibility: legacy callers may use this.
-        return PromptBuilder.buildAnswerLikePrompt(userPrompt = userPrompt, phase = null)
+        // IMPORTANT: Keep this I/O-free and aligned with the real prompt builder contract.
+        return promptBuilder.buildAnswerLikePrompt(systemPrompt = null, userPrompt = userPrompt)
     }
 
     override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
         // IMPORTANT:
         // - Do NOT introduce a nullable overload (PromptPhase?) because JVM signatures collide.
-        return PromptBuilder.buildAnswerLikePrompt(userPrompt = userPrompt, phase = phase)
+        // This is a legacy validator-style prompt path; it is intentionally NOT shared with the real repository.
+        return buildValidatorStylePrompt(userPrompt = userPrompt, phase = phase)
     }
 
     override suspend fun request(prompt: String): Flow<String> {
@@ -182,109 +187,6 @@ class FakeSlmRepository(config: Config = Config()) : RepositoryI {
     }
 
     // ---------------------------------------------------------------------
-    // Prompt building (readable + aligned with real repository intent)
-    // ---------------------------------------------------------------------
-
-    private object PromptBuilder {
-
-        /**
-         * Step-1 Eval prompt: must output exactly one JSON object with a score.
-         *
-         * Expected JSON:
-         * {
-         *   "status": "ACCEPTED" | "NEED_FOLLOW_UP",
-         *   "score": 0..100,
-         *   "reason": "short string"
-         * }
-         */
-        fun buildEvalScorePrompt(questionId: String, userPrompt: String, threshold: Int): String {
-            return """
-Return exactly ONE JSON object and nothing else.
-- No markdown, no code fences, no backticks.
-- Output must start with "{" and end with "}".
-- Use double quotes for all JSON strings.
-- Do not include trailing commas.
-
-Required keys:
-- "status": either "ACCEPTED" or "NEED_FOLLOW_UP"
-- "score": integer from 0 to 100
-- "reason": short string (<= 160 chars)
-
-Decision rule:
-- If score >= $threshold => status="ACCEPTED"
-- Else => status="NEED_FOLLOW_UP"
-
-QUESTION_ID: $questionId
-
-USER_PROMPT:
-$userPrompt
-""".trimIndent()
-        }
-
-        /**
-         * Step-2 Follow-up prompt: must output exactly one JSON object.
-         *
-         * Valid shapes:
-         * 1) {"status":"ACCEPTED","followUpQuestion":""}
-         * 2) {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
-         */
-        fun buildFollowUpPrompt(
-            questionId: String,
-            userPrompt: String,
-            evalJson: String,
-            threshold: Int,
-        ): String {
-            return """
-Return exactly ONE JSON object and nothing else.
-- No markdown, no code fences, no backticks.
-- Output must start with "{" and end with "}".
-- Use double quotes for all JSON strings.
-- Do not include trailing commas.
-
-Valid shapes:
-1) {"status":"ACCEPTED","followUpQuestion":""}
-2) {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
-
-Rules:
-- Read EVAL_JSON and USER_PROMPT.
-- If EVAL_JSON.score >= $threshold:
-  - Return ACCEPTED with followUpQuestion="".
-- Else:
-  - Return NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
-  - The question must target the most important missing constraint.
-
-QUESTION_ID: $questionId
-
-EVAL_JSON:
-$evalJson
-
-USER_PROMPT:
-$userPrompt
-""".trimIndent()
-        }
-
-        /**
-         * Legacy wrapper to keep old behavior stable.
-         */
-        fun buildAnswerLikePrompt(userPrompt: String, phase: PromptPhase?): String {
-            val phaseLine = phase?.let {
-                val tag = when (it) {
-                    PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
-                    PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
-                }
-                "\nPHASE=$tag\n"
-            }.orEmpty()
-
-            return """
-SYSTEM:
-You are a helpful assistant.$phaseLine
-USER:
-$userPrompt
-""".trimIndent()
-        }
-    }
-
-    // ---------------------------------------------------------------------
     // One-step (legacy-ish): stream answer-like text
     // ---------------------------------------------------------------------
 
@@ -307,7 +209,7 @@ $userPrompt
     }
 
     // ---------------------------------------------------------------------
-    // Two-step (NEW SPEC): Eval internal -> FollowUp stream
+    // Two-step (shared prompt contract): Eval internal -> FollowUp stream
     // ---------------------------------------------------------------------
 
     private suspend fun requestTwoStepEvalThenFollowUp(userPrompt: String, rawSeed: String): Flow<String> {
@@ -321,10 +223,11 @@ $userPrompt
             cfg.logger?.invoke("FakeSlmRepository: resetConversation (evalScore) metaOnly=true")
         }
 
-        val evalPrompt = PromptBuilder.buildEvalScorePrompt(
+        val evalPrompt = promptBuilder.buildEvalScorePrompt(
             questionId = questionId,
             userPrompt = u,
-            threshold = cfg.acceptScoreThreshold,
+            acceptScoreThreshold = cfg.acceptScoreThreshold,
+            userPromptMaxChars = EVAL_USER_PROMPT_MAX_CHARS,
         )
 
         val evalJsonIdeal = generateEvalScoreJson(
@@ -353,7 +256,8 @@ $userPrompt
         val evalScore = parseScoreBestEffort(evalJsonRecovered)
 
         cfg.logger?.invoke(
-            "FakeSlmRepository.twoStep: evalCollectedChars=${evalCollected.text.length} evalReason=${evalCollected.reason.name} score=${evalScore ?: -1}",
+            "FakeSlmRepository.twoStep: evalPromptChars=${evalPrompt.length} evalCollectedChars=${evalCollected.text.length} " +
+                    "evalReason=${evalCollected.reason.name} score=${evalScore ?: -1}",
         )
 
         // Step 2: FollowUp stream (JSON)
@@ -361,11 +265,13 @@ $userPrompt
             cfg.logger?.invoke("FakeSlmRepository: resetConversation (followUp) metaOnly=true")
         }
 
-        val followUpPrompt = PromptBuilder.buildFollowUpPrompt(
+        val followUpPrompt = promptBuilder.buildFollowUpPrompt(
             questionId = questionId,
             userPrompt = u,
             evalJson = evalJsonRecovered,
-            threshold = cfg.acceptScoreThreshold,
+            acceptScoreThreshold = cfg.acceptScoreThreshold,
+            userPromptMaxChars = FOLLOWUP_USER_PROMPT_MAX_CHARS,
+            evalJsonMaxChars = FOLLOWUP_EVAL_JSON_MAX_CHARS,
         )
 
         val followUpJson = generateFollowUpJson(
@@ -379,7 +285,7 @@ $userPrompt
         val streamed = clipForSafety(followUpJson, cfg.followUpMaxChars)
 
         cfg.logger?.invoke(
-            "FakeSlmRepository.twoStep: followUpOutChars=${streamed.length} (promptChars=${followUpPrompt.length})",
+            "FakeSlmRepository.twoStep: followUpPromptChars=${followUpPrompt.length} followUpOutChars=${streamed.length}",
         )
 
         return streamTextAsCallbackFlow(
@@ -390,6 +296,27 @@ $userPrompt
             chunkDelayMs = cfg.chunkDelayMs,
             chunkSizeChars = cfg.chunkSizeChars,
         )
+    }
+
+    // ---------------------------------------------------------------------
+    // Legacy validator-style prompt builder (PHASE overload compatibility)
+    // ---------------------------------------------------------------------
+
+    private fun buildValidatorStylePrompt(userPrompt: String, phase: PromptPhase): String {
+        val phaseLine = run {
+            val tag = when (phase) {
+                PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
+                PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
+            }
+            "\nPHASE=$tag\n"
+        }
+
+        return """
+SYSTEM:
+You are a helpful assistant.$phaseLine
+USER:
+$userPrompt
+""".trimIndent()
     }
 
     // ---------------------------------------------------------------------
@@ -457,7 +384,7 @@ $userPrompt
             }
 
             awaitClose {
-                producer.cancel()
+                producer?.cancel()
             }
         }
     }
@@ -765,5 +692,12 @@ $userPrompt
         }
         sb.append('"')
         return sb.toString()
+    }
+
+    companion object {
+        // Keep budgets aligned with SlmRepository's constants.
+        private const val EVAL_USER_PROMPT_MAX_CHARS: Int = 4_000
+        private const val FOLLOWUP_USER_PROMPT_MAX_CHARS: Int = 4_000
+        private const val FOLLOWUP_EVAL_JSON_MAX_CHARS: Int = 2_000
     }
 }

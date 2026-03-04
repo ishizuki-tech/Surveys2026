@@ -25,8 +25,6 @@ package com.negi.surveys.slm
 import android.content.Context
 import android.graphics.Bitmap
 import com.google.ai.edge.litertlm.Message
-import com.negi.surveys.BuildConfig
-import com.negi.surveys.logging.AppLog
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.slm.liteRT.LiteRtLM
 import java.util.concurrent.atomic.AtomicBoolean
@@ -54,12 +52,16 @@ object SLM {
     // Logging helpers
     // ---------------------------------------------------------------------
 
+    private inline fun i(msg: () -> String) {
+        SafeLog.i(TAG, msg())
+    }
+
     private inline fun d(msg: () -> String) {
-        if (DEBUG_SLM) AppLog.d(TAG, msg())
+        if (DEBUG_SLM) SafeLog.d(TAG, msg())
     }
 
     private inline fun w(t: Throwable? = null, msg: () -> String) {
-        if (t != null) AppLog.w(TAG, msg(), t) else AppLog.w(TAG, msg())
+        if (t != null) SafeLog.w(TAG, msg(), t) else SafeLog.w(TAG, msg())
     }
 
     /**
@@ -368,9 +370,9 @@ object SLM {
 
         // Keep logs minimal in release builds.
         if (DEBUG_SLM) {
-            SafeLog.i("SLM runInference", "input(len=${input.length}) :: ${input.ellipsize(256)}")
+            i {"input(len=${input.length}) :: ${input.ellipsize(256)}"}
         } else {
-            SafeLog.i("SLM runInference", "input(len=${input.length})")
+            i {"input(len=${input.length})"}
         }
 
         runCatching {
@@ -379,23 +381,16 @@ object SLM {
                 input = input,
                 resultListener = { partialResult, done ->
                     if (DEBUG_SLM) {
-                        SafeLog.i(
-                            "SLM runInference",
-                            "done=$done partialLen=${partialResult.length} :: ${partialResult.ellipsize(256)}",
-                        )
+                        i {"done=$done partialLen=${partialResult.length} :: ${partialResult.ellipsize(256)}"}
                     }
                     resultListener(partialResult, done)
                 },
                 cleanUpListener = {
-                    if (DEBUG_SLM) SafeLog.i("SLM runInference", "cleanUpListener")
+                    i {"cleanUpListener"}
                     cleanUpOnce()
                 },
                 onError = { message ->
-                    if (DEBUG_SLM) {
-                        SafeLog.i("SLM runInference", "onError :: ${message.ellipsize(512)}")
-                    } else {
-                        SafeLog.i("SLM runInference", "onError(len=${message.length})")
-                    }
+                    i {"onError :: ${message.ellipsize(512)}"}
                     onErrorOnce(message)
                 },
                 images = images,

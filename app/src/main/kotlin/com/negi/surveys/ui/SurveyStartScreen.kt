@@ -44,8 +44,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.negi.surveys.logging.AppLog
-import com.negi.surveys.utils.CompileState
-import com.negi.surveys.utils.WarmupController
+import com.negi.surveys.warmup.WarmupController
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
@@ -84,7 +83,7 @@ fun SurveyStartScreen(
 
     val scope = rememberCoroutineScope()
 
-    val compileState: CompileState by warmupController.compileState.collectAsStateWithLifecycle()
+    val compileState: WarmupController.CompileState by warmupController.compileState.collectAsStateWithLifecycle()
     val latestCompileState by rememberUpdatedState(compileState)
 
     var beginLocked by remember { mutableStateOf(false) }
@@ -95,7 +94,7 @@ fun SurveyStartScreen(
 
     fun requestCompile(reason: String) {
         val st = latestCompileState
-        if (st is CompileState.Compiling || st is CompileState.WaitingForPrefetch) {
+        if (st is WarmupController.CompileState.Compiling || st is WarmupController.CompileState.WaitingForPrefetch) {
             AppLog.d(TAG, "compile request skipped: already running reason=$reason state=${st.javaClass.simpleName}")
             return
         }
@@ -297,17 +296,17 @@ fun SurveyStartScreen(
 
 @Composable
 private fun WarmupStatusPanel(
-    compileState: CompileState,
+    compileState: WarmupController.CompileState,
     onRetry: () -> Unit,
 ) {
     val label = when (compileState) {
-        is CompileState.Idle -> "Idle"
-        is CompileState.WaitingForPrefetch -> "Waiting for prefetch…"
-        is CompileState.Compiling -> "Compiling…"
-        is CompileState.Compiled -> "Compiled"
-        is CompileState.Cancelled -> "Cancelled"
-        is CompileState.SkippedNotConfigured -> "Not configured"
-        is CompileState.Failed -> {
+        is WarmupController.CompileState.Idle -> "Idle"
+        is WarmupController.CompileState.WaitingForPrefetch -> "Waiting for prefetch…"
+        is WarmupController.CompileState.Compiling -> "Compiling…"
+        is WarmupController.CompileState.Compiled -> "Compiled"
+        is WarmupController.CompileState.Cancelled -> "Cancelled"
+        is WarmupController.CompileState.SkippedNotReady -> "Not configured"
+        is WarmupController.CompileState.Failed -> {
             val msg = compileState.message.replace('\n', ' ').take(FAILED_MSG_MAX)
             "Failed: $msg"
         }
@@ -316,7 +315,7 @@ private fun WarmupStatusPanel(
     val elapsed = compileState.elapsedMs
     Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
         Text("$label  (elapsed=${elapsed}ms)")
-        if (compileState is CompileState.Failed || compileState is CompileState.Cancelled) {
+        if (compileState is WarmupController.CompileState.Failed || compileState is WarmupController.CompileState.Cancelled) {
             OutlinedButton(onClick = onRetry, modifier = Modifier.testTag("warmup_retry")) {
                 Text("Retry warmup")
             }
@@ -331,10 +330,10 @@ private fun WarmupStatusPanel(
  * - Compiled => ready.
  * - SkippedNotConfigured => treat as ready so the UI isn't hard-blocked on devices without a model.
  */
-private fun isWarmupReady(state: CompileState): Boolean {
+private fun isWarmupReady(state: WarmupController.CompileState): Boolean {
     return when (state) {
-        is CompileState.Compiled,
-        is CompileState.SkippedNotConfigured -> true
+        is WarmupController.CompileState.Compiled,
+        is WarmupController.CompileState.SkippedNotReady -> true
         else -> false
     }
 }
