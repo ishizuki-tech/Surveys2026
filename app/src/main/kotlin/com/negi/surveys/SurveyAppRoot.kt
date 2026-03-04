@@ -91,10 +91,8 @@ import com.negi.surveys.ui.ReviewScreen
 import com.negi.surveys.ui.SurveyStartScreen
 import com.negi.surveys.ui.chat.ChatQuestionScreen
 import com.negi.surveys.ui.chat.LocalRepositoryI
-import com.negi.surveys.utils.CompileState
 import com.negi.surveys.utils.ModelDownloadController
-import com.negi.surveys.utils.PrefetchState
-import com.negi.surveys.utils.WarmupController
+import com.negi.surveys.warmup.WarmupController
 import java.util.Locale
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -377,14 +375,14 @@ private object SurveyAppRootInternal {
         }
 
         // Collect state ONCE at root to avoid duplicate subscriptions.
-        val rootPrefetchState: PrefetchState by warmup.prefetchState.collectAsStateWithLifecycle()
-        val rootCompileState: CompileState by warmup.compileState.collectAsStateWithLifecycle()
+        val rootPrefetchState: WarmupController.PrefetchState by warmup.prefetchState.collectAsStateWithLifecycle()
+        val rootCompileState: WarmupController.CompileState by warmup.compileState.collectAsStateWithLifecycle()
         val rootModelState: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
 
         // Keep stable state containers for NavEntry lambdas (avoid entryProvider recreation).
         val rootModelStateState: State<ModelDownloadController.ModelState> = rememberUpdatedState(rootModelState)
-        val rootPrefetchStateState: State<PrefetchState> = rememberUpdatedState(rootPrefetchState)
-        val rootCompileStateState: State<CompileState> = rememberUpdatedState(rootCompileState)
+        val rootPrefetchStateState: State<WarmupController.PrefetchState> = rememberUpdatedState(rootPrefetchState)
+        val rootCompileStateState: State<WarmupController.CompileState> = rememberUpdatedState(rootCompileState)
 
         // -------------------------------------------------------------
         // Debug: log transitions (centralized)
@@ -752,8 +750,8 @@ private object SurveyAppRootInternal {
         enabled: Boolean,
         policy: GatePolicy,
         modelState: ModelDownloadController.ModelState,
-        prefetchState: PrefetchState,
-        compileState: CompileState,
+        prefetchState: WarmupController.PrefetchState,
+        compileState: WarmupController.CompileState,
         onBack: () -> Unit,
         onRetryAll: () -> Unit,
         content: @Composable () -> Unit,
@@ -766,7 +764,7 @@ private object SurveyAppRootInternal {
 
         val modelBlocking = modelState !is ModelDownloadController.ModelState.Ready
         val prefetchBusy = isPrefetchInProgress(prefetchState)
-        val compileBusy = compileState is CompileState.WaitingForPrefetch || compileState is CompileState.Compiling
+        val compileBusy = compileState is WarmupController.CompileState.WaitingForPrefetch || compileState is WarmupController.CompileState.Compiling
 
         val isBlocking = when (policy) {
             GatePolicy.MODEL_ONLY -> modelBlocking
@@ -793,13 +791,13 @@ private object SurveyAppRootInternal {
     @Composable
     private fun SlmGateScreen(
         modelState: ModelDownloadController.ModelState,
-        prefetchState: PrefetchState,
-        compileState: CompileState,
+        prefetchState: WarmupController.PrefetchState,
+        compileState: WarmupController.CompileState,
         onBack: () -> Unit,
         onRetryAll: () -> Unit,
     ) {
         val prefetchInProgress = isPrefetchInProgress(prefetchState)
-        val compileInProgress = compileState is CompileState.WaitingForPrefetch || compileState is CompileState.Compiling
+        val compileInProgress = compileState is WarmupController.CompileState.WaitingForPrefetch || compileState is WarmupController.CompileState.Compiling
         val modelInProgress =
             modelState is ModelDownloadController.ModelState.Checking ||
                     modelState is ModelDownloadController.ModelState.Downloading
@@ -828,12 +826,12 @@ private object SurveyAppRootInternal {
                     elapsedMs = prefetchElapsedMs,
                     format = WARMUP_UI_FORMAT_GATE
                 )
-                compileState is CompileState.WaitingForPrefetch -> compileLabelForUi(
+                compileState is WarmupController.CompileState.WaitingForPrefetch -> compileLabelForUi(
                     compileState,
                     elapsedMs = compileElapsedMs,
                     format = WARMUP_UI_FORMAT_GATE
                 )
-                compileState is CompileState.Compiling -> compileLabelForUi(
+                compileState is WarmupController.CompileState.Compiling -> compileLabelForUi(
                     compileState,
                     elapsedMs = compileElapsedMs,
                     format = WARMUP_UI_FORMAT_GATE
@@ -845,8 +843,8 @@ private object SurveyAppRootInternal {
         val showRetryAll = remember(modelState, compileState) {
             modelState is ModelDownloadController.ModelState.Failed ||
                     modelState is ModelDownloadController.ModelState.Cancelled ||
-                    compileState is CompileState.Failed ||
-                    compileState is CompileState.Cancelled
+                    compileState is WarmupController.CompileState.Failed ||
+                    compileState is WarmupController.CompileState.Cancelled
         }
 
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
@@ -890,13 +888,13 @@ private object SurveyAppRootInternal {
                         is ModelDownloadController.ModelState.Cancelled ->
                             "Download cancelled."
                         else -> when (compileState) {
-                            is CompileState.WaitingForPrefetch ->
+                            is WarmupController.CompileState.WaitingForPrefetch ->
                                 "Waiting for prefetch to complete before compilation."
-                            is CompileState.Compiling ->
+                            is WarmupController.CompileState.Compiling ->
                                 "Compiling/initializing the model. UI may stutter briefly."
-                            is CompileState.Failed ->
+                            is WarmupController.CompileState.Failed ->
                                 "Warmup compile failed. Try retry."
-                            is CompileState.Cancelled ->
+                            is WarmupController.CompileState.Cancelled ->
                                 "Warmup compile cancelled. Try retry."
                             else -> ""
                         }
@@ -982,8 +980,8 @@ private object SurveyAppRootInternal {
     @Composable
     private fun LogStateTransitions(
         modelState: ModelDownloadController.ModelState,
-        prefetchState: PrefetchState,
-        compileState: CompileState,
+        prefetchState: WarmupController.PrefetchState,
+        compileState: WarmupController.CompileState,
     ) {
         var prevModel by remember { mutableStateOf<String?>(null) }
         var prevPrefetch by remember { mutableStateOf<String?>(null) }
@@ -1041,8 +1039,8 @@ private object SurveyAppRootInternal {
     // Warmup/model label helpers
     // ---------------------------------------------------------------------
 
-    private fun isPrefetchInProgress(state: PrefetchState): Boolean {
-        return state is PrefetchState.Running
+    private fun isPrefetchInProgress(state: WarmupController.PrefetchState): Boolean {
+        return state is WarmupController.PrefetchState.Running
     }
 
     private fun modelLabelForUi(state: ModelDownloadController.ModelState): String {
@@ -1068,7 +1066,7 @@ private object SurveyAppRootInternal {
     }
 
     private fun prefetchLabelForUi(
-        state: PrefetchState,
+        state: WarmupController.PrefetchState,
         elapsedMs: Long,
         format: WarmupUiFormat,
     ): String {
@@ -1082,15 +1080,15 @@ private object SurveyAppRootInternal {
     }
 
     private fun compileLabelForUi(
-        state: CompileState,
+        state: WarmupController.CompileState,
         elapsedMs: Long,
         format: WarmupUiFormat,
     ): String {
         val elapsed = formatElapsed(elapsedMs)
         return when (state) {
-            is CompileState.WaitingForPrefetch -> "${format.compileWaitingPrefix} $elapsed"
-            is CompileState.Compiling -> "${format.compileCompilingPrefix} $elapsed"
-            is CompileState.Idle -> format.idleLabel
+            is WarmupController.CompileState.WaitingForPrefetch -> "${format.compileWaitingPrefix} $elapsed"
+            is WarmupController.CompileState.Compiling -> "${format.compileCompilingPrefix} $elapsed"
+            is WarmupController.CompileState.Idle -> format.idleLabel
             else -> "${state.javaClass.simpleName} $elapsed"
         }
     }
@@ -1147,14 +1145,14 @@ private object SurveyAppRootInternal {
 
     @Composable
     private fun rememberWarmupUiLabels(
-        prefetchState: PrefetchState,
-        compileState: CompileState,
+        prefetchState: WarmupController.PrefetchState,
+        compileState: WarmupController.CompileState,
         tickIntervalMs: Long,
         format: WarmupUiFormat,
     ): Pair<String, String> {
         val prefetchInProgress = isPrefetchInProgress(prefetchState)
         val compileInProgress =
-            compileState is CompileState.WaitingForPrefetch || compileState is CompileState.Compiling
+            compileState is WarmupController.CompileState.WaitingForPrefetch || compileState is WarmupController.CompileState.Compiling
 
         val inProgress = prefetchInProgress || compileInProgress
         val nowMs = rememberWarmupUiNowMs(inProgress = inProgress, tickIntervalMs = tickIntervalMs)

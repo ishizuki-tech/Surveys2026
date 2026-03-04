@@ -23,6 +23,8 @@ kaml = "0.104.0"
 # LiteRT-LM
 litertlm = "0.9.0-alpha04"
 uiText = "1.10.3"
+datastoreCore = "1.2.0"
+firebaseFirestoreKtx = "26.1.1"
 
 [libraries]
 # AndroidX core / lifecycle
@@ -70,6 +72,8 @@ junit = { module = "junit:junit", version.ref = "junit4" }
 androidx-junit = { module = "androidx.test.ext:junit", version.ref = "androidxJunit" }
 androidx-espresso-core = { module = "androidx.test.espresso:espresso-core", version.ref = "espressoCore" }
 androidx-compose-ui-text = { group = "androidx.compose.ui", name = "ui-text", version.ref = "uiText" }
+androidx-datastore-core = { group = "androidx.datastore", name = "datastore-core", version.ref = "datastoreCore" }
+firebase-firestore-ktx = { group = "com.google.firebase", name = "firebase-firestore-ktx", version.ref = "firebaseFirestoreKtx" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }

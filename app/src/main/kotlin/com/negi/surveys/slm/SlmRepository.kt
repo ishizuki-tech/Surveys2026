@@ -14,11 +14,15 @@
 package com.negi.surveys.slm
 
 import android.content.Context
+import com.google.ai.edge.litertlm.Message
+import com.negi.surveys.chat.DefaultSlmPromptBuilder
 import com.negi.surveys.chat.RepositoryI
+import com.negi.surveys.chat.SlmPromptBuilder
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.logging.SafeLog
+import com.negi.surveys.warmup.WarmupController
 import java.io.File
 import java.security.MessageDigest
 import java.util.UUID
@@ -51,6 +55,11 @@ import org.json.JSONObject
  * - buildPrompt() MUST NOT perform I/O (it is non-suspend and may be called on main thread).
  * - SurveyConfig should come from a single source (installed config).
  * - Optional asset fallback is allowed ONLY in suspend paths and must never auto-install config.
+ * - Prompt composition is delegated to [SlmPromptBuilder] for single-source prompt contract.
+ *
+ * Warmup notes:
+ * - WarmupController/SLMWarmupEngine will attempt to warm the repository by calling [warmup].
+ * - IMPORTANT: warmup() must NOT hop threads internally (to preserve EGL context if the caller provided one).
  */
 class SlmRepository(
     context: Context,
@@ -75,9 +84,18 @@ class SlmRepository(
      */
     private val allowAssetConfigFallback: Boolean = false,
 
+    /**
+     * Injected prompt builder.
+     *
+     * NOTE:
+     * - Keep it stateless.
+     * - Do NOT perform I/O inside the builder.
+     */
+    private val promptBuilder: SlmPromptBuilder = DefaultSlmPromptBuilder,
+
     /** Debug options (safe defaults). */
     debug: DebugConfig = DebugConfig(),
-) : RepositoryI {
+) : RepositoryI, WarmupController.WarmupCapableRepository {
 
     data class DebugConfig(
         /** Enable debug logging. */
@@ -127,7 +145,7 @@ class SlmRepository(
 
         // IMPORTANT: No I/O here. Only use already-installed or cached config.
         val sys = getSystemPromptFromCacheOnly()
-        return PromptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
+        return promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
     }
 
     override suspend fun request(prompt: String): Flow<String> {
@@ -140,16 +158,22 @@ class SlmRepository(
         val stat = safeFileStat(file)
 
         if (!stat.exists || !stat.isFile || stat.length <= 0L) {
-            AppLog.w(
-                TAG,
-                "Model not ready: exists=${stat.exists} isFile=${stat.isFile} len=${stat.length} " +
-                        "name=${file.name} path=${file.absolutePath}",
-            )
-            throw ModelNotReadyException("Model file missing or empty: ${file.name}")
+            // Privacy-safe: do not log file name/path.
+            AppLog.w(TAG, "Model not ready: exists=${stat.exists} isFile=${stat.isFile} len=${stat.length}")
+            throw ModelNotReadyException("Model file missing or empty")
         }
 
         val model = getOrCreateModel(cfg = cfg, file = file)
-        awaitInitializedModelOnce(model)
+
+        // IMPORTANT:
+        // - Do not run heavy initialization on the main thread.
+        // - warmup() path may run inside an EGL context; therefore init itself must not hop threads.
+        withContext(Dispatchers.Default) {
+            awaitInitializedModelOnce(
+                model = model,
+                initOptions = InitOptions.defaultForRepo(),
+            )
+        }
 
         return if (enableTwoStepEval) {
             requestEvalScoreThenFollowUp(model = model, userPrompt = userPrompt)
@@ -159,131 +183,44 @@ class SlmRepository(
                 ?.trim()
                 ?.takeIf { it.isNotBlank() }
 
-            val p = PromptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = userPrompt)
+            val p = promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = userPrompt)
             requestOneStep(model = model, prompt = p)
         }
     }
 
-    // ---------------------------------------------------------------------
-    // Prompt building
-    // ---------------------------------------------------------------------
+    /**
+     * Warmup entry point for WarmupController/SLMWarmupEngine.
+     *
+     * Contract:
+     * - Must not hop threads internally (caller may have provided EGL context).
+     * - Must not perform network I/O.
+     * - Safe to call multiple times (idempotent-ish via init signature).
+     */
+    override suspend fun warmup(
+        appContext: Context,
+        modelFile: File,
+        options: WarmupController.Options,
+    ): Boolean {
+        val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: cachedConfig.get()
 
-    private object PromptBuilder {
-
-        fun buildEvalScorePrompt(
-            questionId: String,
-            userPrompt: String,
-            acceptScoreThreshold: Int,
-        ): String {
-            val clippedUser = clipForEval(userPrompt, EVAL_USER_PROMPT_MAX_CHARS)
-
-            return """
-                Return exactly ONE JSON object and nothing else.
-                - No markdown, no code fences, no backticks.
-                - Output must start with "{" and end with "}".
-                - Use double quotes for all JSON strings.
-                - Do not include trailing commas.
-
-                Required keys:
-                - "status": either "ACCEPTED" or "NEED_FOLLOW_UP"
-                - "score": integer from 0 to 100
-                - "reason": short string (<= 160 chars)
-
-                Optional key:
-                - "missing": array of short strings describing missing info.
-
-                Scoring guidance:
-                - 90-100: fully answerable, clear constraints, no key ambiguity.
-                - 70-89: answerable but minor ambiguity.
-                - 40-69: missing important constraints; follow-up is needed.
-                - 0-39: very unclear; must ask follow-up.
-
-                Decision rule:
-                - If score >= $acceptScoreThreshold => status="ACCEPTED"
-                - Else => status="NEED_FOLLOW_UP"
-
-                QUESTION_ID: $questionId
-
-                USER_PROMPT:
-                $clippedUser
-            """.trimIndent()
+        val stat = safeFileStat(modelFile)
+        if (!stat.exists || !stat.isFile || stat.length <= 0L) {
+            AppLog.w(TAG, "warmup: skipped (model file missing/empty) exists=${stat.exists} isFile=${stat.isFile} len=${stat.length}")
+            return false
         }
 
-        fun buildFollowUpPrompt(
-            questionId: String,
-            userPrompt: String,
-            evalJson: String,
-            acceptScoreThreshold: Int,
-        ): String {
+        return runCatching {
+            val model = getOrCreateModel(cfg = cfg, file = modelFile)
 
-            val clippedEval = clipForEval(evalJson, FOLLOWUP_EVAL_JSON_MAX_CHARS)
-            val clippedUser = clipForEval(userPrompt, FOLLOWUP_USER_PROMPT_MAX_CHARS)
-
-            return """
-                Return exactly ONE JSON object and nothing else.
-                - No markdown, no code fences, no backticks.
-                - Output must start with "{" and end with "}".
-                - Use double quotes for all JSON strings.
-                - Do not include trailing commas.
-
-                Valid shapes:
-                1) {"status":"ACCEPTED","followUpQuestion":""}
-                2) {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
-
-                Rules:
-                - Read EVAL_JSON and USER_PROMPT.
-                - If EVAL_JSON.score >= $acceptScoreThreshold:
-                    - Return ACCEPTED with followUpQuestion="".
-                - Else:
-                    - Return NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
-                    - The question must target the most important missing constraint.
-                    - Do not repeat large chunks of USER_PROMPT verbatim.
-
-                QUESTION_ID: $questionId
-
-                EVAL_JSON:
-                $clippedEval
-
-                USER_PROMPT:
-                $clippedUser
-            """.trimIndent()
-        }
-
-        fun buildAnswerLikePrompt(
-            systemPrompt: String?,
-            userPrompt: String,
-        ): String {
-            val u = userPrompt.trim()
-            if (u.isBlank()) return ""
-
-            val sys = systemPrompt.orEmpty().trim()
-            if (sys.isBlank()) return u
-
-            return """
-                $sys
-
-                $u
-            """.trimIndent()
-        }
-
-        private fun clipForEval(text: String, maxChars: Int): String {
-            if (maxChars <= 0) return ""
-            if (text.length <= maxChars) return text
-
-            var end = maxChars.coerceAtMost(text.length)
-            if (end <= 0) return ""
-
-            // Prevent cutting surrogate pairs.
-            if (end < text.length) {
-                val last = text[end - 1]
-                val next = text[end]
-                if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
-                    end -= 1
-                }
-            }
-
-            if (end <= 0) return ""
-            return text.take(end)
+            awaitInitializedModelOnce(
+                model = model,
+                initOptions = InitOptions.fromWarmupOptions(options),
+            )
+            true
+        }.getOrElse { t ->
+            // Privacy-safe: avoid logging exception messages/paths.
+            AppLog.w(TAG, "warmup: failed type=${t.javaClass.simpleName}")
+            false
         }
     }
 
@@ -335,10 +272,11 @@ class SlmRepository(
                             resetConversationBestEffort(model, reason = "evalScore")
                         }
 
-                        val evalPrompt = PromptBuilder.buildEvalScorePrompt(
+                        val evalPrompt = promptBuilder.buildEvalScorePrompt(
                             questionId = questionId,
                             userPrompt = u,
                             acceptScoreThreshold = acceptScoreThreshold,
+                            userPromptMaxChars = EVAL_USER_PROMPT_MAX_CHARS,
                         )
 
                         dbgLogPrompt(
@@ -394,11 +332,13 @@ class SlmRepository(
                             resetConversationBestEffort(model, reason = "followUp")
                         }
 
-                        val followUpPrompt = PromptBuilder.buildFollowUpPrompt(
+                        val followUpPrompt = promptBuilder.buildFollowUpPrompt(
                             questionId = questionId,
                             userPrompt = u,
                             evalJson = evalJsonRaw ?: evalResult.text,
                             acceptScoreThreshold = acceptScoreThreshold,
+                            userPromptMaxChars = FOLLOWUP_USER_PROMPT_MAX_CHARS,
+                            evalJsonMaxChars = FOLLOWUP_EVAL_JSON_MAX_CHARS,
                         )
 
                         dbgLogPrompt(
@@ -639,8 +579,11 @@ class SlmRepository(
                 else finishOnce(reason = "COMPLETED; $mes", earlyStop = false)
             },
             onError = { msg ->
+                val current = reasonRef.get()
                 if (msg.equals("Cancelled", ignoreCase = true)) {
-                    finishOnce(reason = "CANCELLED", earlyStop = true)
+                    if (current == "MAX_CHARS") finishOnce(reason = "MAX_CHARS; Cancelled", earlyStop = true)
+                    else if (current == "TIMEOUT") finishOnce(reason = "TIMEOUT; Cancelled", earlyStop = true)
+                    else finishOnce(reason = "CANCELLED", earlyStop = true)
                 } else {
                     errRef.set(msg)
                     finishOnce(reason = "ERROR", earlyStop = true)
@@ -686,10 +629,6 @@ class SlmRepository(
 
     /**
      * Extracts the first complete JSON object from a text stream.
-     *
-     * Why:
-     * - LLMs sometimes emit prefixes/suffixes (whitespace, stray tokens).
-     * - "first '{' to last '}'" is unsafe when multiple objects or braces exist.
      */
     private fun extractFirstCompleteJsonObjectBestEffort(text: String): String? {
         val s = text
@@ -876,14 +815,6 @@ class SlmRepository(
     // Config + model resolution
     // ---------------------------------------------------------------------
 
-    /**
-     * Best-effort config fetch:
-     * - Prefer installed config (single source).
-     * - If missing and fallback enabled, load from assets on Dispatchers.IO (suspend path only).
-     *
-     * IMPORTANT:
-     * - This function must never install config.
-     */
     private suspend fun getConfigSuspendBestEffort(): SurveyConfig? {
         SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
             cachedConfig.set(cfg)
@@ -920,12 +851,6 @@ class SlmRepository(
         }
     }
 
-    /**
-     * Resolves model file under app filesDir.
-     *
-     * Security:
-     * - Prevent path traversal by accepting only a simple file name.
-     */
     private fun resolveModelFile(cfg: SurveyConfig?): File {
         val rawFileName = cfg?.modelDefaults?.defaultFileName
             ?.trim()
@@ -972,7 +897,11 @@ class SlmRepository(
         val key = "$modelName::${file.absolutePath}"
         val holder = modelCache.getOrPut(key) {
             val modelConfig: Map<Model.ConfigKey, Any> = Model.buildModelConfigSafe(cfg?.slm)
-            AppLog.d(TAG, "ModelCache create: key=$key cfgPresent=${cfg != null} file=${file.name}")
+
+            // Privacy-safe: do not log absolute paths or file names.
+            val fileLen = runCatching { file.length() }.getOrDefault(-1L)
+            AppLog.d(TAG, "ModelCache create: modelName=$modelName cfgPresent=${cfg != null} fileLen=$fileLen")
+
             ModelHolder(
                 model = Model(
                     name = modelName,
@@ -988,48 +917,91 @@ class SlmRepository(
         val model: Model,
         val initMutex: Mutex = Mutex(),
         val initialized: AtomicBoolean = AtomicBoolean(false),
+        val initSignatureRef: AtomicReference<String?> = AtomicReference(null),
     )
 
-    /**
-     * Ensures the SDK is initialized once per model key.
-     * This reduces redundant init calls and log noise.
-     */
-    private suspend fun awaitInitializedModelOnce(model: Model) {
-        val key = "${model.name}::${model.taskPath}"
-        val holder = modelCache[key]
-        if (holder == null) {
-            // Fall back to direct init if the model was not created via cache (should be rare).
-            awaitInitializedModel(model)
-            return
+    private data class InitOptions(
+        val supportImage: Boolean,
+        val supportAudio: Boolean,
+        val systemMessage: Message?,
+        val tools: List<Any>,
+    ) {
+        fun signature(): String {
+            val sys = if (systemMessage != null) 1 else 0
+            return "img=${if (supportImage) 1 else 0};aud=${if (supportAudio) 1 else 0};sys=$sys;tools=${tools.size}"
         }
 
-        if (holder.initialized.get()) return
+        companion object {
+            fun defaultForRepo(): InitOptions {
+                return InitOptions(
+                    supportImage = false,
+                    supportAudio = false,
+                    systemMessage = null,
+                    tools = emptyList(),
+                )
+            }
 
-        holder.initMutex.withLock {
-            if (holder.initialized.get()) return@withLock
-            awaitInitializedModel(model)
-            holder.initialized.set(true)
+            fun fromWarmupOptions(options: WarmupController.Options): InitOptions {
+                val sys = options.systemMessage as? Message
+                return InitOptions(
+                    supportImage = options.supportImage,
+                    supportAudio = options.supportAudio,
+                    systemMessage = sys,
+                    tools = options.tools,
+                )
+            }
         }
     }
 
-    private suspend fun awaitInitializedModel(model: Model) {
-        withContext(Dispatchers.Default) {
-            runCatching { SLM.setApplicationContext(appContext) }
-
-            AppLog.d(
-                TAG,
-                "initializeIfNeeded: model='${model.name}' file='${File(model.taskPath).name}' path='${model.taskPath}'",
-            )
-
-            SLM.initializeIfNeeded(
-                context = appContext,
+    private suspend fun awaitInitializedModelOnce(
+        model: Model,
+        initOptions: InitOptions,
+    ) {
+        val key = "${model.name}::${model.taskPath}"
+        val holder = modelCache[key]
+        if (holder == null) {
+            initializeSdkIfNeeded(
                 model = model,
-                supportImage = false,
-                supportAudio = false,
-                systemMessage = null,
-                tools = emptyList(),
+                initOptions = initOptions,
             )
+            return
         }
+
+        val desiredSig = initOptions.signature()
+        val existingSig = holder.initSignatureRef.get()
+        if (holder.initialized.get() && existingSig == desiredSig) return
+
+        holder.initMutex.withLock {
+            val sigNow = holder.initSignatureRef.get()
+            if (holder.initialized.get() && sigNow == desiredSig) return@withLock
+
+            initializeSdkIfNeeded(
+                model = model,
+                initOptions = initOptions,
+            )
+
+            holder.initialized.set(true)
+            holder.initSignatureRef.set(desiredSig)
+        }
+    }
+
+    private suspend fun initializeSdkIfNeeded(
+        model: Model,
+        initOptions: InitOptions,
+    ) {
+        runCatching { SLM.setApplicationContext(appContext) }
+
+        // Privacy-safe: avoid logging file paths/names.
+        AppLog.d(TAG, "initializeIfNeeded: model='${model.name}'")
+
+        SLM.initializeIfNeeded(
+            context = appContext,
+            model = model,
+            supportImage = initOptions.supportImage,
+            supportAudio = initOptions.supportAudio,
+            systemMessage = initOptions.systemMessage,
+            tools = initOptions.tools,
+        )
     }
 
     private suspend fun resetConversationBestEffort(model: Model, reason: String) {
@@ -1045,10 +1017,7 @@ class SlmRepository(
         }.getOrNull() == true
 
         if (!ok) {
-            AppLog.w(
-                TAG,
-                "resetConversationAndAwait failed or timed out; continuing: reason='$reason' model='${model.name}'",
-            )
+            AppLog.w(TAG, "resetConversationAndAwait failed or timed out; continuing: reason='$reason' model='${model.name}'")
         }
     }
 

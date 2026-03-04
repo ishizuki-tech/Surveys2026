@@ -403,6 +403,7 @@ dependencies {
     // Tooling (preview/debug)
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.ui.text)
+    implementation(libs.androidx.datastore.core)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
     // Icons
