@@ -14,8 +14,8 @@
 package com.negi.surveys
 
 import android.content.Context
+import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.chat.FakeSlmRepository
-import com.negi.surveys.chat.RepositoryI
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.slm.SlmRepository
@@ -63,14 +63,14 @@ object AppProcessServices {
     // Repository (process scoped)
     // ---------------------------------------------------------------------
 
-    private val repoRef = AtomicReference<RepositoryI?>(null)
+    private val repoRef = AtomicReference<ChatValidation.RepositoryI?>(null)
     private val repoModeRef = AtomicReference<RepoMode?>(null)
     private val repoLock = Any()
 
     fun repository(
         context: Context,
         mode: RepoMode,
-    ): RepositoryI {
+    ): ChatValidation.RepositoryI {
         val appCtx = context.applicationContext
 
         val cur = repoRef.get()
@@ -78,15 +78,15 @@ object AppProcessServices {
         if (cur != null && curMode == mode) return cur
 
         var toClose: Any? = null
-        var createdNow: RepositoryI? = null
+        var createdNow: ChatValidation.RepositoryI? = null
 
-        val installed: RepositoryI =
+        val installed: ChatValidation.RepositoryI =
             synchronized(repoLock) {
                 val insideCur = repoRef.get()
                 val insideMode = repoModeRef.get()
                 if (insideCur != null && insideMode == mode) return insideCur
 
-                val created: RepositoryI =
+                val created: ChatValidation.RepositoryI =
                     when (mode) {
                         RepoMode.ON_DEVICE -> {
                             // IMPORTANT: Avoid logging raw model outputs in production.

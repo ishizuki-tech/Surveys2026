@@ -321,49 +321,6 @@ object ChatModels {
     }
 
     /**
-     * Streaming events emitted by the model layer.
-     *
-     * Design:
-     * - Every event carries a [sessionId] so the ViewModel can safely ignore stale/overlapping streams.
-     */
-    @Immutable
-    sealed interface ChatStreamEvent {
-
-        /** Stream session started. */
-        @Immutable
-        data class Begin(val sessionId: Long) : ChatStreamEvent
-
-        /**
-         * Incremental token/text delta.
-         *
-         * Notes:
-         * - [text] should be small and append-only.
-         */
-        @Immutable
-        data class Delta(
-            val sessionId: Long,
-            val text: String
-        ) : ChatStreamEvent
-
-        /** Stream session completed normally. */
-        @Immutable
-        data class End(val sessionId: Long) : ChatStreamEvent
-
-        /**
-         * Stream session failed.
-         *
-         * @param token Short, metadata-only token (e.g., "TimeoutCancellationException", "io_error").
-         * @param code Optional stable code for programmatic handling (e.g., "TIMEOUT", "CANCELLED", "E_IO").
-         */
-        @Immutable
-        data class Error(
-            val sessionId: Long,
-            val token: String,
-            val code: String? = null
-        ) : ChatStreamEvent
-    }
-
-    /**
      * Validation status for an answer.
      */
     enum class ValidationStatus {

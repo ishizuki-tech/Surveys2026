@@ -43,6 +43,10 @@ import kotlinx.coroutines.flow.asStateFlow
  * Threading contract:
  * - All producer APIs are safe to call from any thread.
  * - Event ordering is enforced per session: Begin -> Delta* -> End/Error.
+ *
+ * IMPORTANT (stability):
+ * - Error.code MUST be a stable enum-like value (ChatStreamEvent.Codes.*).
+ * - Error.token is metadata-only and may be a sanitized message.
  */
 class ChatStreamBridge(
     private val logger: ((String) -> Unit)? = null
@@ -164,7 +168,8 @@ class ChatStreamBridge(
             // NOTE: "replaced" is not a cancel; we do not record it as lastCancel*.
             terminateLocked(
                 sessionId = prev,
-                reason = REPLACED_MESSAGE,
+                token = ChatStreamEvent.Codes.REPLACED,
+                code = ChatStreamEvent.Codes.REPLACED,
                 kind = "Error(replaced)",
                 recordAsCancel = false
             )
@@ -186,7 +191,7 @@ class ChatStreamBridge(
      * Emit a delta chunk for an active session.
      *
      * IMPORTANT:
-     * - This method is synchronized to guarantee ordering against end()/error()/cancel().
+     * - This method is synchronized to guarantee ordering against end()/error()/cancel()/timeout().
      * - Without this, "Delta after End/Error" can happen under race conditions.
      */
     fun emitChunk(sessionId: Long, chunk: String) {
@@ -228,6 +233,12 @@ class ChatStreamBridge(
         publishStats(force = true)
     }
 
+    /**
+     * Emits an error with a stable ERROR code and a sanitized token.
+     *
+     * NOTE:
+     * - Use [timeout] for stable TIMEOUT classification.
+     */
     fun error(sessionId: Long, message: String): Unit = synchronized(lock) {
         if (sessionId <= 0L) return
 
@@ -238,19 +249,60 @@ class ChatStreamBridge(
             return
         }
 
-        val msg = sanitizeReason(message, fallback = ERROR_MESSAGE)
+        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.ERROR)
         terminateLocked(
             sessionId = sessionId,
-            reason = msg,
+            token = token,
+            code = ChatStreamEvent.Codes.ERROR,
             kind = "Error",
             recordAsCancel = false
         )
 
-        logger?.invoke("ChatStreamBridge: error session=$sessionId msg=${msg.take(32)}")
+        logger?.invoke("ChatStreamBridge: error session=$sessionId token=${token.take(32)}")
         publishStats(force = true)
     }
 
-    fun cancel(sessionId: Long, message: String = CANCELLED_MESSAGE): Long = synchronized(lock) {
+    /**
+     * Emits a timeout with a stable TIMEOUT code.
+     */
+    fun timeout(sessionId: Long, message: String = ChatStreamEvent.Codes.TIMEOUT): Long = synchronized(lock) {
+        if (sessionId <= 0L) return 0L
+
+        val active = activeSessionId.get()
+        if (active != sessionId) {
+            ignoredError.incrementAndGet()
+            publishStats(force = true)
+            return 0L
+        }
+
+        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.TIMEOUT)
+        terminateLocked(
+            sessionId = sessionId,
+            token = token,
+            code = ChatStreamEvent.Codes.TIMEOUT,
+            kind = "Error(timeout)",
+            recordAsCancel = false
+        )
+
+        logger?.invoke("ChatStreamBridge: timeout session=$sessionId token=${token.take(32)}")
+        publishStats(force = true)
+        sessionId
+    }
+
+    /**
+     * Emits a timeout for the currently active session, if any.
+     */
+    fun timeoutActive(message: String = ChatStreamEvent.Codes.TIMEOUT): Long = synchronized(lock) {
+        val id = activeSessionId.get()
+        if (id <= 0L) {
+            ignoredError.incrementAndGet()
+            publishStats(force = true)
+            return 0L
+        }
+        return timeout(id, message)
+    }
+
+    fun cancel(sessionId: Long, message: String = ChatStreamEvent.Codes.CANCELLED): Long = synchronized(lock) {
         if (sessionId <= 0L) return 0L
 
         val active = activeSessionId.get()
@@ -260,20 +312,21 @@ class ChatStreamBridge(
             return 0L
         }
 
-        val msg = sanitizeReason(message, fallback = CANCELLED_MESSAGE)
+        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.CANCELLED)
         terminateLocked(
             sessionId = sessionId,
-            reason = msg,
+            token = token,
+            code = ChatStreamEvent.Codes.CANCELLED,
             kind = "Error(cancel)",
             recordAsCancel = true
         )
 
-        logger?.invoke("ChatStreamBridge: cancel session=$sessionId msg=${msg.take(32)}")
+        logger?.invoke("ChatStreamBridge: cancel session=$sessionId token=${token.take(32)}")
         publishStats(force = true)
         sessionId
     }
 
-    fun cancelActive(message: String = CANCELLED_MESSAGE): Long = synchronized(lock) {
+    fun cancelActive(message: String = ChatStreamEvent.Codes.CANCELLED): Long = synchronized(lock) {
         val id = activeSessionId.get()
         if (id <= 0L) {
             ignoredCancel.incrementAndGet()
@@ -281,15 +334,16 @@ class ChatStreamBridge(
             return 0L
         }
 
-        val msg = sanitizeReason(message, fallback = CANCELLED_MESSAGE)
+        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.CANCELLED)
         terminateLocked(
             sessionId = id,
-            reason = msg,
+            token = token,
+            code = ChatStreamEvent.Codes.CANCELLED,
             kind = "Error(cancelActive)",
             recordAsCancel = true
         )
 
-        logger?.invoke("ChatStreamBridge: cancelActive session=$id msg=${msg.take(32)}")
+        logger?.invoke("ChatStreamBridge: cancelActive session=$id token=${token.take(32)}")
         publishStats(force = true)
         id
     }
@@ -300,7 +354,8 @@ class ChatStreamBridge(
 
     private fun terminateLocked(
         sessionId: Long,
-        reason: String,
+        token: String,
+        code: String,
         kind: String,
         recordAsCancel: Boolean
     ) {
@@ -309,15 +364,15 @@ class ChatStreamBridge(
 
         if (recordAsCancel) {
             lastCancelSessionId = sessionId
-            lastCancelMessage = reason
+            lastCancelMessage = token
         }
 
         emittedError.incrementAndGet()
         emitEvent(
             ChatStreamEvent.Error(
                 sessionId = sessionId,
-                token = reason,
-                code = reason
+                token = token,
+                code = code
             ),
             kind = kind,
             sessionId = sessionId
@@ -345,11 +400,5 @@ class ChatStreamBridge(
         }
 
         return normalized.trim().take(maxLen)
-    }
-
-    private companion object {
-        private const val CANCELLED_MESSAGE = "cancelled"
-        private const val REPLACED_MESSAGE = "replaced"
-        private const val ERROR_MESSAGE = "error"
     }
 }

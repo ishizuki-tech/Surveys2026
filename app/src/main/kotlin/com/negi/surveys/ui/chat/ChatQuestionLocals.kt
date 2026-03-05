@@ -14,7 +14,7 @@
 package com.negi.surveys.ui.chat
 
 import androidx.compose.runtime.staticCompositionLocalOf
-import com.negi.surveys.chat.RepositoryI
+import com.negi.surveys.chat.ChatValidation
 
 /**
  * Required CompositionLocal for [RepositoryI].
@@ -27,6 +27,6 @@ import com.negi.surveys.chat.RepositoryI
  * - Provide in your app root:
  *   CompositionLocalProvider(LocalRepositoryI provides repository) { ... }
  */
-val LocalRepositoryI = staticCompositionLocalOf<RepositoryI> {
+val LocalRepositoryI = staticCompositionLocalOf<ChatValidation.RepositoryI> {
     error("LocalRepositoryI is not provided. Provide RepositoryI in SurveyAppRoot via CompositionLocalProvider.")
 }

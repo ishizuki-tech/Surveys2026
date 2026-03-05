@@ -16,20 +16,6 @@ package com.negi.surveys.chat
 import androidx.compose.runtime.Immutable
 
 /**
- * Stable tokens/codes shared across Bridge/VM/UI.
- *
- * Notes:
- * - token: metadata-only label (may be same as code).
- * - code: stable machine-readable short code for programmatic handling.
- */
-object ChatStreamCodes {
-    const val CANCELLED: String = "cancelled"
-    const val REPLACED: String = "replaced"
-    const val TIMEOUT: String = "timeout"
-    const val ERROR: String = "error"
-}
-
-/**
  * Streaming events emitted by the model layer.
  *
  * Design:
@@ -48,6 +34,16 @@ object ChatStreamCodes {
  */
 @Immutable
 sealed interface ChatStreamEvent {
+
+    /**
+     * Stable tokens/codes shared across Bridge/VM/UI.
+     */
+    object Codes {
+        const val CANCELLED: String = "cancelled"
+        const val REPLACED: String = "replaced"
+        const val TIMEOUT: String = "timeout"
+        const val ERROR: String = "error"
+    }
 
     /** Stream session started. */
     @Immutable

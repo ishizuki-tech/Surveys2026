@@ -15,10 +15,10 @@ package com.negi.surveys.ui.chat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
-import com.negi.surveys.chat.AnswerValidatorI
 import com.negi.surveys.chat.ChatDrafts
 import com.negi.surveys.chat.ChatQuestionViewModel
 import com.negi.surveys.chat.ChatStreamBridge
+import com.negi.surveys.chat.ChatValidation
 
 /**
  * Factory for [ChatQuestionViewModel].
@@ -30,7 +30,7 @@ import com.negi.surveys.chat.ChatStreamBridge
 internal class ChatQuestionViewModelFactory(
     private val questionId: String,
     private val prompt: String,
-    private val validator: AnswerValidatorI,
+    private val validator: ChatValidation.AnswerValidatorI,
     private val streamBridge: ChatStreamBridge,
     private val draftStore: ChatDrafts.ChatDraftStore,
     private val draftKey: ChatDrafts.DraftKey
