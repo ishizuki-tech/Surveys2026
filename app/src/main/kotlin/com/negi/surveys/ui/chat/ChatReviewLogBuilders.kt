@@ -13,9 +13,7 @@
 
 package com.negi.surveys.ui.chat
 
-import com.negi.surveys.chat.ChatMessage
-import com.negi.surveys.chat.ChatRole
-import com.negi.surveys.chat.ChatStreamState
+import com.negi.surveys.chat.ChatModels
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.ui.ReviewChatKind
 import com.negi.surveys.ui.ReviewChatLine
@@ -93,7 +91,7 @@ internal object ChatReviewLogBuilders {
         prompt: String,
         isSkipped: Boolean,
         completionPayload: String,
-        messagesSnapshot: List<ChatMessage>
+        messagesSnapshot: List<ChatModels.ChatMessage>
     ): ReviewQuestionLog {
         val lines = ArrayList<ReviewChatLine>(messagesSnapshot.size * 2)
 
@@ -110,7 +108,7 @@ internal object ChatReviewLogBuilders {
 
         for (m in messagesSnapshot) {
             when (m.role) {
-                ChatRole.USER -> {
+                ChatModels.ChatRole.USER -> {
                     val t = clip(m.text.trim(), MAX_LINE_CHARS)
                     if (t.isNotEmpty()) {
                         lines += ReviewChatLine(kind = ReviewChatKind.USER, text = t)
@@ -118,7 +116,7 @@ internal object ChatReviewLogBuilders {
                     }
                 }
 
-                ChatRole.ASSISTANT -> {
+                ChatModels.ChatRole.ASSISTANT -> {
                     val a = clip(m.assistantMessage?.trim().orEmpty(), MAX_LINE_CHARS)
                     val fallback = clip(m.text.trim(), MAX_LINE_CHARS)
                     val q = normalizeFollowUp(m.followUpQuestion)
@@ -147,7 +145,7 @@ internal object ChatReviewLogBuilders {
                         }
 
                         val raw = m.streamText?.trim().orEmpty()
-                        if (raw.isNotEmpty() && m.streamState != ChatStreamState.NONE) {
+                        if (raw.isNotEmpty() && m.streamState != ChatModels.ChatStreamState.NONE) {
                             appendModelRawOnce(raw)
                         }
                         continue
@@ -165,12 +163,12 @@ internal object ChatReviewLogBuilders {
                     }
 
                     val raw = m.streamText?.trim().orEmpty()
-                    if (raw.isNotEmpty() && m.streamState != ChatStreamState.NONE) {
+                    if (raw.isNotEmpty() && m.streamState != ChatModels.ChatStreamState.NONE) {
                         appendModelRawOnce(raw)
                     }
                 }
 
-                ChatRole.MODEL -> {
+                ChatModels.ChatRole.MODEL -> {
                     if (isSkipped && !seenUser) continue
                     val raw = (m.streamText?.takeIf { it.isNotBlank() } ?: m.text).trim()
                     if (raw.isNotEmpty()) appendModelRawOnce(raw)
@@ -231,7 +229,7 @@ internal fun buildReviewQuestionLog(
     prompt: String,
     isSkipped: Boolean,
     completionPayload: String,
-    messagesSnapshot: List<ChatMessage>
+    messagesSnapshot: List<ChatModels.ChatMessage>
 ): ReviewQuestionLog =
     ChatReviewLogBuilders.buildReviewQuestionLog(
         questionId = questionId,

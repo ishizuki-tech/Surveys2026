@@ -73,7 +73,7 @@ internal fun BottomComposerCard(
         Column(modifier = Modifier.padding(12.dp)) {
             OutlinedTextField(
                 value = input,
-                onValueChange = { onInputChange(clipInput(it)) },
+                onValueChange = { onInputChange(clipInputPreserveSurrogates(it)) },
                 enabled = !isBusy,
                 label = {
                     Text(
@@ -143,9 +143,26 @@ internal fun BottomComposerCard(
 private const val MAX_INPUT_CHARS: Int = 8_000
 
 /**
- * Clip user input to a safe maximum.
+ * Clip user input to a safe maximum without splitting surrogate pairs.
+ *
+ * Notes:
+ * - Avoids producing invalid UTF-16 by cutting between high/low surrogate.
+ * - Returns empty when the limit is non-positive.
  */
-private fun clipInput(raw: String): String {
-    if (raw.length <= MAX_INPUT_CHARS) return raw
-    return raw.take(min(MAX_INPUT_CHARS, raw.length))
+private fun clipInputPreserveSurrogates(raw: String): String {
+    val n = MAX_INPUT_CHARS.coerceAtLeast(0)
+    if (n == 0) return ""
+    if (raw.length <= n) return raw
+
+    var end = min(n, raw.length)
+    if (end > 0 && end < raw.length) {
+        val last = raw[end - 1]
+        val next = raw[end]
+        if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
+            end -= 1
+        }
+    }
+
+    if (end <= 0) return ""
+    return raw.substring(0, end)
 }

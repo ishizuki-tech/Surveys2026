@@ -41,7 +41,7 @@ class AnswerValidator(
     private val logger: ((String) -> Unit)? = null
 ) : AnswerValidatorI {
 
-    override suspend fun validateMain(questionId: String, answer: String): ValidationOutcome {
+    override suspend fun validateMain(questionId: String, answer: String): ChatModels.ValidationOutcome {
         return withContext(Dispatchers.Default) {
             val t0 = SystemClock.elapsedRealtime()
 
@@ -82,7 +82,7 @@ class AnswerValidator(
         questionId: String,
         mainAnswer: String,
         followUpAnswer: String
-    ): ValidationOutcome {
+    ): ChatModels.ValidationOutcome {
         return withContext(Dispatchers.Default) {
             val t0 = SystemClock.elapsedRealtime()
 
@@ -137,37 +137,61 @@ class AnswerValidator(
 
         val fuRaw = followUpAnswerPayload?.trim().orEmpty()
         val hasFollowUp = fuRaw.isNotBlank()
+
+        // Detect "history" format. If it's not history, treat the payload as the actual follow-up answer text.
         val treatAsHistory = hasFollowUp && looksLikeFollowUpHistory(fuRaw)
 
-        val extracted = if (hasFollowUp) extractLatestFollowUpTurn(fuRaw) else null
-        val latestA = extracted?.answer?.trim().orEmpty()
-        val latestQ = extracted?.question?.trim().orEmpty()
+        val extracted: FollowUpTurnExtract? = if (hasFollowUp && treatAsHistory) {
+            extractLatestFollowUpTurn(fuRaw)
+        } else {
+            null
+        }
+
+        val followUpAnswerText: String = when {
+            !hasFollowUp -> ""
+            extracted != null && extracted.answer.isNotBlank() -> extracted.answer.trim()
+            // IMPORTANT FIX:
+            // If the payload is NOT a history format, it's a direct answer. Use it as-is.
+            !treatAsHistory -> fuRaw
+            // History detected but extraction failed (rare). Fallback to raw payload (clipped below).
+            else -> fuRaw
+        }
+
+        val followUpQuestionText: String = when {
+            extracted != null && extracted.question.isNotBlank() -> extracted.question.trim()
+            else -> ""
+        }
 
         if (hasFollowUp) {
             // Do NOT log raw answers. Only metadata.
-            val sha8 = sha256Hex(latestA).take(8)
+            val sha8 = sha256Hex(followUpAnswerText).take(8)
             log(
                 "followUpDetected: phase=${phase.tag} treatAsHistory=$treatAsHistory " +
-                        "latestQlen=${latestQ.length} latestAlen=${latestA.length} latestAsha8=$sha8"
+                        "latestQlen=${followUpQuestionText.length} latestAlen=${followUpAnswerText.length} latestAsha8=$sha8"
             )
         }
 
         val followUpSection = if (!hasFollowUp) {
             ""
         } else {
+            // Clip to keep prompt size sane (prevents prompt blowups when history is large).
+            val clippedA = followUpAnswerText.safeTrimAndClip(MAX_FOLLOW_UP_ANSWER_CHARS)
+            val clippedQ = followUpQuestionText.safeTrimAndClip(MAX_FOLLOW_UP_QUESTION_CHARS)
+            val clippedHistory = if (treatAsHistory) fuRaw.safeTrimAndClip(MAX_FOLLOW_UP_HISTORY_CHARS) else ""
+
             buildString {
                 appendLine("FOLLOW_UP_ANSWER_BEGIN")
-                if (latestA.isNotBlank()) appendLine(latestA)
+                if (clippedA.isNotBlank()) appendLine(clippedA)
                 appendLine("FOLLOW_UP_ANSWER_END")
                 appendLine()
 
                 appendLine("FOLLOW_UP_QUESTION:")
-                if (latestQ.isNotBlank()) appendLine(latestQ)
+                if (clippedQ.isNotBlank()) appendLine(clippedQ)
                 appendLine()
 
                 if (treatAsHistory) {
                     appendLine("FOLLOW_UP_HISTORY_BEGIN")
-                    appendLine(fuRaw)
+                    if (clippedHistory.isNotBlank()) appendLine(clippedHistory)
                     appendLine("FOLLOW_UP_HISTORY_END")
                     appendLine()
                 }
@@ -302,7 +326,7 @@ $followUpSection
         stopReason: FlowTextStopReason,
         errorToken: String?,
         fallbackFollowUp: String
-    ): ValidationOutcome {
+    ): ChatModels.ValidationOutcome {
         val cleaned = raw
             .replace("\u0000", "")
             .replace("\uFEFF", "")
@@ -324,8 +348,8 @@ $followUpSection
             }
 
             log("parseOutcome: qid=${questionId.trim()} empty -> stop=$stopReason token=$errorToken")
-            return ValidationOutcome(
-                status = ValidationStatus.NEED_FOLLOW_UP,
+            return ChatModels.ValidationOutcome(
+                status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = msg,
                 followUpQuestion = fallbackFollowUp
             )
@@ -345,8 +369,8 @@ $followUpSection
             }
 
             log("parseOutcome: qid=${questionId.trim()} jsonNotFound -> stop=$stopReason")
-            return ValidationOutcome(
-                status = ValidationStatus.NEED_FOLLOW_UP,
+            return ChatModels.ValidationOutcome(
+                status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = msg,
                 followUpQuestion = fallbackFollowUp
             )
@@ -363,30 +387,30 @@ $followUpSection
                 .ifEmpty { "Thanks." }
 
             val status = when (statusStr) {
-                "ACCEPTED" -> ValidationStatus.ACCEPTED
-                "NEED_FOLLOW_UP" -> ValidationStatus.NEED_FOLLOW_UP
-                else -> ValidationStatus.NEED_FOLLOW_UP
+                "ACCEPTED" -> ChatModels.ValidationStatus.ACCEPTED
+                "NEED_FOLLOW_UP" -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
+                else -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
             }
 
             val followUpNormalized = normalizeFollowUpQuestion(obj.optString("followUpQuestion", ""))
 
-            if (status == ValidationStatus.ACCEPTED) {
-                ValidationOutcome(
-                    status = ValidationStatus.ACCEPTED,
+            if (status == ChatModels.ValidationStatus.ACCEPTED) {
+                ChatModels.ValidationOutcome(
+                    status = ChatModels.ValidationStatus.ACCEPTED,
                     assistantMessage = assistantMessage,
                     followUpQuestion = null
                 )
             } else {
-                ValidationOutcome(
-                    status = ValidationStatus.NEED_FOLLOW_UP,
+                ChatModels.ValidationOutcome(
+                    status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
                     assistantMessage = assistantMessage,
                     followUpQuestion = followUpNormalized ?: fallbackFollowUp
                 )
             }
         } catch (_: Throwable) {
             log("parseOutcome: qid=${questionId.trim()} jsonParseError -> fallback NEED_FOLLOW_UP stop=$stopReason")
-            ValidationOutcome(
-                status = ValidationStatus.NEED_FOLLOW_UP,
+            ChatModels.ValidationOutcome(
+                status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = "Validation output was malformed. Please add one more detail.",
                 followUpQuestion = fallbackFollowUp
             )
@@ -504,24 +528,13 @@ $followUpSection
     private fun looksLikeFollowUpHistory(text: String): Boolean {
         val raw = text.trim()
         if (raw.isEmpty()) return false
-        val re = Regex("""^FOLLOW_UP_\d+_[QA]:\s*.*$""")
-        return raw.lineSequence().any { line -> re.matches(line.trim()) }
+        return raw.lineSequence().any { line -> FOLLOW_UP_HISTORY_LINE_RE.matches(line.trim()) }
     }
 
     private fun extractLatestFollowUpTurn(payload: String): FollowUpTurnExtract? {
         val normalized = payload.replace("\u0000", "").replace("\r\n", "\n").replace("\r", "\n")
         val lines = normalized.split('\n')
         if (lines.isEmpty()) return null
-
-        val currentQRe = Regex("""^CURRENT_FOLLOW_UP_Q:\s*(.*)$""")
-        val currentARe = Regex("""^CURRENT_FOLLOW_UP_A:\s*(.*)$""")
-
-        val qRe = Regex("""^FOLLOW_UP_(\d+)_Q:\s*(.*)$""")
-        val aRe = Regex("""^FOLLOW_UP_(\d+)_A:\s*(.*)$""")
-
-        val anyMarkerRe = Regex(
-            """^(CURRENT_FOLLOW_UP_[QA]|FOLLOW_UP_\d+_[QA]|FOLLOW_UP_TURNS:|FOLLOW_UP_HISTORY_BEGIN|FOLLOW_UP_HISTORY_END)\s*:?.*$"""
-        )
 
         var currentQ: String? = null
         var currentA: String? = null
@@ -533,7 +546,7 @@ $followUpSection
         fun readContinuation(startIndex: Int, head: String): Pair<String, Int> {
             val buf = StringBuilder().append(head)
             var j = startIndex + 1
-            while (j < lines.size && !anyMarkerRe.matches(lines[j].trim())) {
+            while (j < lines.size && !ANY_MARKER_RE.matches(lines[j].trim())) {
                 buf.append('\n').append(lines[j])
                 j++
             }
@@ -544,21 +557,21 @@ $followUpSection
         while (i < lines.size) {
             val t = lines[i].trim()
 
-            currentQRe.matchEntire(t)?.let { m ->
+            CURRENT_Q_RE.matchEntire(t)?.let { m ->
                 val (body, nextIdx) = readContinuation(i, m.groupValues[1])
                 currentQ = body
                 i = nextIdx
                 continue
             }
 
-            currentARe.matchEntire(t)?.let { m ->
+            CURRENT_A_RE.matchEntire(t)?.let { m ->
                 val (body, nextIdx) = readContinuation(i, m.groupValues[1])
                 currentA = body
                 i = nextIdx
                 continue
             }
 
-            val qm = qRe.matchEntire(t)
+            val qm = TURN_Q_RE.matchEntire(t)
             if (qm != null) {
                 val idx = qm.groupValues[1].toIntOrNull() ?: -1
                 val (body, nextIdx) = readContinuation(i, qm.groupValues[2])
@@ -570,7 +583,7 @@ $followUpSection
                 continue
             }
 
-            val am = aRe.matchEntire(t)
+            val am = TURN_A_RE.matchEntire(t)
             if (am != null) {
                 val idx = am.groupValues[1].toIntOrNull() ?: -1
                 val (body, nextIdx) = readContinuation(i, am.groupValues[2])
@@ -675,8 +688,45 @@ $followUpSection
         logger?.invoke(msg) ?: SafeLog.d(TAG, msg)
     }
 
+    /**
+     * Trim + clip to [limit] UTF-16 code units while preserving surrogate pairs.
+     */
+    private fun String.safeTrimAndClip(limit: Int): String {
+        val t = trim()
+        val n = limit.coerceAtLeast(0)
+        if (n == 0) return ""
+        if (t.length <= n) return t
+
+        var end = n
+        if (end > 0 && end < t.length) {
+            val last = t[end - 1]
+            val next = t[end]
+            if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
+                end -= 1
+            }
+        }
+        if (end <= 0) return ""
+        return t.substring(0, end)
+    }
+
     private companion object {
         private const val TAG = "AnswerValidator"
         private const val DEFAULT_TIMEOUT_MS = 90_000L
+
+        // Prompt-size guards (avoid giant follow-up payloads causing prompt bloat).
+        private const val MAX_FOLLOW_UP_ANSWER_CHARS = 8_000
+        private const val MAX_FOLLOW_UP_QUESTION_CHARS = 2_000
+        private const val MAX_FOLLOW_UP_HISTORY_CHARS = 16_000
+
+        // Precompiled regex (avoid per-call allocations).
+        private val FOLLOW_UP_HISTORY_LINE_RE = Regex("""^FOLLOW_UP_\d+_[QA]:\s*.*$""")
+        private val CURRENT_Q_RE = Regex("""^CURRENT_FOLLOW_UP_Q:\s*(.*)$""")
+        private val CURRENT_A_RE = Regex("""^CURRENT_FOLLOW_UP_A:\s*(.*)$""")
+        private val TURN_Q_RE = Regex("""^FOLLOW_UP_(\d+)_Q:\s*(.*)$""")
+        private val TURN_A_RE = Regex("""^FOLLOW_UP_(\d+)_A:\s*(.*)$""")
+
+        private val ANY_MARKER_RE = Regex(
+            """^(CURRENT_FOLLOW_UP_[QA]|FOLLOW_UP_\d+_[QA]|FOLLOW_UP_TURNS:|FOLLOW_UP_HISTORY_BEGIN|FOLLOW_UP_HISTORY_END)\s*:?.*$"""
+        )
     }
 }

@@ -14,6 +14,7 @@
 package com.negi.surveys.logging
 
 import android.content.Context
+import android.os.Build
 import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
@@ -62,6 +63,15 @@ object AppLog {
     /** Truncate throwable message (after sanitization). */
     private const val MAX_THROWABLE_MSG_CHARS: Int = 512
 
+    /** Pre-Android N (API < 24) Log tag length limit is 23 chars. */
+    private const val MAX_TAG_PRE_N: Int = 23
+
+    /**
+     * Disable file writes after repeated failures to avoid hot-loop exceptions.
+     * Logcat logging will continue.
+     */
+    private const val FILE_WRITE_FAIL_DISABLE_THRESHOLD: Long = 3L
+
     private val installed = AtomicBoolean(false)
     private val lock = Any()
 
@@ -76,6 +86,11 @@ object AppLog {
 
     /** Ensure rotate filenames are unique even if timestamps collide. */
     private val rotateSeq = AtomicLong(0L)
+
+    /** File write circuit-breaker. */
+    private val fileWritesEnabled = AtomicBoolean(true)
+    private val fileWriteFailCount = AtomicLong(0L)
+    private val fileWriteDisableLogged = AtomicBoolean(false)
 
     /** Thread-local UTC timestamp formatter (SimpleDateFormat is not thread-safe). */
     private val tsUtc: ThreadLocal<SimpleDateFormat> = ThreadLocal.withInitial {
@@ -142,7 +157,11 @@ object AppLog {
             installed.set(true)
 
             dirPath = dir.absolutePath
-            safeInstallId = runCatching { LogFiles.installId(app).take(8) }.getOrDefault("unknown")
+            safeInstallId = try {
+                LogFiles.installId(app).take(8)
+            } catch (_: Throwable) {
+                "unknown"
+            }
         }
 
         i(INTERNAL_TAG, "init: dir=$dirPath build=${LogFiles.buildLabelSafe()} installId=$safeInstallId")
@@ -175,10 +194,6 @@ object AppLog {
 
     /**
      * Returns the current log file (app.log), creating it if needed.
-     *
-     * Notes:
-     * - Always returns a File that exists (best-effort).
-     * - Does NOT expose secret values; it may write a minimal marker line.
      */
     fun getOrCreateCurrentLogFile(context: Context): File {
         ensureReady(context)
@@ -196,13 +211,6 @@ object AppLog {
 
     /**
      * Lists log files suitable for upload.
-     *
-     * Ordering:
-     * - Most recent first
-     * - Includes "app.log" and rotated "app-*.log"
-     *
-     * Notes:
-     * - If init() wasn't called, this will call ensureReady() and create app.log.
      */
     fun getLogFilesForUpload(context: Context): List<File> {
         ensureReady(context)
@@ -221,10 +229,6 @@ object AppLog {
 
     /**
      * Writes a lightweight marker line that is safe for upload/debug.
-     *
-     * Notes:
-     * - Useful to ensure the log file is non-empty right before uploading.
-     * - Message is sanitized and length-limited.
      */
     fun mark(context: Context, tag: String, msg: String) {
         ensureReady(context)
@@ -240,18 +244,45 @@ object AppLog {
     fun w(tag: String, msg: String, t: Throwable): Int = log(Log.WARN, tag, msg, t)
     fun e(tag: String, msg: String, t: Throwable): Int = log(Log.ERROR, tag, msg, t)
 
+    private fun normalizeTag(tag: String): String {
+        val trimmed = tag.trim()
+        val safe = if (trimmed.isNotEmpty()) trimmed else INTERNAL_TAG
+        return if (Build.VERSION.SDK_INT >= 24) safe else safe.take(MAX_TAG_PRE_N)
+    }
+
     private fun log(level: Int, tag: String, msg: String, t: Throwable?): Int {
-        val rc = when (level) {
-            Log.VERBOSE -> Log.v(tag, msg, t)
-            Log.DEBUG -> Log.d(tag, msg, t)
-            Log.INFO -> Log.i(tag, msg, t)
-            Log.WARN -> Log.w(tag, msg, t)
-            Log.ERROR -> Log.e(tag, msg, t)
-            else -> Log.d(tag, msg, t)
+        val safeTag = normalizeTag(tag)
+        val cleanMsg = sanitize(msg).take(MAX_MSG_CHARS)
+
+        val rc = try {
+            when (level) {
+                Log.VERBOSE -> Log.v(safeTag, cleanMsg, t)
+                Log.DEBUG -> Log.d(safeTag, cleanMsg, t)
+                Log.INFO -> Log.i(safeTag, cleanMsg, t)
+                Log.WARN -> Log.w(safeTag, cleanMsg, t)
+                Log.ERROR -> Log.e(safeTag, cleanMsg, t)
+                else -> Log.d(safeTag, cleanMsg, t)
+            }
+        } catch (_: Throwable) {
+            // Extremely defensive: never let logging crash.
+            0
         }
 
-        runCatching { writeLineOrBuffer(level, tag, msg, t) }
-            .onFailure { ex -> Log.w(INTERNAL_TAG, "file write failed: ${ex.javaClass.simpleName}") }
+        if (!fileWritesEnabled.get()) return rc
+
+        try {
+            writeLineOrBuffer(level, safeTag, cleanMsg, t)
+            fileWriteFailCount.set(0L)
+        } catch (ex: Throwable) {
+            val n = fileWriteFailCount.incrementAndGet()
+            Log.w(INTERNAL_TAG, "file write failed: ${ex.javaClass.simpleName} (count=$n)")
+
+            if (n >= FILE_WRITE_FAIL_DISABLE_THRESHOLD && fileWritesEnabled.compareAndSet(true, false)) {
+                if (fileWriteDisableLogged.compareAndSet(false, true)) {
+                    Log.w(INTERNAL_TAG, "file writes disabled after repeated failures")
+                }
+            }
+        }
 
         return rc
     }
@@ -297,7 +328,9 @@ object AppLog {
             else -> 'D'
         }
 
-        val cleanMsg = sanitize(msg).replace('\n', ' ').take(MAX_MSG_CHARS)
+        val cleanMsg = msg.replace('\n', ' ').take(MAX_MSG_CHARS)
+        val safeTag = tag.replace('\n', ' ').take(64)
+
         val extra = if (t != null) {
             val m = sanitize(t.message.orEmpty()).replace('\n', ' ').take(MAX_THROWABLE_MSG_CHARS)
             " | ${t.javaClass.simpleName}${if (m.isBlank()) "" else ": $m"}"
@@ -305,15 +338,11 @@ object AppLog {
             ""
         }
 
-        return "$now $lvl/${tag.take(64)}: $cleanMsg$extra\n"
+        return "$now $lvl/$safeTag: $cleanMsg$extra\n"
     }
 
     /**
      * Best-effort redaction for secrets/PII-like values.
-     *
-     * Notes:
-     * - This is intentionally conservative; it won't catch everything.
-     * - The primary protection is still: "do not log sensitive data at call sites".
      */
     private fun sanitize(input: String): String {
         var s = input
@@ -352,11 +381,21 @@ object AppLog {
 
     private fun ensureFileExistsLocked() {
         val dir = logDir ?: return
-        if (!dir.exists()) runCatching { dir.mkdirs() }
+        if (!dir.exists()) {
+            try {
+                dir.mkdirs()
+            } catch (_: Throwable) {
+                // Ignore.
+            }
+        }
 
         val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
         if (!file.exists()) {
-            runCatching { FileOutputStream(file, true).use { /* touch */ } }
+            try {
+                FileOutputStream(file, true).use { /* touch */ }
+            } catch (_: Throwable) {
+                // Ignore.
+            }
         }
     }
 
@@ -366,14 +405,14 @@ object AppLog {
         val dir = logDir ?: return
         val file = currentFile ?: File(dir, "app.log").also { currentFile = it }
 
-        runCatching {
+        try {
             FileOutputStream(file, true).use { out ->
                 while (preInitLines.isNotEmpty()) {
                     out.write(preInitLines.removeFirst().toByteArray(Charsets.UTF_8))
                 }
                 out.flush()
             }
-        }.onFailure {
+        } catch (_: Throwable) {
             // If flushing fails, keep buffer bounded and continue; avoid throwing.
             while (preInitLines.size > PREINIT_BUFFER_LINES) preInitLines.removeFirst()
         }
@@ -387,10 +426,15 @@ object AppLog {
 
         val rotated = nextRotatedFileLocked(dir)
 
-        val renamed = runCatching { file.renameTo(rotated) }.getOrDefault(false)
+        val renamed = try {
+            file.renameTo(rotated)
+        } catch (_: Throwable) {
+            false
+        }
+
         if (!renamed) {
             // Fallback: copy then truncate original (best-effort).
-            runCatching {
+            try {
                 file.inputStream().use { input ->
                     FileOutputStream(rotated, false).use { output ->
                         input.copyTo(output)
@@ -398,13 +442,19 @@ object AppLog {
                     }
                 }
                 FileOutputStream(file, false).use { /* truncate */ }
+            } catch (_: Throwable) {
+                // Ignore.
             }
         }
 
         // Ensure app.log exists for new writes.
         currentFile = File(dir, "app.log").also { f ->
             if (!f.exists()) {
-                runCatching { FileOutputStream(f, true).use { /* touch */ } }
+                try {
+                    FileOutputStream(f, true).use { /* touch */ }
+                } catch (_: Throwable) {
+                    // Ignore.
+                }
             }
         }
 
@@ -415,7 +465,13 @@ object AppLog {
             ?: return
 
         if (rotatedFiles.size <= MAX_ROTATED_FILES) return
-        rotatedFiles.drop(MAX_ROTATED_FILES).forEach { runCatching { it.delete() } }
+        rotatedFiles.drop(MAX_ROTATED_FILES).forEach {
+            try {
+                it.delete()
+            } catch (_: Throwable) {
+                // Ignore.
+            }
+        }
     }
 
     /**
@@ -433,38 +489,5 @@ object AppLog {
             if (!f.exists()) return f
         }
         return File(dir, "app-$stamp-$seq-${System.nanoTime().toString(16)}.log")
-    }
-}
-
-/**
- * Minimal safe logger wrapper.
- *
- * Why:
- * - If AppLog init fails, calling AppLog.* may itself throw or no-op depending on implementation.
- * - Always ensure logs land in Logcat as a fallback.
- */
-object SafeLog {
-    fun d(tag: String, msg: String) {
-        runCatching { AppLog.d(tag, msg) }.onFailure { Log.d(tag, msg) }
-    }
-
-    fun i(tag: String, msg: String) {
-        runCatching { AppLog.i(tag, msg) }.onFailure { Log.i(tag, msg) }
-    }
-
-    fun w(tag: String, msg: String, t: Throwable? = null) {
-        runCatching {
-            if (t != null) AppLog.w(tag, msg, t) else AppLog.w(tag, msg)
-        }.onFailure {
-            if (t != null) Log.w(tag, msg, t) else Log.w(tag, msg)
-        }
-    }
-
-    fun e(tag: String, msg: String, t: Throwable? = null) {
-        runCatching {
-            if (t != null) AppLog.e(tag, msg, t) else AppLog.e(tag, msg)
-        }.onFailure {
-            if (t != null) Log.e(tag, msg, t) else Log.e(tag, msg)
-        }
     }
 }

@@ -161,11 +161,12 @@ class ChatStreamBridge(
     fun begin(): Long = synchronized(lock) {
         val prev = activeSessionId.get()
         if (prev > 0L) {
+            // NOTE: "replaced" is not a cancel; we do not record it as lastCancel*.
             terminateLocked(
                 sessionId = prev,
                 reason = REPLACED_MESSAGE,
                 kind = "Error(replaced)",
-                recordAsCancel = true
+                recordAsCancel = false
             )
             logger?.invoke("ChatStreamBridge: replaced prev session=$prev")
         }
@@ -174,7 +175,7 @@ class ChatStreamBridge(
         activeSessionId.set(id)
 
         emittedBegin.incrementAndGet()
-        emitEvent(ChatStreamEvent.Begin(id), kind = "Begin", sessionId = id)
+        emitEvent(ChatStreamEvent.Begin(sessionId = id), kind = "Begin", sessionId = id)
 
         logger?.invoke("ChatStreamBridge: begin session=$id (prev=$prev)")
         publishStats(force = true)
@@ -203,7 +204,7 @@ class ChatStreamBridge(
 
             emittedDelta.incrementAndGet()
             deltaTick.incrementAndGet()
-            emitEvent(ChatStreamEvent.Delta(sessionId, chunk), kind = "Delta", sessionId = sessionId)
+            emitEvent(ChatStreamEvent.Delta(sessionId = sessionId, text = chunk), kind = "Delta", sessionId = sessionId)
             publishStats(force = false)
         }
     }
@@ -221,7 +222,7 @@ class ChatStreamBridge(
         activeSessionId.set(0L)
 
         emittedEnd.incrementAndGet()
-        emitEvent(ChatStreamEvent.End(sessionId), kind = "End", sessionId = sessionId)
+        emitEvent(ChatStreamEvent.End(sessionId = sessionId), kind = "End", sessionId = sessionId)
 
         logger?.invoke("ChatStreamBridge: end session=$sessionId")
         publishStats(force = true)
@@ -313,7 +314,11 @@ class ChatStreamBridge(
 
         emittedError.incrementAndGet()
         emitEvent(
-            ChatStreamEvent.Error(sessionId, reason),
+            ChatStreamEvent.Error(
+                sessionId = sessionId,
+                token = reason,
+                code = reason
+            ),
             kind = kind,
             sessionId = sessionId
         )

@@ -53,13 +53,9 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.negi.surveys.chat.AnswerValidator
 import com.negi.surveys.chat.AnswerValidatorI
-import com.negi.surveys.chat.ChatDraftStore
-import com.negi.surveys.chat.ChatMessage
+import com.negi.surveys.chat.ChatDrafts
 import com.negi.surveys.chat.ChatQuestionViewModel
-import com.negi.surveys.chat.ChatRole
 import com.negi.surveys.chat.ChatStreamBridge
-import com.negi.surveys.chat.ChatStreamState
-import com.negi.surveys.chat.DraftKey
 import com.negi.surveys.chat.RepositoryI
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.ui.LocalChatStreamBridge
@@ -69,6 +65,14 @@ import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
+
+// ---------------------------------------------------------------------
+// Type aliases to keep UI code clean while moving models under ChatModels.
+// This avoids top-level symbol clutter while minimizing UI churn.
+// ---------------------------------------------------------------------
+import com.negi.surveys.chat.ChatModels.ChatMessage as ChatMessage
+import com.negi.surveys.chat.ChatModels.ChatRole as ChatRole
+import com.negi.surveys.chat.ChatModels.ChatStreamState as ChatStreamState
 
 /**
  * Chat question screen.
@@ -93,13 +97,13 @@ fun ChatQuestionScreen(
     val onBackLatest by rememberUpdatedState(onBack)
 
     val streamBridge: ChatStreamBridge = LocalChatStreamBridge.current
-    val draftStore: ChatDraftStore = remember { ChatDraftStoreHolder.store }
+    val draftStore: ChatDrafts.ChatDraftStore = remember { ChatDraftStoreHolder.store }
 
     // Use a stable hash to reduce collisions while keeping DraftKey(promptHash:Int) API intact.
     val promptHash = remember(prompt) { stablePromptHash(prompt) }
 
     val draftKey = remember(questionId, promptHash) {
-        DraftKey(questionId = questionId, promptHash = promptHash)
+        ChatDrafts.DraftKey(questionId = questionId, promptHash = promptHash)
     }
 
     val validator: AnswerValidatorI = remember(questionId, promptHash, repository, streamBridge) {

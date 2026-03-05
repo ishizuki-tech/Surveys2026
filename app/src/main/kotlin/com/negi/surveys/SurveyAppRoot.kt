@@ -41,7 +41,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
@@ -87,6 +86,7 @@ import com.negi.surveys.ui.DebugRow
 import com.negi.surveys.ui.ExportScreen
 import com.negi.surveys.ui.HomeScreen
 import com.negi.surveys.ui.LocalChatStreamBridge
+import com.negi.surveys.ui.ReviewQuestionLog
 import com.negi.surveys.ui.ReviewScreen
 import com.negi.surveys.ui.SurveyStartScreen
 import com.negi.surveys.ui.chat.ChatQuestionScreen
@@ -100,12 +100,19 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
-@Composable
-fun SurveyAppRoot(modifier: Modifier = Modifier) {
-    SurveyAppRootInternal.Render(modifier = modifier)
-}
+object SurveyAppRoot {
 
-private object SurveyAppRootInternal {
+    /**
+     * Allows calling `SurveyAppRoot(...)` even though this is an object.
+     *
+     * Why:
+     * - Keeps call-sites unchanged (previously a top-level composable).
+     * - Avoids the confusing `SurveyAppRoot.SurveyAppRoot()` pattern.
+     */
+    @Composable
+    operator fun invoke(modifier: Modifier = Modifier) {
+        Render(modifier = modifier)
+    }
 
     // ---------------------------------------------------------------------
     // Constants
@@ -116,8 +123,8 @@ private object SurveyAppRootInternal {
     /**
      * Hard guard for switching repository mode.
      *
-     * NOTE:
-     * - Replace this with BuildConfig / SurveyConfig / dev menu toggle as needed.
+     * Notes:
+     * - Replace with BuildConfig / SurveyConfig / dev menu toggle if needed.
      * - MUST NOT depend on secrets / tokens.
      */
     private const val FORCE_FAKE_REPO: Boolean = false
@@ -125,9 +132,9 @@ private object SurveyAppRootInternal {
     /**
      * How long the UI should wait for Application-installed config to appear.
      *
-     * Why:
-     * - In most cases, SurveyApplication installs config before first composition.
-     * - However, there are edge cases where Compose starts before install is visible.
+     * Rationale:
+     * - Usually SurveyApplication installs config before first composition.
+     * - However, there are rare edge cases where Compose starts before install is visible.
      */
     private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
     private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
@@ -178,10 +185,9 @@ private object SurveyAppRootInternal {
     /**
      * Stable key for deciding whether the downloader should be recreated.
      *
-     * Why:
-     * - ModelDownloadController is stateful (has a SupervisorJob scope).
-     * - We MUST recreate it when effective config changes, otherwise it stays "NotConfigured".
-     * - We also MUST close the previous instance to avoid scope leaks.
+     * Notes:
+     * - ModelDownloadController is stateful (has an internal scope).
+     * - AppProcessServices is responsible for swap+close lifecycle, not UI.
      */
     private data class ModelSpecKey(
         val url: String,
@@ -218,7 +224,7 @@ private object SurveyAppRootInternal {
         BackHandler(enabled = canPop) {
             SafeLog.d(
                 TAG,
-                "BackHandler: pop requested stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}"
+                "BackHandler: pop requested stackSize=${backStack.size} current=${currentKey.javaClass.simpleName}",
             )
             nav.pop()
         }
@@ -232,13 +238,24 @@ private object SurveyAppRootInternal {
         // -------------------------------------------------------------
 
         val sessionVm: SurveySessionViewModel = viewModel()
-        val logs by sessionVm.logs.collectAsStateWithLifecycle()
-        val exportText by sessionVm.exportJson.collectAsStateWithLifecycle()
+
+        val logs: List<ReviewQuestionLog> by sessionVm.logs.collectAsStateWithLifecycle()
+        val exportText: String by sessionVm.exportJson.collectAsStateWithLifecycle()
+
+        /**
+         * Keep updated State references so NavEntry composables do NOT re-collect flows.
+         *
+         * IMPORTANT:
+         * - Do NOT map/copy lists here (avoid allocations).
+         * - Do NOT cast in destination screens.
+         */
+        val logsState: State<List<ReviewQuestionLog>> = rememberUpdatedState(logs)
+        val exportTextState: State<String> = rememberUpdatedState(exportText)
 
         val prompts: Map<String, String> = remember {
             linkedMapOf(
                 "Q1" to "Question prompt for Q1 (placeholder)",
-                "Q2" to "Question prompt for Q2 (placeholder)"
+                "Q2" to "Question prompt for Q2 (placeholder)",
             )
         }
 
@@ -250,7 +267,7 @@ private object SurveyAppRootInternal {
                 logger = { msg ->
                     // Log only metadata to avoid leaking prompts/answers/deltas.
                     SafeLog.d("StreamBridge", "eventLen=${msg.length}")
-                }
+                },
             )
         }
         val streamStats: ChatStreamBridge.StreamStats by streamBridge.stats.collectAsStateWithLifecycle()
@@ -261,7 +278,7 @@ private object SurveyAppRootInternal {
 
         val configState: ConfigState by produceState<ConfigState>(
             initialValue = ConfigState.Loading,
-            key1 = appContext
+            key1 = appContext,
         ) {
             val t0 = SystemClock.elapsedRealtime()
             SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
@@ -288,7 +305,6 @@ private object SurveyAppRootInternal {
 
         /**
          * Resolve ModelDownloadSpec only when config is ready.
-         * No casts, no assumptions.
          */
         val modelSpec: ModelDownloadSpec? = remember(configState) {
             when (val st = configState) {
@@ -299,7 +315,6 @@ private object SurveyAppRootInternal {
 
         /**
          * Build a stable "effective key" that decides downloader recreation.
-         * Keep it strict: if URL/fileName changes, we MUST recreate.
          */
         val modelSpecKey: ModelSpecKey? = remember(modelSpec) {
             val s = modelSpec ?: return@remember null
@@ -311,7 +326,7 @@ private object SurveyAppRootInternal {
                 url = url,
                 fileName = name,
                 timeoutMs = s.timeoutMs,
-                forceFreshOnStart = false, // Keep false by default for resume friendliness.
+                forceFreshOnStart = false,
                 uiThrottleMs = s.uiThrottleMs,
                 uiMinDeltaBytes = s.uiMinDeltaBytes,
             )
@@ -344,8 +359,9 @@ private object SurveyAppRootInternal {
         }
 
         /**
-         * Even in FAKE mode, we create a "configured" ModelDownloadController if config has URL/fileName.
-         * We still NEVER start downloads unless onDeviceEnabled == true (startup effects below).
+         * NOTE:
+         * - This is process-scoped. Do NOT close() it from UI.
+         * - AppProcessServices is responsible for swap/close when config changes.
          */
         val modelDownloader: ModelDownloadController = remember(appContext, repoMode, modelSpecKey) {
             val specToUse: ModelDownloadSpec? = modelSpecKey?.let { modelSpec }
@@ -354,23 +370,8 @@ private object SurveyAppRootInternal {
                 val key = modelSpecKey
                 SafeLog.i(
                     TAG,
-                    "ModelDownloader: created onDevice=$onDeviceEnabled " +
-                            "cfgUrlPresent=${key != null} cfgFilePresent=${key != null} specPresent=${specToUse != null}"
+                    "ModelDownloader: obtained onDevice=$onDeviceEnabled keyPresent=${key != null} specPresent=${specToUse != null}",
                 )
-            }
-        }
-
-        DisposableEffect(modelDownloader) {
-            onDispose {
-                // Ensure no leaking scopes across recompositions / config swaps.
-                runCatching { modelDownloader.close() }
-                    .onFailure { t ->
-                        SafeLog.e(
-                            TAG,
-                            "ModelDownloader: close failed (non-fatal) type=${t::class.java.simpleName}",
-                            t
-                        )
-                    }
             }
         }
 
@@ -379,7 +380,7 @@ private object SurveyAppRootInternal {
         val rootCompileState: WarmupController.CompileState by warmup.compileState.collectAsStateWithLifecycle()
         val rootModelState: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
 
-        // Keep stable state containers for NavEntry lambdas (avoid entryProvider recreation).
+        // Keep stable state containers for NavEntry lambdas.
         val rootModelStateState: State<ModelDownloadController.ModelState> = rememberUpdatedState(rootModelState)
         val rootPrefetchStateState: State<WarmupController.PrefetchState> = rememberUpdatedState(rootPrefetchState)
         val rootCompileStateState: State<WarmupController.CompileState> = rememberUpdatedState(rootCompileState)
@@ -391,7 +392,7 @@ private object SurveyAppRootInternal {
         LogStateTransitions(
             modelState = rootModelState,
             prefetchState = rootPrefetchState,
-            compileState = rootCompileState
+            compileState = rootCompileState,
         )
 
         // -------------------------------------------------------------
@@ -403,7 +404,7 @@ private object SurveyAppRootInternal {
             warmup,
             modelDownloader,
             modelSpecKey,
-            onDeviceEnabled
+            onDeviceEnabled,
         ) {
             { fromRaw ->
                 val from = sanitizeLabel(fromRaw)
@@ -412,7 +413,7 @@ private object SurveyAppRootInternal {
                     val key = modelSpecKey
                     SafeLog.w(
                         TAG,
-                        "RetryAll requested from=$from onDevice=$onDeviceEnabled keyPresent=${key != null}"
+                        "RetryAll requested from=$from onDevice=$onDeviceEnabled keyPresent=${key != null}",
                     )
 
                     if (onDeviceEnabled) {
@@ -430,7 +431,7 @@ private object SurveyAppRootInternal {
                                 modelDownloader.ensureModelOnce(
                                     timeoutMs = key.timeoutMs,
                                     forceFresh = false,
-                                    reason = "uiRetry"
+                                    reason = "uiRetry",
                                 )
                             }.onFailure { t ->
                                 SafeLog.e(
@@ -469,11 +470,6 @@ private object SurveyAppRootInternal {
         // Startup effects (single pipeline)
         // -------------------------------------------------------------
 
-        /**
-         * Start model download only when:
-         * - on-device mode is enabled
-         * - config is Ready (modelSpecKey present)
-         */
         LaunchedEffect(onDeviceEnabled, modelSpecKey, modelDownloader) {
             if (!onDeviceEnabled) return@LaunchedEffect
             val key = modelSpecKey ?: return@LaunchedEffect
@@ -486,16 +482,13 @@ private object SurveyAppRootInternal {
                 modelDownloader.ensureModelOnce(
                     timeoutMs = key.timeoutMs,
                     forceFresh = key.forceFreshOnStart,
-                    reason = "startupAfterFirstFrame"
+                    reason = "startupAfterFirstFrame",
                 )
             }.onFailure { t ->
                 SafeLog.e(TAG, "Model ensure failed (non-fatal) type=${t::class.java.simpleName}", t)
             }
         }
 
-        /**
-         * Warmup should start after model is ready.
-         */
         LaunchedEffect(rootModelState, onDeviceEnabled, warmup) {
             if (!onDeviceEnabled) return@LaunchedEffect
             if (rootModelState is ModelDownloadController.ModelState.Ready) {
@@ -516,7 +509,7 @@ private object SurveyAppRootInternal {
             prefetchState = rootPrefetchState,
             compileState = rootCompileState,
             tickIntervalMs = 500L,
-            format = WARMUP_UI_FORMAT_HOME
+            format = WARMUP_UI_FORMAT_HOME,
         )
 
         val modelUiLabel: String = remember(rootModelState) { modelLabelForUi(rootModelState) }
@@ -572,7 +565,7 @@ private object SurveyAppRootInternal {
                     DebugRow("SLM Compile", compileUiLabel),
                     DebugRow("RepoId", System.identityHashCode(repo).toString()),
                     DebugRow("RepoType", repo.javaClass.simpleName),
-                )
+                ),
             )
         }
 
@@ -613,13 +606,15 @@ private object SurveyAppRootInternal {
         }
 
         // -------------------------------------------------------------
-        // Nav3 entries (stable entryProvider + updated state refs)
+        // Nav3 entries (stable entryProvider + NO duplicate flow collects)
         // -------------------------------------------------------------
 
         val entries: (NavKey) -> NavEntry<NavKey> = remember(
             nav,
             prompts,
             sessionVm,
+            logsState,
+            exportTextState,
             startManualUpload,
             debugInfoState,
             warmup,
@@ -635,7 +630,7 @@ private object SurveyAppRootInternal {
                     HomeScreen(
                         onStartSurvey = { nav.startSurvey() },
                         onExport = { nav.goExport() },
-                        debugInfo = debugInfoState.value
+                        debugInfo = debugInfoState.value,
                     )
                 }
 
@@ -681,27 +676,25 @@ private object SurveyAppRootInternal {
                                     else -> nav.goReview()
                                 }
                             },
-                            onBack = { nav.pop() }
+                            onBack = { nav.pop() },
                         )
                     }
                 }
 
                 entry<Review> {
-                    val reviewLogs by sessionVm.logs.collectAsStateWithLifecycle()
                     ReviewScreen(
-                        logs = reviewLogs,
+                        logs = logsState.value,
                         onExport = { nav.goExport() },
                         onBack = { nav.pop() },
                         onUploadLogs = { startManualUpload("review") },
-                        uploadStatusLine = uploadStatusState.value
+                        uploadStatusLine = uploadStatusState.value,
                     )
                 }
 
                 entry<Export> {
-                    val payload by sessionVm.exportJson.collectAsStateWithLifecycle()
                     ExportScreen(
-                        exportText = payload,
-                        onBack = { nav.pop() }
+                        exportText = exportTextState.value,
+                        onBack = { nav.pop() },
                     )
                 }
             }
@@ -718,14 +711,14 @@ private object SurveyAppRootInternal {
                 CompactTopBar(
                     title = titleFor(currentKey),
                     canPop = canPop,
-                    onBack = { nav.pop() }
+                    onBack = { nav.pop() },
                 )
-            }
+            },
         ) { innerPadding ->
             Box(
                 modifier = Modifier
                     .fillMaxSize()
-                    .padding(innerPadding)
+                    .padding(innerPadding),
             ) {
                 CompositionLocalProvider(
                     LocalChatStreamBridge provides streamBridge,
@@ -734,7 +727,7 @@ private object SurveyAppRootInternal {
                     NavDisplay(
                         backStack = backStack,
                         entryProvider = entries,
-                        modifier = Modifier.fillMaxSize()
+                        modifier = Modifier.fillMaxSize(),
                     )
                 }
             }
@@ -764,7 +757,9 @@ private object SurveyAppRootInternal {
 
         val modelBlocking = modelState !is ModelDownloadController.ModelState.Ready
         val prefetchBusy = isPrefetchInProgress(prefetchState)
-        val compileBusy = compileState is WarmupController.CompileState.WaitingForPrefetch || compileState is WarmupController.CompileState.Compiling
+        val compileBusy =
+            compileState is WarmupController.CompileState.WaitingForPrefetch ||
+                    compileState is WarmupController.CompileState.Compiling
 
         val isBlocking = when (policy) {
             GatePolicy.MODEL_ONLY -> modelBlocking
@@ -797,45 +792,50 @@ private object SurveyAppRootInternal {
         onRetryAll: () -> Unit,
     ) {
         val prefetchInProgress = isPrefetchInProgress(prefetchState)
-        val compileInProgress = compileState is WarmupController.CompileState.WaitingForPrefetch || compileState is WarmupController.CompileState.Compiling
+        val compileInProgress =
+            compileState is WarmupController.CompileState.WaitingForPrefetch ||
+                    compileState is WarmupController.CompileState.Compiling
         val modelInProgress =
             modelState is ModelDownloadController.ModelState.Checking ||
                     modelState is ModelDownloadController.ModelState.Downloading
 
         val nowMs = rememberWarmupUiNowMs(
             inProgress = modelInProgress || prefetchInProgress || compileInProgress,
-            tickIntervalMs = 250L
+            tickIntervalMs = 250L,
         )
 
         val prefetchElapsedMs = rememberDynamicElapsedMs(
             reportedElapsedMs = prefetchState.elapsedMs,
             inProgress = prefetchInProgress,
-            nowMs = nowMs
+            nowMs = nowMs,
         )
         val compileElapsedMs = rememberDynamicElapsedMs(
             reportedElapsedMs = compileState.elapsedMs,
             inProgress = compileInProgress,
-            nowMs = nowMs
+            nowMs = nowMs,
         )
 
         val primary = remember(modelState, prefetchState, compileState, prefetchElapsedMs, compileElapsedMs) {
             when {
                 modelState !is ModelDownloadController.ModelState.Ready -> modelLabelForUi(modelState)
-                prefetchInProgress -> prefetchLabelForUi(
-                    prefetchState,
-                    elapsedMs = prefetchElapsedMs,
-                    format = WARMUP_UI_FORMAT_GATE
-                )
-                compileState is WarmupController.CompileState.WaitingForPrefetch -> compileLabelForUi(
-                    compileState,
-                    elapsedMs = compileElapsedMs,
-                    format = WARMUP_UI_FORMAT_GATE
-                )
-                compileState is WarmupController.CompileState.Compiling -> compileLabelForUi(
-                    compileState,
-                    elapsedMs = compileElapsedMs,
-                    format = WARMUP_UI_FORMAT_GATE
-                )
+                prefetchInProgress ->
+                    prefetchLabelForUi(
+                        prefetchState,
+                        elapsedMs = prefetchElapsedMs,
+                        format = WARMUP_UI_FORMAT_GATE,
+                    )
+                compileState is WarmupController.CompileState.WaitingForPrefetch ->
+                    compileLabelForUi(
+                        compileState,
+                        elapsedMs = compileElapsedMs,
+                        format = WARMUP_UI_FORMAT_GATE,
+                    )
+                compileState is WarmupController.CompileState.Compiling ->
+                    compileLabelForUi(
+                        compileState,
+                        elapsedMs = compileElapsedMs,
+                        format = WARMUP_UI_FORMAT_GATE,
+                    )
                 else -> WARMUP_UI_FORMAT_GATE.idleLabel
             }
         }
@@ -853,7 +853,7 @@ private object SurveyAppRootInternal {
                     .fillMaxSize()
                     .padding(20.dp),
                 verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally
+                horizontalAlignment = Alignment.CenterHorizontally,
             ) {
                 CircularProgressIndicator()
                 Spacer(modifier = Modifier.height(16.dp))
@@ -861,7 +861,7 @@ private object SurveyAppRootInternal {
                 Text(
                     text = "Preparing the on-device model…",
                     style = MaterialTheme.typography.titleMedium,
-                    textAlign = TextAlign.Center
+                    textAlign = TextAlign.Center,
                 )
 
                 Spacer(modifier = Modifier.height(8.dp))
@@ -870,7 +870,7 @@ private object SurveyAppRootInternal {
                     text = primary,
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center
+                    textAlign = TextAlign.Center,
                 )
 
                 Spacer(modifier = Modifier.height(18.dp))
@@ -905,7 +905,7 @@ private object SurveyAppRootInternal {
                     Text(
                         text = hint,
                         style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center
+                        textAlign = TextAlign.Center,
                     )
                     Spacer(modifier = Modifier.height(18.dp))
                 }
@@ -928,14 +928,14 @@ private object SurveyAppRootInternal {
     private fun CompactTopBar(
         title: String,
         canPop: Boolean,
-        onBack: () -> Unit
+        onBack: () -> Unit,
     ) {
         val barHeight = 44.dp
 
         Surface(
             modifier = Modifier.fillMaxWidth(),
             tonalElevation = 2.dp,
-            color = MaterialTheme.colorScheme.surface
+            color = MaterialTheme.colorScheme.surface,
         ) {
             Column(modifier = Modifier.fillMaxWidth()) {
                 Spacer(modifier = Modifier.windowInsetsTopHeight(WindowInsets.statusBars))
@@ -946,13 +946,13 @@ private object SurveyAppRootInternal {
                         .height(barHeight)
                         .padding(horizontal = 8.dp),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Start
+                    horizontalArrangement = Arrangement.Start,
                 ) {
                     if (canPop) {
                         IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back"
+                                contentDescription = "Back",
                             )
                         }
                     } else {
@@ -966,7 +966,7 @@ private object SurveyAppRootInternal {
                         overflow = TextOverflow.Ellipsis,
                         modifier = Modifier
                             .padding(start = 6.dp)
-                            .weight(1f)
+                            .weight(1f),
                     )
                 }
             }
@@ -1117,7 +1117,7 @@ private object SurveyAppRootInternal {
     /**
      * Produces a smoothly increasing elapsedMs for UI even if the underlying state updates are sparse.
      *
-     * How:
+     * Notes:
      * - Treat reportedElapsedMs as a baseline at the moment we last observed it.
      * - While inProgress, add (nowMs - baselineNowMs).
      */
@@ -1152,7 +1152,8 @@ private object SurveyAppRootInternal {
     ): Pair<String, String> {
         val prefetchInProgress = isPrefetchInProgress(prefetchState)
         val compileInProgress =
-            compileState is WarmupController.CompileState.WaitingForPrefetch || compileState is WarmupController.CompileState.Compiling
+            compileState is WarmupController.CompileState.WaitingForPrefetch ||
+                    compileState is WarmupController.CompileState.Compiling
 
         val inProgress = prefetchInProgress || compileInProgress
         val nowMs = rememberWarmupUiNowMs(inProgress = inProgress, tickIntervalMs = tickIntervalMs)
@@ -1160,12 +1161,12 @@ private object SurveyAppRootInternal {
         val prefetchElapsedMs = rememberDynamicElapsedMs(
             reportedElapsedMs = prefetchState.elapsedMs,
             inProgress = prefetchInProgress,
-            nowMs = nowMs
+            nowMs = nowMs,
         )
         val compileElapsedMs = rememberDynamicElapsedMs(
             reportedElapsedMs = compileState.elapsedMs,
             inProgress = compileInProgress,
-            nowMs = nowMs
+            nowMs = nowMs,
         )
 
         val prefetchLabel = remember(prefetchState, prefetchElapsedMs, format) {

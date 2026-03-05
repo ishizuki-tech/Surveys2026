@@ -44,23 +44,24 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
-import com.negi.surveys.chat.ChatMessage
-import com.negi.surveys.chat.ChatRole
-import com.negi.surveys.chat.ChatStreamState
+import com.negi.surveys.chat.ChatModels
 
 @Composable
 internal fun ChatBubbleStructured(
-    msg: ChatMessage,
+    msg: ChatModels.ChatMessage,
     allowFollowUp: Boolean,
     detailsExpanded: Boolean,
     onToggleDetailsExpand: (Boolean) -> Unit
 ) {
-    val isUser = msg.role == ChatRole.USER
-    val isModel = msg.role == ChatRole.MODEL
-    val isAssistant = msg.role == ChatRole.ASSISTANT
+    val isUser = msg.role == ChatModels.ChatRole.USER
+    val isModel = msg.role == ChatModels.ChatRole.MODEL
+    val isAssistant = msg.role == ChatModels.ChatRole.ASSISTANT
 
-    val hasStreamDetails = !msg.streamText.isNullOrBlank() && msg.streamState != ChatStreamState.NONE
-    val isStreamingModelBubble = isModel && (msg.streamState == ChatStreamState.STREAMING)
+    val hasStreamDetails =
+        !msg.streamText.isNullOrBlank() && msg.streamState != ChatModels.ChatStreamState.NONE
+
+    val isStreamingModelBubble =
+        isModel && (msg.streamState == ChatModels.ChatStreamState.STREAMING)
 
     val rowAlign = if (isUser) Arrangement.End else Arrangement.Start
 
@@ -71,15 +72,15 @@ internal fun ChatBubbleStructured(
     }
 
     val bubbleColor = when (msg.role) {
-        ChatRole.USER -> MaterialTheme.colorScheme.primaryContainer
-        ChatRole.ASSISTANT -> MaterialTheme.colorScheme.secondaryContainer
-        ChatRole.MODEL -> MaterialTheme.colorScheme.surface
+        ChatModels.ChatRole.USER -> MaterialTheme.colorScheme.primaryContainer
+        ChatModels.ChatRole.ASSISTANT -> MaterialTheme.colorScheme.secondaryContainer
+        ChatModels.ChatRole.MODEL -> MaterialTheme.colorScheme.surface
     }
 
     val textColor = when (msg.role) {
-        ChatRole.USER -> MaterialTheme.colorScheme.onPrimaryContainer
-        ChatRole.ASSISTANT -> MaterialTheme.colorScheme.onSecondaryContainer
-        ChatRole.MODEL -> MaterialTheme.colorScheme.onSurface
+        ChatModels.ChatRole.USER -> MaterialTheme.colorScheme.onPrimaryContainer
+        ChatModels.ChatRole.ASSISTANT -> MaterialTheme.colorScheme.onSecondaryContainer
+        ChatModels.ChatRole.MODEL -> MaterialTheme.colorScheme.onSurface
     }
 
     val outline = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
@@ -225,6 +226,7 @@ internal fun ChatBubbleStructured(
                     isModel -> {
                         val streamRaw = msg.streamText.orEmpty()
                         val ttftActive = isStreamingModelBubble && streamRaw.isBlank()
+
                         val raw = if (streamRaw.isNotBlank()) streamRaw else msg.text
 
                         val canClick = !isStreamingModelBubble && raw.isNotBlank()
@@ -273,10 +275,10 @@ internal fun ChatBubbleStructured(
                                 val blockShape = RoundedCornerShape(14.dp)
 
                                 if (isStreamingModelBubble) {
+                                    // UPDATED: FancyStreamingModelBlock now consumes msg and derives TTFT/raw internally.
                                     FancyStreamingModelBlock(
                                         shape = blockShape,
-                                        ttftActive = ttftActive,
-                                        raw = raw,
+                                        msg = msg,
                                         onOutline = outline
                                     )
                                 } else {

@@ -16,6 +16,20 @@ package com.negi.surveys.chat
 import androidx.compose.runtime.Immutable
 
 /**
+ * Stable tokens/codes shared across Bridge/VM/UI.
+ *
+ * Notes:
+ * - token: metadata-only label (may be same as code).
+ * - code: stable machine-readable short code for programmatic handling.
+ */
+object ChatStreamCodes {
+    const val CANCELLED: String = "cancelled"
+    const val REPLACED: String = "replaced"
+    const val TIMEOUT: String = "timeout"
+    const val ERROR: String = "error"
+}
+
+/**
  * Streaming events emitted by the model layer.
  *
  * Design:
@@ -60,7 +74,7 @@ sealed interface ChatStreamEvent {
      * Stream session failed.
      *
      * @param token Short, metadata-only token (e.g., "TimeoutCancellationException", "io_error").
-     * @param code Optional stable code for programmatic handling (e.g., "TIMEOUT", "CANCELLED", "E_IO").
+     * @param code Optional stable code for programmatic handling (e.g., "timeout", "cancelled", "replaced").
      */
     @Immutable
     data class Error(

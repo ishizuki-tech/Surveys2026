@@ -18,12 +18,14 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Process
 import android.os.SystemClock
+import android.util.Log
 import java.io.File
 import java.io.FileOutputStream
 import java.io.OutputStream
 import java.io.OutputStreamWriter
 import java.io.PrintWriter
 import java.io.Writer
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 
@@ -113,7 +115,7 @@ object CrashCapture {
 
         val appContext = context.applicationContext
 
-        // Best-effort: make file logger ready so crash-path logs can land on disk.
+        // Best-effort: make file logger ready so non-crash logs can land on disk.
         runCatching { AppLog.ensureReady(appContext) }
 
         previous = Thread.getDefaultUncaughtExceptionHandler()
@@ -127,10 +129,12 @@ object CrashCapture {
             }
 
             try {
+                // IMPORTANT: On crash path, avoid AppLog/SafeLog to prevent extra IO/locks.
                 runCatching {
                     val tid = safeThreadId(thread)
-                    AppLog.e(TAG, "uncaught: thread=${thread.name} tid=$tid pid=${Process.myPid()}", throwable)
+                    Log.e(TAG, "uncaught: thread=${thread.name} tid=$tid pid=${Process.myPid()}", throwable)
                 }
+
                 runCatching {
                     writeCrashFile(appContext, thread, throwable)
                 }
@@ -142,7 +146,8 @@ object CrashCapture {
             }
         }
 
-        AppLog.i(TAG, "installed")
+        // Normal path log is fine; SafeLog is okay here.
+        SafeLog.i(TAG, "installed")
     }
 
     fun countPendingCrashes(context: Context): Int =
@@ -171,79 +176,128 @@ object CrashCapture {
         val pkg = safePackageName(appContext)
         val versionName = safeVersionName(appContext)
         val versionCode = safeVersionCode(appContext)
-        val safeInstallId = runCatching { LogFiles.installId(appContext).take(8) }.getOrDefault("unknown")
+        val installShort = runCatching { LogFiles.installIdShort(appContext) }.getOrDefault("unknown")
+        val installHash = runCatching { LogFiles.installIdHash(appContext) }.getOrDefault("unknown")
 
         val uptimeMs = runCatching { SystemClock.elapsedRealtime() }.getOrDefault(-1L)
         val tid = safeThreadId(thread)
 
+        val fingerprintHash = sha256Hex(Build.FINGERPRINT).take(16).ifBlank { "unknown" }
+        val abis = runCatching { (Build.SUPPORTED_ABIS ?: emptyArray()).joinToString(",") }.getOrDefault("")
+
         // Best-effort: write to tmp then rename into place.
-        FileOutputStream(tmp, false).use { fos ->
-            val limited = LimitedOutputStream(fos, MAX_REPORT_BYTES)
-            val osw = OutputStreamWriter(limited, Charsets.UTF_8)
-            SanitizingLineWriter(osw) { line -> sanitizeLine(line) }.use { writer ->
-                PrintWriter(writer, true).use { pw ->
-                    pw.println("===== Survey App Crash Report =====")
-                    pw.println("utcCompact=$utcCompact")
-                    pw.println("thread=${thread.name}")
-                    pw.println("threadId=$tid")
-                    pw.println("pid=$pid")
-                    pw.println("uptimeMs=$uptimeMs")
-                    pw.println("sdk=${Build.VERSION.SDK_INT}")
-                    pw.println("device=${Build.MANUFACTURER}/${Build.MODEL}")
-                    pw.println("fingerprint=${Build.FINGERPRINT ?: ""}")
-                    pw.println("abis=${(Build.SUPPORTED_ABIS ?: emptyArray()).joinToString(",")}")
-                    pw.println("appId=$pkg")
-                    pw.println("versionName=$versionName")
-                    pw.println("versionCode=$versionCode")
-                    pw.println("build=${LogFiles.buildLabelSafe()}")
-                    pw.println("installId=$safeInstallId")
-                    pw.println()
+        val wroteTmp = runCatching {
+            FileOutputStream(tmp, false).use { fos ->
+                writeReport(
+                    out = fos,
+                    utcCompact = utcCompact,
+                    thread = thread,
+                    tid = tid,
+                    pid = pid,
+                    uptimeMs = uptimeMs,
+                    pkg = pkg,
+                    versionName = versionName,
+                    versionCode = versionCode,
+                    buildLabel = LogFiles.buildLabelSafe(),
+                    installShort = installShort,
+                    installHash = installHash,
+                    sdk = Build.VERSION.SDK_INT,
+                    device = "${Build.MANUFACTURER}/${Build.MODEL}",
+                    fingerprintHash = fingerprintHash,
+                    abis = abis,
+                    throwable = t,
+                )
 
-                    pw.println("----- Exception -----")
-                    t.printStackTrace(pw)
-                    pw.flush()
-                }
+                // Best-effort fsync (helps on sudden process death).
+                runCatching { fos.fd.sync() }
             }
+            true
+        }.getOrDefault(false)
 
-            // Best-effort fsync (helps on sudden process death).
-            runCatching { fos.fd.sync() }
+        if (!wroteTmp) {
+            runCatching { tmp.delete() }
+            return
         }
 
         // If rename fails (rare), fallback to direct write.
         if (!tmp.renameTo(file)) {
             runCatching { file.delete() }
-            FileOutputStream(file, false).use { fos ->
-                val limited = LimitedOutputStream(fos, MAX_REPORT_BYTES)
-                val osw = OutputStreamWriter(limited, Charsets.UTF_8)
-                SanitizingLineWriter(osw) { line -> sanitizeLine(line) }.use { writer ->
-                    PrintWriter(writer, true).use { pw ->
-                        pw.println("===== Survey App Crash Report =====")
-                        pw.println("utcCompact=$utcCompact")
-                        pw.println("thread=${thread.name}")
-                        pw.println("threadId=$tid")
-                        pw.println("pid=$pid")
-                        pw.println("uptimeMs=$uptimeMs")
-                        pw.println("sdk=${Build.VERSION.SDK_INT}")
-                        pw.println("device=${Build.MANUFACTURER}/${Build.MODEL}")
-                        pw.println("fingerprint=${Build.FINGERPRINT ?: ""}")
-                        pw.println("abis=${(Build.SUPPORTED_ABIS ?: emptyArray()).joinToString(",")}")
-                        pw.println("appId=$pkg")
-                        pw.println("versionName=$versionName")
-                        pw.println("versionCode=$versionCode")
-                        pw.println("build=${LogFiles.buildLabelSafe()}")
-                        pw.println("installId=$safeInstallId")
-                        pw.println()
-
-                        pw.println("----- Exception -----")
-                        t.printStackTrace(pw)
-                        pw.flush()
-                    }
+            runCatching {
+                FileOutputStream(file, false).use { fos ->
+                    writeReport(
+                        out = fos,
+                        utcCompact = utcCompact,
+                        thread = thread,
+                        tid = tid,
+                        pid = pid,
+                        uptimeMs = uptimeMs,
+                        pkg = pkg,
+                        versionName = versionName,
+                        versionCode = versionCode,
+                        buildLabel = LogFiles.buildLabelSafe(),
+                        installShort = installShort,
+                        installHash = installHash,
+                        sdk = Build.VERSION.SDK_INT,
+                        device = "${Build.MANUFACTURER}/${Build.MODEL}",
+                        fingerprintHash = fingerprintHash,
+                        abis = abis,
+                        throwable = t,
+                    )
+                    runCatching { fos.fd.sync() }
                 }
-                runCatching { fos.fd.sync() }
             }
             runCatching { tmp.delete() }
         } else {
             runCatching { tmp.delete() }
+        }
+    }
+
+    private fun writeReport(
+        out: OutputStream,
+        utcCompact: String,
+        thread: Thread,
+        tid: Long,
+        pid: Int,
+        uptimeMs: Long,
+        pkg: String,
+        versionName: String,
+        versionCode: Long,
+        buildLabel: String,
+        installShort: String,
+        installHash: String,
+        sdk: Int,
+        device: String,
+        fingerprintHash: String,
+        abis: String,
+        throwable: Throwable,
+    ) {
+        val limited = LimitedOutputStream(out, MAX_REPORT_BYTES)
+        val osw = OutputStreamWriter(limited, Charsets.UTF_8)
+
+        SanitizingLineWriter(osw) { line -> sanitizeLine(line) }.use { writer ->
+            PrintWriter(writer, true).use { pw ->
+                pw.println("===== Survey App Crash Report =====")
+                pw.println("utcCompact=$utcCompact")
+                pw.println("thread=${thread.name}")
+                pw.println("threadId=$tid")
+                pw.println("pid=$pid")
+                pw.println("uptimeMs=$uptimeMs")
+                pw.println("sdk=$sdk")
+                pw.println("device=$device")
+                pw.println("fingerprintHash=$fingerprintHash")
+                pw.println("abis=$abis")
+                pw.println("appId=$pkg")
+                pw.println("versionName=$versionName")
+                pw.println("versionCode=$versionCode")
+                pw.println("build=$buildLabel")
+                pw.println("installIdShort=$installShort")
+                pw.println("installIdHash=$installHash")
+                pw.println()
+
+                pw.println("----- Exception -----")
+                throwable.printStackTrace(pw)
+                pw.flush()
+            }
         }
     }
 
@@ -465,5 +519,21 @@ object CrashCapture {
             base.write(clean)
             if (withNewline) base.write("\n")
         }
+    }
+
+    private val HEX = "0123456789abcdef".toCharArray()
+
+    /** SHA-256 hex (lowercase). */
+    private fun sha256Hex(s: String): String {
+        val md = MessageDigest.getInstance("SHA-256")
+        val digest = md.digest(s.toByteArray(Charsets.UTF_8))
+        val out = CharArray(digest.size * 2)
+        var i = 0
+        for (b in digest) {
+            val v = b.toInt() and 0xFF
+            out[i++] = HEX[v ushr 4]
+            out[i++] = HEX[v and 0x0F]
+        }
+        return String(out)
     }
 }

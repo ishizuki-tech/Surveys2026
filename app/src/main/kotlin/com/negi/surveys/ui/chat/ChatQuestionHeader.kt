@@ -37,7 +37,9 @@ import androidx.compose.ui.unit.dp
 /**
  * Header card for the chat question screen.
  *
- * This component is intentionally "dumb" (no state ownership).
+ * Notes:
+ * - Intentionally "dumb" (no state ownership).
+ * - Avoids any logging; caller decides privacy policy.
  */
 @Composable
 internal fun HeaderCard(
@@ -85,15 +87,21 @@ internal fun HeaderCard(
 
 /**
  * Simple status chip.
+ *
+ * Notes:
+ * - Uses label matching (READY / VALIDATING / default).
+ * - Keeps visuals deterministic and theme-driven.
  */
 @Composable
 internal fun StatusPill(label: String) {
-    val bg = when (label) {
+    val normalized = label.trim().uppercase()
+
+    val bg = when (normalized) {
         "READY" -> MaterialTheme.colorScheme.primaryContainer
         "VALIDATING" -> MaterialTheme.colorScheme.tertiaryContainer
         else -> MaterialTheme.colorScheme.surfaceVariant
     }
-    val fg = when (label) {
+    val fg = when (normalized) {
         "READY" -> MaterialTheme.colorScheme.onPrimaryContainer
         "VALIDATING" -> MaterialTheme.colorScheme.onTertiaryContainer
         else -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -106,7 +114,7 @@ internal fun StatusPill(label: String) {
             .padding(horizontal = 10.dp, vertical = 6.dp)
     ) {
         Text(
-            text = label,
+            text = normalized,
             style = MaterialTheme.typography.labelMedium,
             color = fg,
             fontWeight = FontWeight.SemiBold

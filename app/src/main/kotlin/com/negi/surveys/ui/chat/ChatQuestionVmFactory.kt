@@ -16,11 +16,9 @@ package com.negi.surveys.ui.chat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import com.negi.surveys.chat.AnswerValidatorI
-import com.negi.surveys.chat.ChatDraftStore
+import com.negi.surveys.chat.ChatDrafts
 import com.negi.surveys.chat.ChatQuestionViewModel
 import com.negi.surveys.chat.ChatStreamBridge
-import com.negi.surveys.chat.DraftKey
-import com.negi.surveys.chat.InMemoryChatDraftStore
 
 /**
  * Factory for [ChatQuestionViewModel].
@@ -34,8 +32,8 @@ internal class ChatQuestionViewModelFactory(
     private val prompt: String,
     private val validator: AnswerValidatorI,
     private val streamBridge: ChatStreamBridge,
-    private val draftStore: ChatDraftStore,
-    private val draftKey: DraftKey
+    private val draftStore: ChatDrafts.ChatDraftStore,
+    private val draftKey: ChatDrafts.DraftKey
 ) : ViewModelProvider.Factory {
 
     @Suppress("UNCHECKED_CAST")
@@ -61,5 +59,5 @@ internal class ChatQuestionViewModelFactory(
  * - This is intentionally in-memory. If you need persistence, swap this via DI (Hilt/Koin/manual).
  */
 internal object ChatDraftStoreHolder {
-    val store: ChatDraftStore by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { InMemoryChatDraftStore() }
+    val store: ChatDrafts.ChatDraftStore by lazy(LazyThreadSafetyMode.SYNCHRONIZED) { ChatDrafts.InMemoryChatDraftStore() }
 }

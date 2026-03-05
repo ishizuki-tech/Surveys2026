@@ -13,10 +13,8 @@
 
 package com.negi.surveys.ui
 
-import com.negi.surveys.chat.ChatDraftStore
-import com.negi.surveys.chat.ChatMessage
-import com.negi.surveys.chat.ChatRole
-import com.negi.surveys.chat.DraftKey
+import com.negi.surveys.chat.ChatDrafts
+import com.negi.surveys.chat.ChatModels
 import java.security.MessageDigest
 import java.util.Locale
 
@@ -52,8 +50,8 @@ object ReviewAssembler {
      */
     fun buildLogs(
         defs: List<ReviewQuestionDef>,
-        draftStore: ChatDraftStore,
-        keyForQuestion: (questionId: String) -> DraftKey
+        draftStore: ChatDrafts.ChatDraftStore,
+        keyForQuestion: (questionId: String) -> ChatDrafts.DraftKey
     ): List<ReviewQuestionLog> {
         if (defs.isEmpty()) return emptyList()
 
@@ -133,7 +131,7 @@ object ReviewAssembler {
      * - Drop the initial "seed" message from ChatQuestionViewModel:
      *   assistantMessage="Question: <qid>" + followUpQuestion="<prompt>" (before any USER line).
      */
-    private fun List<ChatMessage>.toReviewLines(
+    private fun List<ChatModels.ChatMessage>.toReviewLines(
         questionId: String,
         prompt: String
     ): List<ReviewChatLine> {
@@ -141,7 +139,7 @@ object ReviewAssembler {
 
         
         /** Prefer embedded model output on ASSISTANT messages over transient MODEL bubbles. */
-        val hasEmbeddedModelOutput = any { it.role == ChatRole.ASSISTANT && !it.streamText.isNullOrBlank() }
+        val hasEmbeddedModelOutput = any { it.role == ChatModels.ChatRole.ASSISTANT && !it.streamText.isNullOrBlank() }
 
         val out = ArrayList<ReviewChatLine>(size * 2)
 
@@ -166,7 +164,7 @@ object ReviewAssembler {
 
         for (m in this) {
             when (m.role) {
-                ChatRole.USER -> {
+                ChatModels.ChatRole.USER -> {
                     val t = m.text.trim()
                     if (t.isNotEmpty()) {
                         addLine(ReviewChatKind.USER, t)
@@ -174,7 +172,7 @@ object ReviewAssembler {
                     }
                 }
 
-                ChatRole.ASSISTANT -> {
+                ChatModels.ChatRole.ASSISTANT -> {
                     val a = m.assistantMessage?.trim().orEmpty()
                     val q = normalizeFollowUp(m.followUpQuestion)
 
@@ -196,7 +194,7 @@ object ReviewAssembler {
                     if (embedded.isNotEmpty()) addLine(ReviewChatKind.MODEL_RAW, embedded)
                 }
 
-                ChatRole.MODEL -> {
+                ChatModels.ChatRole.MODEL -> {
                     if (hasEmbeddedModelOutput) {
                         // Skip transient streaming bubbles when an embedded result exists.
                         continue

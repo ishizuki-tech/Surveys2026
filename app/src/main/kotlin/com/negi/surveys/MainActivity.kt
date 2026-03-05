@@ -49,21 +49,26 @@ class MainActivity : ComponentActivity() {
             MaterialTheme {
                 Surface(
                     modifier = Modifier.fillMaxSize(),
-                    color = MaterialTheme.colorScheme.background
+                    color = MaterialTheme.colorScheme.background,
                 ) {
                     SurveyAppRoot()
                 }
             }
         }
     }
-}
 
-private const val TAG_MAIN = "MainActivity"
+    /**
+     * Builds a stable startup log line without leaking any sensitive information.
+     */
+    private fun buildStartupLog(savedInstanceState: Bundle?): String {
+        val recreation = savedInstanceState != null
+        val buildLabel =
+            "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
+                    "${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
+        return "onCreate: uptimeMs=${SystemClock.uptimeMillis()} recreated=$recreation build=$buildLabel"
+    }
 
-private fun buildStartupLog(savedInstanceState: Bundle?): String {
-    val recreation = savedInstanceState != null
-    val buildLabel =
-        "v${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE}) " +
-                "${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}"
-    return "onCreate: uptimeMs=${SystemClock.uptimeMillis()} recreated=$recreation build=$buildLabel"
+    private companion object {
+        private const val TAG_MAIN = "MainActivity"
+    }
 }

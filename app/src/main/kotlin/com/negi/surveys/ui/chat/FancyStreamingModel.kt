@@ -55,9 +55,11 @@ import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.negi.surveys.chat.ChatModels
+import kotlin.math.max
 
 @Immutable
-internal data class StreamAnimPhases(
+private data class StreamAnimPhases(
     val borderPulse: Float,
     val bgPulse: Float,
     val shimmerPhase: Float,
@@ -71,7 +73,7 @@ internal data class StreamAnimPhases(
 )
 
 @Composable
-internal fun rememberStreamAnimPhases(): StreamAnimPhases {
+private fun rememberStreamAnimPhases(): StreamAnimPhases {
     val t = rememberInfiniteTransition(label = "streamAnim")
 
     val borderPulse by t.animateFloat(
@@ -184,18 +186,29 @@ internal fun rememberStreamAnimPhases(): StreamAnimPhases {
         ttftDot1 = ttftDot1,
         ttftDot2 = ttftDot2,
         ttftDot3 = ttftDot3,
-        ttftShimmerPhase = ttftShimmerPhase,
+        ttftShimmerPhase = ttftShimmerPhase
     )
 }
 
+/**
+ * Fancy streaming block for MODEL bubbles, aligned to [ChatModels.ChatMessage].
+ *
+ * Policy:
+ * - TTFT state = STREAMING and streamText is blank.
+ * - Render body = streamText if present, else fall back to [ChatModels.ChatMessage.text].
+ */
 @Composable
 internal fun FancyStreamingModelBlock(
     shape: RoundedCornerShape,
-    ttftActive: Boolean,
-    raw: String,
+    msg: ChatModels.ChatMessage,
     onOutline: Color
 ) {
     val phases = rememberStreamAnimPhases()
+
+    val isStreaming = msg.streamState == ChatModels.ChatStreamState.STREAMING
+    val streamBody = msg.streamText.orEmpty()
+    val ttftActive = isStreaming && streamBody.isBlank()
+    val raw = if (streamBody.isNotBlank()) streamBody else msg.text
 
     val borderColor = MaterialTheme.colorScheme.primary.copy(alpha = phases.borderPulse * 0.9f)
     val baseBg = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.42f + phases.bgPulse)
@@ -219,7 +232,11 @@ internal fun FancyStreamingModelBlock(
             .padding(horizontal = 10.dp, vertical = 10.dp)
     ) {
         Column {
-            FancyStreamingHeader(ttftActive = ttftActive, outline = onOutline, dotAlpha = phases.headerDotAlpha)
+            FancyStreamingHeader(
+                ttftActive = ttftActive,
+                outline = onOutline,
+                dotAlpha = phases.headerDotAlpha
+            )
 
             Spacer(Modifier.height(10.dp))
 
@@ -244,7 +261,7 @@ internal fun FancyStreamingModelBlock(
 }
 
 @Composable
-internal fun StreamingMonospaceTextWithCursor(
+private fun StreamingMonospaceTextWithCursor(
     raw: String,
     cursorAlpha: Float,
     modifier: Modifier = Modifier
@@ -264,13 +281,17 @@ internal fun StreamingMonospaceTextWithCursor(
             drawContent()
             val lr = layoutResult ?: return@drawWithContent
 
-            val caret = lr.getCursorRect(textToRender.length.coerceAtLeast(0))
-            val w = 2.dp.toPx().coerceAtLeast(1f)
-            val h = caret.height.coerceAtLeast(10f)
+            val cursorIndex = textToRender.length.coerceAtLeast(0)
+            val caret = lr.getCursorRect(cursorIndex)
+            val w = max(1f, 2.dp.toPx())
+            val h = max(10f, caret.height)
+
+            val x = caret.left.coerceIn(0f, size.width - w)
+            val y = caret.top.coerceIn(0f, size.height - h)
 
             drawRoundRect(
                 color = cursorColor,
-                topLeft = Offset(caret.left, caret.top),
+                topLeft = Offset(x, y),
                 size = Size(w, h),
                 cornerRadius = CornerRadius(w / 2f, w / 2f)
             )
@@ -280,7 +301,7 @@ internal fun StreamingMonospaceTextWithCursor(
 }
 
 @Composable
-internal fun FancyStreamingHeader(
+private fun FancyStreamingHeader(
     ttftActive: Boolean,
     outline: Color,
     dotAlpha: Float
@@ -338,7 +359,7 @@ internal fun FancyStreamingHeader(
 }
 
 @Composable
-internal fun StreamingMiniShimmerBar(phase: Float) {
+private fun StreamingMiniShimmerBar(phase: Float) {
     val barShape = RoundedCornerShape(999.dp)
 
     BoxWithConstraints(
@@ -366,7 +387,7 @@ internal fun StreamingMiniShimmerBar(phase: Float) {
 }
 
 @Composable
-internal fun TtftIndicator(
+private fun TtftIndicator(
     dot1: Float,
     dot2: Float,
     dot3: Float,
@@ -399,7 +420,6 @@ internal fun TtftIndicator(
 
         val barShape = RoundedCornerShape(999.dp)
 
-        @Suppress("COMPOSE_APPLIER_CALL_MISMATCH")
         BoxWithConstraints(
             modifier = Modifier
                 .fillMaxWidth()
@@ -426,7 +446,7 @@ internal fun TtftIndicator(
 }
 
 @Composable
-internal fun TtftDot(alpha: Float, color: Color) {
+private fun TtftDot(alpha: Float, color: Color) {
     Box(
         modifier = Modifier
             .clip(RoundedCornerShape(999.dp))
