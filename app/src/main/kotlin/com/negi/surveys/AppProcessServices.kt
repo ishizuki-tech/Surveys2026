@@ -20,10 +20,11 @@ import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.slm.SlmRepository
 import com.negi.surveys.utils.ModelDownloadController
-import com.negi.surveys.warmup.FakeWarmupEngine
 import com.negi.surveys.warmup.SLMWarmupEngine
 import com.negi.surveys.warmup.WarmupController
+import java.io.Closeable
 import java.io.File
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -51,6 +52,7 @@ import kotlinx.coroutines.SupervisorJob
 object AppProcessServices {
 
     private const val TAG = "AppProcessServices"
+    private const val TAG_WARMUP_LOG = "WarmupController"
 
     enum class RepoMode {
         ON_DEVICE,
@@ -75,31 +77,46 @@ object AppProcessServices {
         val curMode = repoModeRef.get()
         if (cur != null && curMode == mode) return cur
 
-        synchronized(repoLock) {
-            val insideCur = repoRef.get()
-            val insideMode = repoModeRef.get()
-            if (insideCur != null && insideMode == mode) return insideCur
+        var toClose: Any? = null
+        var createdNow: RepositoryI? = null
 
-            val created: RepositoryI =
-                when (mode) {
-                    RepoMode.ON_DEVICE -> {
-                        // IMPORTANT: Avoid logging raw model outputs in production.
-                        SlmRepository(
-                            context = appCtx,
-                            enableTwoStepEval = true,
-                        )
+        val installed: RepositoryI =
+            synchronized(repoLock) {
+                val insideCur = repoRef.get()
+                val insideMode = repoModeRef.get()
+                if (insideCur != null && insideMode == mode) return insideCur
+
+                val created: RepositoryI =
+                    when (mode) {
+                        RepoMode.ON_DEVICE -> {
+                            // IMPORTANT: Avoid logging raw model outputs in production.
+                            SlmRepository(
+                                context = appCtx,
+                                enableTwoStepEval = true,
+                            )
+                        }
+                        RepoMode.FAKE -> {
+                            FakeSlmRepository()
+                        }
                     }
-                    RepoMode.FAKE -> {
-                        FakeSlmRepository()
-                    }
-                }
 
-            repoRef.set(created)
-            repoModeRef.set(mode)
+                toClose = repoRef.get()
+                createdNow = created
 
+                repoRef.set(created)
+                repoModeRef.set(mode)
+
+                created
+            }
+
+        // Close outside lock (best-effort).
+        toClose?.let { closeIfSupportedSafely(it) }
+
+        createdNow?.let { created ->
             SafeLog.i(TAG, "repository: (re)created mode=$mode type=${created.javaClass.simpleName}")
-            return created
         }
+
+        return installed
     }
 
     // ---------------------------------------------------------------------
@@ -111,8 +128,7 @@ object AppProcessServices {
     private val warmupLock = Any()
 
     // External scope for warmup engine work (never use Main).
-    private val warmupEngineScope =
-        CoroutineScope(SupervisorJob() + Dispatchers.Default)
+    private val warmupEngineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /**
      * Cached inputs for ON_DEVICE warmup.
@@ -132,26 +148,41 @@ object AppProcessServices {
         val curMode = warmupModeRef.get()
         if (cur != null && curMode == mode) return cur
 
-        synchronized(warmupLock) {
-            val insideCur = warmupRef.get()
-            val insideMode = warmupModeRef.get()
-            if (insideCur != null && insideMode == mode) return insideCur
+        var toClose: Any? = null
+        var createdNow: WarmupController? = null
 
-            val created = createWarmupControllerBestEffort(appCtx, mode)
+        val installed: WarmupController =
+            synchronized(warmupLock) {
+                val insideCur = warmupRef.get()
+                val insideMode = warmupModeRef.get()
+                if (insideCur != null && insideMode == mode) return insideCur
 
-            warmupRef.set(created)
-            warmupModeRef.set(mode)
+                val created = createWarmupControllerBestEffort(appCtx, mode)
 
-            // Apply cached inputs if we have them (ON_DEVICE only).
-            if (mode == RepoMode.ON_DEVICE) {
-                created.updateInputs(warmupInputsRef.get())
-            } else {
-                created.updateInputs(null)
+                toClose = warmupRef.get()
+                createdNow = created
+
+                warmupRef.set(created)
+                warmupModeRef.set(mode)
+
+                // Apply cached inputs if we have them (ON_DEVICE only).
+                if (mode == RepoMode.ON_DEVICE) {
+                    created.updateInputs(warmupInputsRef.get())
+                } else {
+                    created.updateInputs(null)
+                }
+
+                created
             }
 
+        // Close outside lock (best-effort).
+        toClose?.let { closeIfSupportedSafely(it) }
+
+        createdNow?.let { created ->
             SafeLog.i(TAG, "warmupController: (re)created mode=$mode type=${created.javaClass.simpleName}")
-            return created
         }
+
+        return installed
     }
 
     /**
@@ -225,11 +256,14 @@ object AppProcessServices {
      * - Never throws.
      *
      * Strategy:
-     * - FAKE mode uses FakeWarmupEngine immediately.
+     * - FAKE mode uses Fake engine immediately.
      * - ON_DEVICE mode uses SLMWarmupEngine that waits for Inputs via updateInputs().
      */
     private fun createWarmupControllerBestEffort(appCtx: Context, mode: RepoMode): WarmupController {
-        val warmupLogger: (String) -> Unit = { msg -> SafeLog.d("WarmupController", msg) }
+        val warmupLogger: (String) -> Unit = { msg ->
+            // Sanitize any engine message to avoid leaking URLs/paths/tokens/filenames.
+            SafeLog.d(TAG_WARMUP_LOG, sanitizeWarmupLog(msg))
+        }
 
         return when (mode) {
             RepoMode.FAKE -> {
@@ -343,23 +377,96 @@ object AppProcessServices {
         val uiMinDeltaBytes: Long,
     )
 
+    // ---------------------------------------------------------------------
+    // Close helpers (best-effort, privacy-safe)
+    // ---------------------------------------------------------------------
+
+    private val closeMethodCache = ConcurrentHashMap<Class<*>, java.lang.reflect.Method?>()
+
     /**
      * Best-effort close helper.
      *
-     * Notes:
+     * Rules:
      * - Never logs exception.message.
+     * - Prefer type-safe close (AutoCloseable/Closeable).
+     * - Reflection is last resort and cached per class.
      */
     private fun closeIfSupportedSafely(target: Any) {
         runCatching {
-            val m = target.javaClass.methods.firstOrNull { it.name == "close" && it.parameterTypes.isEmpty() }
+            when (target) {
+                is AutoCloseable -> {
+                    target.close()
+                    return
+                }
+                is Closeable -> {
+                    target.close()
+                    return
+                }
+            }
+
+            val cls = target.javaClass
+            val cached = closeMethodCache[cls]
+            val m =
+                cached ?: run {
+                    val found = cls.methods.firstOrNull { it.name == "close" && it.parameterTypes.isEmpty() }
+                    closeMethodCache[cls] = found
+                    found
+                }
+
             m?.invoke(target)
         }.onFailure { t ->
-            SafeLog.w(TAG, "closeIfSupportedSafely: failed errType=${t::class.java.simpleName} at=${t.toStackHint()}")
+            SafeLog.w(
+                TAG,
+                "closeIfSupportedSafely: failed errType=${t::class.java.simpleName} at=${t.toStackHint()}",
+            )
         }
     }
-}
 
-private fun Throwable.toStackHint(): String {
-    val e = this.stackTrace.firstOrNull()
-    return if (e != null) "${e.className}.${e.methodName}:${e.lineNumber}" else "unknown"
+    // ---------------------------------------------------------------------
+    // Log sanitization
+    // ---------------------------------------------------------------------
+
+    /**
+     * Sanitizes a warmup-engine log message to avoid leaking:
+     * - URLs, file paths, filenames, and token-like substrings.
+     *
+     * This is intentionally conservative: it may redact non-sensitive details,
+     * but it strongly reduces accidental leakage from engine-side logs.
+     */
+    private fun sanitizeWarmupLog(raw: String): String {
+        var s = raw
+
+        // Redact common Hugging Face token pattern.
+        s = s.replace(Regex("""\bhf_[A-Za-z0-9]{10,}\b"""), "<token>")
+
+        // Redact URLs.
+        s = s.replace(Regex("""https?://\S+"""), "<url>")
+
+        // Redact Windows paths.
+        s = s.replace(Regex("""[A-Za-z]:\\[^\s]+"""), "<path>")
+
+        // Redact Unix-like absolute paths.
+        s = s.replace(Regex("""(/[A-Za-z0-9._-]+)+"""), "<path>")
+
+        // Redact common model/config filenames.
+        s = s.replace(
+            Regex(
+                """\b[\w.-]+\.(bin|tflite|task|gguf|onnx|json|yaml|yml|zip)\b""",
+                RegexOption.IGNORE_CASE,
+            ),
+            "<file>",
+        )
+
+        // Keep logs short and stable.
+        val trimmed = s.trim()
+        return if (trimmed.length <= 220) trimmed else trimmed.take(220) + "…"
+    }
+
+    /**
+     * Returns a stable "stack hint" without printing exception.message.
+     */
+    private fun Throwable.toStackHint(): String {
+        val e = this.stackTrace.firstOrNull()
+        return if (e != null) "${e.className}.${e.methodName}:${e.lineNumber}" else "unknown"
+    }
 }

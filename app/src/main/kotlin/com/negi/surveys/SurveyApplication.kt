@@ -67,7 +67,7 @@ class SurveyApplication : Application() {
             AppBootstrap.ensureInitialized(appContext)
         }.onFailure { t ->
             // IMPORTANT: Do not log t.message (may contain sensitive info).
-            SafeLog.e(TAG, "AppBootstrap failed (non-fatal) type=${t::class.java.simpleName}", t)
+            SafeLog.e(TAG, "AppBootstrap failed (non-fatal) ${t.safeTypeAndHint()}")
         }
 
         // 2) Main-process guard (avoid redundant IO/installs in secondary processes).
@@ -91,7 +91,7 @@ class SurveyApplication : Application() {
             )
         }.onFailure { t ->
             // IMPORTANT: Do not log t.message (may contain sensitive info).
-            SafeLog.e(TAG, "Config install: failed type=${t::class.java.simpleName}", t)
+            SafeLog.e(TAG, "Config install: failed (non-fatal) ${t.safeTypeAndHint()}")
         }
 
         // 4) Warmup Inputs (best-effort):
@@ -107,265 +107,274 @@ class SurveyApplication : Application() {
         private const val TAG = "SurveyApplication"
         private const val CONFIG_ASSET_NAME = "survey.yaml"
     }
-}
-
-/**
- * Best-effort early warmup inputs injection.
- *
- * Rationale:
- * - In some flows, the model file may already exist at cold start (previous download).
- * - If we can determine (file + WarmupCapableRepository), we can install Inputs early.
- *
- * IMPORTANT:
- * - Never blocks the caller.
- * - Never logs file paths/names.
- * - Never clears existing Inputs; only installs when confident.
- */
-private object WarmupInputsBootstrap {
-
-    private const val TAG = "SurveyApplication"
-
-    private val attemptedOnce = AtomicBoolean(false)
-
-    private val scope =
-        CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-    private const val INITIAL_DELAY_MS: Long = 150L
-    private const val RETRY_INTERVAL_MS: Long = 250L
-    private const val MAX_TOTAL_RETRY_MS: Long = 5_000L
-
-    fun tryInjectOnceBestEffort(appContext: Context) {
-        if (!attemptedOnce.compareAndSet(false, true)) return
-
-        scope.launch {
-            // Small delay so process bootstrap/config install can settle.
-            delay(INITIAL_DELAY_MS)
-
-            val deadlineAt = SystemClock.elapsedRealtime() + MAX_TOTAL_RETRY_MS
-            var attempts = 0
-
-            while (SystemClock.elapsedRealtime() < deadlineAt) {
-                attempts += 1
-
-                val file = ModelFileProbe.findModelFileOrNull(appContext.applicationContext)
-                val fileReady = file != null && file.exists() && file.isFile && file.length() > 0L
-                if (!fileReady) {
-                    // Retry in case the file becomes visible shortly after startup.
-                    delay(RETRY_INTERVAL_MS)
-                    continue
-                }
-
-                // Avoid heavy repo creation unless file is ready.
-                val repo =
-                    runCatching {
-                        AppProcessServices.repository(
-                            appContext.applicationContext,
-                            AppProcessServices.RepoMode.ON_DEVICE,
-                        )
-                    }.getOrNull()
-
-                val warmupRepo = repo as? WarmupController.WarmupCapableRepository
-                if (warmupRepo == null) {
-                    // Retry briefly: repo graph may still be stabilizing.
-                    SafeLog.w(
-                        TAG,
-                        "warmupInputs: earlyInject retry (repo not WarmupCapableRepository) " +
-                                "repoType=${repo?.javaClass?.simpleName ?: "null"} pid=${Process.myPid()}",
-                    )
-                    delay(RETRY_INTERVAL_MS)
-                    continue
-                }
-
-                val inputs =
-                    WarmupController.Inputs(
-                        file = file,
-                        repository = warmupRepo,
-                        options = WarmupController.Options(),
-                    )
-
-                AppProcessServices.updateWarmupInputs(inputs)
-
-                SafeLog.i(
-                    TAG,
-                    "warmupInputs: earlyInject installed hasInputs=true pid=${Process.myPid()} " +
-                            "repoType=${repo.javaClass.simpleName} attempts=$attempts",
-                )
-                return@launch
-            }
-
-            SafeLog.w(
-                TAG,
-                "warmupInputs: earlyInject gave up (best-effort) pid=${Process.myPid()} attempts=$attempts",
-            )
-        }
-    }
-}
-
-/**
- * Minimal process guards for Application entry.
- *
- * Notes:
- * - Keep this small and dependency-free.
- * - Avoid disk IO here.
- */
-private object ProcessGuardsEntry {
-
-    @Volatile
-    private var cachedName: String? = null
-
-    fun currentProcessNameCached(context: Context): String {
-        val cur = cachedName
-        if (!cur.isNullOrBlank()) return cur
-
-        val resolved =
-            runCatching {
-                if (Build.VERSION.SDK_INT >= 28) {
-                    Application.getProcessName()
-                } else {
-                    // Best effort (no disk IO): query ActivityManager by pid.
-                    val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-                    val procs = am?.runningAppProcesses
-                    val pid = Process.myPid()
-                    procs?.firstOrNull { it.pid == pid }?.processName
-                }
-            }.getOrNull()
-
-        val name = resolved?.takeIf { it.isNotBlank() } ?: "unknown"
-        cachedName = name
-        return name
-    }
-
-    fun isMainProcess(context: Context): Boolean {
-        val name = currentProcessNameCached(context)
-        val pkg = context.packageName
-        // Fail-open: if we cannot determine, treat as main to keep behavior consistent.
-        return name.isBlank() || name == "unknown" || name == pkg
-    }
-}
-
-/**
- * Best-effort model file probe without depending on ModelDownloadController internals.
- *
- * Privacy:
- * - Never logs file paths.
- *
- * Strategy:
- * - Prefer config-resolved file name if installed config is available.
- * - Otherwise, scan a small set of app-private directories.
- * - Pick the largest plausible model file by extension and minimum size threshold.
- *
- * Notes:
- * - Keep this fast and rate-limited; Application cold-start must stay snappy.
- */
-private object ModelFileProbe {
-
-    private const val TAG = "SurveyApplication"
-
-    private val lastScanAtMs = AtomicLong(0L)
-    private val cachedFile = AtomicReference<File?>(null)
-
-    // Avoid scanning too often (engine/UI may also perform resolution later).
-    private const val SCAN_INTERVAL_READY_MS: Long = 30_000L
-
-    // If no file is cached yet, allow quicker rescans during startup to avoid missing late visibility.
-    private const val SCAN_INTERVAL_EMPTY_MS: Long = 1_000L
-
-    // Heuristic: filter out tiny files.
-    private const val MIN_BYTES: Long = 128L * 1024L * 1024L
-
-    private val allowedExtensions = setOf(
-        ".litertlm",
-        ".bin",
-        ".task",
-        ".gguf",
-    )
-
-    fun findModelFileOrNull(appContext: Context): File? {
-        // 1) Prefer config-resolved file name (single source) if available.
-        val preferred = resolvePreferredFromInstalledConfig(appContext)
-        if (preferred != null) {
-            cachedFile.set(preferred)
-            return preferred
-        }
-
-        // 2) Rate-limit scans.
-        val now = SystemClock.elapsedRealtime()
-        val last = lastScanAtMs.get()
-
-        val interval = if (cachedFile.get() == null) SCAN_INTERVAL_EMPTY_MS else SCAN_INTERVAL_READY_MS
-        if (now - last < interval) {
-            return cachedFile.get()
-        }
-        if (!lastScanAtMs.compareAndSet(last, now)) {
-            return cachedFile.get()
-        }
-
-        val roots = listOfNotNull(
-            appContext.filesDir,
-            File(appContext.filesDir, "models"),
-            File(appContext.filesDir, "slm"),
-            File(appContext.filesDir, "litert"),
-            appContext.noBackupFilesDir,
-            appContext.cacheDir,
-        ).distinct()
-
-        var best: File? = null
-        var bestLen = 0L
-
-        for (dir in roots) {
-            val list = runCatching { dir.listFiles() ?: emptyArray() }.getOrDefault(emptyArray())
-            for (f in list) {
-                if (!f.isFile) continue
-                val name = f.name.lowercase()
-                if (allowedExtensions.none { name.endsWith(it) }) continue
-
-                val len = runCatching { f.length() }.getOrDefault(0L)
-                if (len < MIN_BYTES) continue
-
-                if (len > bestLen) {
-                    best = f
-                    bestLen = len
-                }
-            }
-        }
-
-        cachedFile.set(best)
-
-        if (best != null) {
-            SafeLog.d(TAG, "warmupProbe: best-effort file found size=$bestLen pid=${Process.myPid()}")
-        } else {
-            SafeLog.d(TAG, "warmupProbe: no candidate found pid=${Process.myPid()}")
-        }
-
-        return best
-    }
 
     /**
-     * Resolves a preferred model file using installed config without performing disk/network IO.
+     * Best-effort early warmup inputs injection.
      *
-     * NOTE:
-     * - This does not scan directories.
-     * - This does not log any file name.
+     * Rationale:
+     * - In some flows, the model file may already exist at cold start (previous download).
+     * - If we can determine (file + WarmupCapableRepository), we can install Inputs early.
+     *
+     * IMPORTANT:
+     * - Never blocks the caller.
+     * - Never logs file paths/names.
+     * - Never clears existing Inputs; only installs when confident.
      */
-    private fun resolvePreferredFromInstalledConfig(appContext: Context): File? {
-        val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: return null
-        val raw = cfg.modelDefaults.defaultFileName?.trim().orEmpty()
-        val safeName = sanitizeSimpleFileName(raw) ?: return null
+    private object WarmupInputsBootstrap {
 
-        val f = File(appContext.filesDir, safeName)
-        val ok = runCatching { f.exists() && f.isFile && f.length() > 0L }.getOrDefault(false)
-        return if (ok) f else null
+        private const val TAG = "SurveyApplication"
+
+        private val attemptedOnce = AtomicBoolean(false)
+
+        private val scope =
+            CoroutineScope(SupervisorJob() + Dispatchers.Default)
+
+        private const val INITIAL_DELAY_MS: Long = 150L
+        private const val RETRY_INTERVAL_MS: Long = 250L
+        private const val MAX_TOTAL_RETRY_MS: Long = 5_000L
+
+        fun tryInjectOnceBestEffort(appContext: Context) {
+            if (!attemptedOnce.compareAndSet(false, true)) return
+
+            scope.launch {
+                // Small delay so process bootstrap/config install can settle.
+                delay(INITIAL_DELAY_MS)
+
+                val deadlineAt = SystemClock.elapsedRealtime() + MAX_TOTAL_RETRY_MS
+                var attempts = 0
+
+                while (SystemClock.elapsedRealtime() < deadlineAt) {
+                    attempts += 1
+
+                    val file = ModelFileProbe.findModelFileOrNull(appContext.applicationContext)
+                    val fileReady = file != null && file.exists() && file.isFile && file.length() > 0L
+                    if (!fileReady) {
+                        // Retry in case the file becomes visible shortly after startup.
+                        delay(RETRY_INTERVAL_MS)
+                        continue
+                    }
+
+                    // Avoid heavy repo creation unless file is ready.
+                    val repo =
+                        runCatching {
+                            AppProcessServices.repository(
+                                appContext.applicationContext,
+                                AppProcessServices.RepoMode.ON_DEVICE,
+                            )
+                        }.getOrNull()
+
+                    val warmupRepo = repo as? WarmupController.WarmupCapableRepository
+                    if (warmupRepo == null) {
+                        // Retry briefly: repo graph may still be stabilizing.
+                        SafeLog.w(
+                            TAG,
+                            "warmupInputs: earlyInject retry (repo not WarmupCapableRepository) " +
+                                    "repoType=${repo?.javaClass?.simpleName ?: "null"} pid=${Process.myPid()}",
+                        )
+                        delay(RETRY_INTERVAL_MS)
+                        continue
+                    }
+
+                    val inputs =
+                        WarmupController.Inputs(
+                            file = file,
+                            repository = warmupRepo,
+                            options = WarmupController.Options(),
+                        )
+
+                    AppProcessServices.updateWarmupInputs(inputs)
+
+                    SafeLog.i(
+                        TAG,
+                        "warmupInputs: earlyInject installed hasInputs=true pid=${Process.myPid()} " +
+                                "repoType=${repo.javaClass.simpleName} attempts=$attempts",
+                    )
+                    return@launch
+                }
+
+                SafeLog.w(
+                    TAG,
+                    "warmupInputs: earlyInject gave up (best-effort) pid=${Process.myPid()} attempts=$attempts",
+                )
+            }
+        }
     }
 
     /**
-     * Simple file-name sanitizer to avoid traversal-like inputs.
+     * Minimal process guards for Application entry.
+     *
+     * Notes:
+     * - Keep this small and dependency-free.
+     * - Avoid disk IO here.
      */
-    private fun sanitizeSimpleFileName(name: String): String? {
-        val n = name.trim()
-        if (n.isBlank()) return null
-        if (n.contains('/') || n.contains('\\')) return null
-        if (n.contains("..")) return null
-        if (n.length > 200) return null
-        return n
+    private object ProcessGuardsEntry {
+
+        @Volatile
+        private var cachedName: String? = null
+
+        fun currentProcessNameCached(context: Context): String {
+            val cur = cachedName
+            if (!cur.isNullOrBlank()) return cur
+
+            val resolved =
+                runCatching {
+                    if (Build.VERSION.SDK_INT >= 28) {
+                        Application.getProcessName()
+                    } else {
+                        // Best effort (no disk IO): query ActivityManager by pid.
+                        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+                        val procs = am?.runningAppProcesses
+                        val pid = Process.myPid()
+                        procs?.firstOrNull { it.pid == pid }?.processName
+                    }
+                }.getOrNull()
+
+            val name = resolved?.takeIf { it.isNotBlank() } ?: "unknown"
+            cachedName = name
+            return name
+        }
+
+        fun isMainProcess(context: Context): Boolean {
+            val name = currentProcessNameCached(context)
+            val pkg = context.packageName
+            // Fail-open: if we cannot determine, treat as main to keep behavior consistent.
+            return name.isBlank() || name == "unknown" || name == pkg
+        }
+    }
+
+    /**
+     * Best-effort model file probe without depending on ModelDownloadController internals.
+     *
+     * Privacy:
+     * - Never logs file paths.
+     *
+     * Strategy:
+     * - Prefer config-resolved file name if installed config is available.
+     * - Otherwise, scan a small set of app-private directories.
+     * - Pick the largest plausible model file by extension and minimum size threshold.
+     *
+     * Notes:
+     * - Keep this fast and rate-limited; Application cold-start must stay snappy.
+     */
+    private object ModelFileProbe {
+
+        private const val TAG = "SurveyApplication"
+
+        private val lastScanAtMs = AtomicLong(0L)
+        private val cachedFile = AtomicReference<File?>(null)
+
+        // Avoid scanning too often (engine/UI may also perform resolution later).
+        private const val SCAN_INTERVAL_READY_MS: Long = 30_000L
+
+        // If no file is cached yet, allow quicker rescans during startup to avoid missing late visibility.
+        private const val SCAN_INTERVAL_EMPTY_MS: Long = 1_000L
+
+        // Heuristic: filter out tiny files.
+        private const val MIN_BYTES: Long = 128L * 1024L * 1024L
+
+        private val allowedExtensions = setOf(
+            ".litertlm",
+            ".bin",
+            ".task",
+            ".gguf",
+        )
+
+        fun findModelFileOrNull(appContext: Context): File? {
+            // 1) Prefer config-resolved file name (single source) if available.
+            val preferred = resolvePreferredFromInstalledConfig(appContext)
+            if (preferred != null) {
+                cachedFile.set(preferred)
+                return preferred
+            }
+
+            // 2) Rate-limit scans.
+            val now = SystemClock.elapsedRealtime()
+            val last = lastScanAtMs.get()
+
+            val interval = if (cachedFile.get() == null) SCAN_INTERVAL_EMPTY_MS else SCAN_INTERVAL_READY_MS
+            if (now - last < interval) {
+                return cachedFile.get()
+            }
+            if (!lastScanAtMs.compareAndSet(last, now)) {
+                return cachedFile.get()
+            }
+
+            val roots = listOfNotNull(
+                appContext.filesDir,
+                File(appContext.filesDir, "models"),
+                File(appContext.filesDir, "slm"),
+                File(appContext.filesDir, "litert"),
+                appContext.noBackupFilesDir,
+                appContext.cacheDir,
+            ).distinct()
+
+            var best: File? = null
+            var bestLen = 0L
+
+            for (dir in roots) {
+                val list = runCatching { dir.listFiles() ?: emptyArray() }.getOrDefault(emptyArray())
+                for (f in list) {
+                    if (!f.isFile) continue
+                    val name = f.name.lowercase()
+                    if (allowedExtensions.none { name.endsWith(it) }) continue
+
+                    val len = runCatching { f.length() }.getOrDefault(0L)
+                    if (len < MIN_BYTES) continue
+
+                    if (len > bestLen) {
+                        best = f
+                        bestLen = len
+                    }
+                }
+            }
+
+            cachedFile.set(best)
+
+            if (best != null) {
+                SafeLog.d(TAG, "warmupProbe: best-effort file found size=$bestLen pid=${Process.myPid()}")
+            } else {
+                SafeLog.d(TAG, "warmupProbe: no candidate found pid=${Process.myPid()}")
+            }
+
+            return best
+        }
+
+        /**
+         * Resolves a preferred model file using installed config without performing disk/network IO.
+         *
+         * NOTE:
+         * - This does not scan directories.
+         * - This does not log any file name.
+         */
+        private fun resolvePreferredFromInstalledConfig(appContext: Context): File? {
+            val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: return null
+            val raw = cfg.modelDefaults.defaultFileName?.trim().orEmpty()
+            val safeName = sanitizeSimpleFileName(raw) ?: return null
+
+            val f = File(appContext.filesDir, safeName)
+            val ok = runCatching { f.exists() && f.isFile && f.length() > 0L }.getOrDefault(false)
+            return if (ok) f else null
+        }
+
+        /**
+         * Simple file-name sanitizer to avoid traversal-like inputs.
+         */
+        private fun sanitizeSimpleFileName(name: String): String? {
+            val n = name.trim()
+            if (n.isBlank()) return null
+            if (n.contains('/') || n.contains('\\')) return null
+            if (n.contains("..")) return null
+            if (n.length > 200) return null
+            return n
+        }
+    }
+
+    /**
+     * Returns a safe string that never includes exception.message.
+     */
+    private fun Throwable.safeTypeAndHint(): String {
+        val e = this.stackTrace.firstOrNull()
+        val hint = if (e != null) "${e.className}.${e.methodName}:${e.lineNumber}" else "unknown"
+        return "type=${this::class.java.simpleName} at=$hint"
     }
 }

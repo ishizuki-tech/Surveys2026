@@ -18,13 +18,14 @@ import android.os.SystemClock
 import android.util.Base64
 import com.negi.surveys.BuildConfig
 import java.io.File
-import java.io.FileOutputStream
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.ThreadLocalRandom
 import kotlin.math.min
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 /**
@@ -46,6 +47,7 @@ import org.json.JSONObject
  * - Size cap is conservative to reduce memory spikes (base64 + JSON).
  * - Retries for transient failures (5xx/429), and conflict retry (409) by re-fetching sha.
  * - Retry-After header support (best-effort) for 429/secondary rate limiting.
+ * - RateLimit reset support (best-effort) for some 403/429 cases.
  */
 object GitHubLogUploadManager {
     private const val TAG = "GitHubLogUpload"
@@ -77,6 +79,9 @@ object GitHubLogUploadManager {
 
     /** Base backoff (ms). */
     private const val BACKOFF_BASE_MS: Long = 700L
+
+    /** Hard clamp for sleep to avoid blocking app start forever. */
+    private const val BACKOFF_MAX_MS: Long = 30_000L
 
     private data class GitHubCfg(
         val owner: String,
@@ -142,7 +147,7 @@ object GitHubLogUploadManager {
         // Ensure file logger exists so the bundle is not mysteriously empty.
         runCatching { AppLog.ensureReady(context.applicationContext) }
 
-        val install = LogFiles.installId(context)
+        val installHash = LogFiles.installIdHash(context) // PII-safe stable directory key
         val zip = LogFiles.createZipBundle(
             context = context,
             kind = LogFiles.UploadKind.REGULAR,
@@ -153,7 +158,7 @@ object GitHubLogUploadManager {
         val remotePath = buildRepoPath(
             cfg = cfg,
             kind = LogFiles.UploadKind.REGULAR,
-            installId = install,
+            installKey = installHash,
             fileName = zip.name
         )
 
@@ -188,7 +193,7 @@ object GitHubLogUploadManager {
         val pending = CrashCapture.pendingCrashFiles(context)
         if (pending.isEmpty()) return Result.success(0)
 
-        val install = LogFiles.installId(context)
+        val installHash = LogFiles.installIdHash(context) // PII-safe stable directory key
         val zip = LogFiles.createZipBundle(
             context = context,
             kind = LogFiles.UploadKind.CRASH,
@@ -199,7 +204,7 @@ object GitHubLogUploadManager {
         val remotePath = buildRepoPath(
             cfg = cfg,
             kind = LogFiles.UploadKind.CRASH,
-            installId = install,
+            installKey = installHash,
             fileName = zip.name
         )
 
@@ -221,12 +226,35 @@ object GitHubLogUploadManager {
         }
     }
 
-    private fun buildRepoPath(cfg: GitHubCfg, kind: LogFiles.UploadKind, installId: String, fileName: String): String {
+    /**
+     * Coroutine-friendly regular upload.
+     */
+    suspend fun uploadRegular(context: Context, reason: String? = null): Result<String> =
+        withContext(Dispatchers.IO) { uploadRegularBlocking(context, reason) }
+
+    /**
+     * Coroutine-friendly pending crash upload.
+     */
+    suspend fun tryUploadPendingCrashes(context: Context): Result<Int> =
+        withContext(Dispatchers.IO) { tryUploadPendingCrashesBlocking(context) }
+
+    private fun buildRepoPath(
+        cfg: GitHubCfg,
+        kind: LogFiles.UploadKind,
+        installKey: String,
+        fileName: String
+    ): String {
         val prefix = cfg.logPrefix.trim().trim('/').ifBlank { "surveyapp" }
-        return "$prefix/${kind.prefix}/$installId/$fileName"
+        val safeInstallKey = installKey.trim().ifBlank { "unknown" }
+        return "$prefix/${kind.prefix}/$safeInstallKey/$fileName"
     }
 
-    private fun uploadZipAsRepoContent(cfg: GitHubCfg, zipFile: File, repoPath: String, commitHint: String): Result<String> {
+    private fun uploadZipAsRepoContent(
+        cfg: GitHubCfg,
+        zipFile: File,
+        repoPath: String,
+        commitHint: String
+    ): Result<String> {
         if (!zipFile.exists() || !zipFile.isFile) {
             return Result.failure(IllegalArgumentException("zipFile not found: ${zipFile.absolutePath}"))
         }
@@ -248,10 +276,10 @@ object GitHubLogUploadManager {
 
         // Base64 expands payload; keep an additional sanity check.
         val estimatedB64Chars = estimateBase64Chars(bytes.size)
-        if (estimatedB64Chars <= 0) {
+        if (estimatedB64Chars <= 0L) {
             return Result.failure(IllegalStateException("Invalid Base64 size estimation."))
         }
-        if (estimatedB64Chars > SOFT_MAX_B64_CHARS) {
+        if (estimatedB64Chars > SOFT_MAX_B64_CHARS.toLong()) {
             return Result.failure(
                 IllegalStateException(
                     "Bundle too large after Base64 expansion (estimatedB64Chars=$estimatedB64Chars). " +
@@ -335,6 +363,7 @@ object GitHubLogUploadManager {
                         sleepBackoffMs(
                             attempt = attempt,
                             retryAfterMs = e.retryAfterMs,
+                            rateLimitResetEpochSec = e.rateLimitResetEpochSec,
                             hint = "409-conflict"
                         )
                         continue
@@ -350,6 +379,7 @@ object GitHubLogUploadManager {
                         sleepBackoffMs(
                             attempt = attempt,
                             retryAfterMs = e.retryAfterMs,
+                            rateLimitResetEpochSec = e.rateLimitResetEpochSec,
                             hint = "http-${e.code}"
                         )
                         continue
@@ -362,8 +392,8 @@ object GitHubLogUploadManager {
                 } catch (e: IOException) {
                     lastError = e
                     if (attempt < MAX_RETRIES - 1) {
-                        AppLog.w(TAG, "upload: io retry uploadId=$uploadId path=$repoPath err=${e.message}")
-                        sleepBackoffMs(attempt = attempt, retryAfterMs = null, hint = "io")
+                        AppLog.w(TAG, "upload: io retry uploadId=$uploadId path=$repoPath err=${e.javaClass.simpleName}")
+                        sleepBackoffMs(attempt = attempt, retryAfterMs = null, rateLimitResetEpochSec = null, hint = "io")
                         continue
                     }
                     throw e
@@ -412,7 +442,7 @@ object GitHubLogUploadManager {
                     body = resp,
                     retryAfterMs = parseRetryAfterMs(conn),
                     rateLimitRemaining = conn.getHeaderField("X-RateLimit-Remaining"),
-                    rateLimitReset = conn.getHeaderField("X-RateLimit-Reset")
+                    rateLimitResetEpochSec = parseRateLimitResetEpochSec(conn)
                 )
             }
             return resp
@@ -456,7 +486,7 @@ object GitHubLogUploadManager {
                     body = resp,
                     retryAfterMs = parseRetryAfterMs(conn),
                     rateLimitRemaining = conn.getHeaderField("X-RateLimit-Remaining"),
-                    rateLimitReset = conn.getHeaderField("X-RateLimit-Reset")
+                    rateLimitResetEpochSec = parseRateLimitResetEpochSec(conn)
                 )
             }
         } finally {
@@ -537,22 +567,45 @@ object GitHubLogUploadManager {
         return sec * 1000L
     }
 
-    private fun sleepBackoffMs(attempt: Int, retryAfterMs: Long?, hint: String) {
+    private fun parseRateLimitResetEpochSec(conn: HttpURLConnection): Long? {
+        val raw = conn.getHeaderField("X-RateLimit-Reset")?.trim().orEmpty()
+        val sec = raw.toLongOrNull() ?: return null
+        return sec.takeIf { it > 0L }
+    }
+
+    private fun sleepBackoffMs(
+        attempt: Int,
+        retryAfterMs: Long?,
+        rateLimitResetEpochSec: Long?,
+        hint: String
+    ) {
         val jitter = ThreadLocalRandom.current().nextLong(0L, 250L)
         val exp = (attempt + 1).toLong()
         val base = BACKOFF_BASE_MS * exp * exp
-        val ms = (retryAfterMs ?: base) + jitter
-        val clamped = ms.coerceIn(200L, 30_000L)
+
+        val untilResetMs = rateLimitResetEpochSec?.let { resetSec ->
+            val now = System.currentTimeMillis()
+            val resetMs = resetSec * 1000L
+            (resetMs - now).takeIf { it > 0L }
+        }
+
+        val ms = maxOf(
+            0L,
+            retryAfterMs ?: 0L,
+            untilResetMs ?: 0L,
+            base
+        ) + jitter
+
+        val clamped = ms.coerceIn(200L, BACKOFF_MAX_MS)
         AppLog.d(TAG, "backoff: hint=$hint attempt=${attempt + 1} sleepMs=$clamped")
         runCatching { Thread.sleep(clamped) }
     }
 
-    private fun estimateBase64Chars(byteCount: Int): Int {
-        if (byteCount <= 0) return 0
+    private fun estimateBase64Chars(byteCount: Int): Long {
+        if (byteCount <= 0) return 0L
         // Base64: 4 chars per 3 bytes, rounded up.
-        val groups = (byteCount + 2) / 3
-        val chars = groups * 4
-        return min(chars, Int.MAX_VALUE)
+        val groups = (byteCount.toLong() + 2L) / 3L
+        return groups * 4L
     }
 
     private fun firstNonBlank(vararg xs: String): String {
@@ -580,6 +633,6 @@ object GitHubLogUploadManager {
         val body: String,
         val retryAfterMs: Long?,
         val rateLimitRemaining: String?,
-        val rateLimitReset: String?
+        val rateLimitResetEpochSec: Long?
     ) : IOException("HTTP $code")
 }

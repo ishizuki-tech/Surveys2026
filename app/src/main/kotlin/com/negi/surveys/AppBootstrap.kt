@@ -38,6 +38,10 @@ import kotlin.concurrent.thread
  * Privacy:
  * - Never log tokens/urls/file names/raw content.
  * - Never log exception.message (it can contain sensitive info).
+ *
+ * Note:
+ * - To enforce the privacy rule robustly, this file never passes Throwable to the logger.
+ *   (Some logger implementations print `Throwable.toString()`, which includes message.)
  */
 object AppBootstrap {
 
@@ -65,12 +69,14 @@ object AppBootstrap {
 
         runCatching { AppLog.init(appCtx) }
             .onFailure { t ->
-                SafeLog.w(TAG_BOOT, "AppLog.init failed (non-fatal) type=${t.javaClass.simpleName}", t)
+                // Do not pass Throwable to logger (may print exception.message).
+                SafeLog.w(TAG_BOOT, "AppLog.init failed (non-fatal) type=${t.javaClass.simpleName}")
             }
 
         runCatching { CrashCapture.install(appCtx) }
             .onFailure { t ->
-                SafeLog.w(TAG_BOOT, "CrashCapture.install failed (non-fatal) type=${t.javaClass.simpleName}", t)
+                // Do not pass Throwable to logger (may print exception.message).
+                SafeLog.w(TAG_BOOT, "CrashCapture.install failed (non-fatal) type=${t.javaClass.simpleName}")
             }
 
         PendingCrashUploadKickoff.tryStart(appCtx)
@@ -90,11 +96,14 @@ object AppBootstrap {
      * Notes:
      * - Uses a background thread intentionally (best-effort early upload).
      * - Watchdog logs only state breadcrumbs (no sensitive payloads).
+     * - Blocking upload is additionally wrapped with a hard timeout to avoid hanging forever.
      */
     private object PendingCrashUploadKickoff {
         private const val TAG_UPLOAD = "PendingCrashUpload"
         private const val THREAD_NAME = "PendingCrashUpload"
+
         private const val UPLOAD_WATCHDOG_MS = 25_000L
+        private const val UPLOAD_HARD_TIMEOUT_MS = 23_000L
 
         private val started = AtomicBoolean(false)
 
@@ -116,12 +125,20 @@ object AppBootstrap {
             DONE,
         }
 
+        private data class UploadCallMeta(
+            val finished: Boolean,
+            val ok: Boolean,
+            val resultType: String?,
+            val errType: String?,
+        )
+
         private fun kickOffPendingCrashUpload(context: Context) {
             runCatching {
                 thread(
                     start = true,
                     name = THREAD_NAME,
-                    // Do NOT daemonize: we want a higher chance of completing early uploads.
+                    // Do NOT daemonize this outer thread: it provides early best-effort upload.
+                    // The actual blocking upload call is run on a daemon sub-thread with a hard timeout.
                     isDaemon = false,
                 ) {
                     val appCtx = context.applicationContext
@@ -130,7 +147,8 @@ object AppBootstrap {
 
                     Thread.currentThread().uncaughtExceptionHandler =
                         Thread.UncaughtExceptionHandler { _, e ->
-                            SafeLog.e(TAG_UPLOAD, "pending crash upload: uncaught exception", e)
+                            // Do not pass Throwable to logger (may print exception.message).
+                            SafeLog.e(TAG_UPLOAD, "pending crash upload: uncaught exception type=${e.javaClass.simpleName}")
                         }
 
                     runCatching { Process.setThreadPriority(Process.THREAD_PRIORITY_BACKGROUND) }
@@ -184,18 +202,19 @@ object AppBootstrap {
                         val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }
                             .getOrDefault(-1)
 
-                        val r = runCatching { GitHubLogUploadManager.tryUploadPendingCrashesBlocking(appCtx) }
-                        val err = r.exceptionOrNull()
+                        val meta = tryUploadPendingCrashesWithHardTimeout(appCtx, UPLOAD_HARD_TIMEOUT_MS)
 
                         SafeLog.i(
                             TAG_UPLOAD,
-                            "pending crash upload (GitHub): pendingBefore=$pendingBefore ok=${r.isSuccess} " +
-                                    "result=${r.getOrNull()} errType=${err?.javaClass?.simpleName ?: "-"}",
+                            "pending crash upload (GitHub): pendingBefore=$pendingBefore finished=${meta.finished} " +
+                                    "ok=${meta.ok} resultType=${meta.resultType ?: "-"} errType=${meta.errType ?: "-"}",
                         )
 
-                        if (err != null) {
-                            // IMPORTANT: Do not log err.message (may contain sensitive info).
-                            SafeLog.e(TAG_UPLOAD, "pending crash upload (GitHub) failed", err)
+                        if (!meta.finished) {
+                            SafeLog.w(TAG_UPLOAD, "pending crash upload (GitHub): hard timeout reached; continuing")
+                        } else if (!meta.ok && meta.errType != null) {
+                            // Do not pass Throwable to logger (may print exception.message).
+                            SafeLog.e(TAG_UPLOAD, "pending crash upload (GitHub) failed errType=${meta.errType}")
                         }
 
                         phaseRef.set(UploadPhase.COUNT_PENDING_AFTER)
@@ -204,7 +223,8 @@ object AppBootstrap {
 
                         SafeLog.i(TAG_UPLOAD, "pending crash upload: end pendingAfter=$pendingAfter")
                     } catch (t: Throwable) {
-                        SafeLog.e(TAG_UPLOAD, "kickOffPendingCrashUpload: unexpected failure", t)
+                        // Do not pass Throwable to logger (may print exception.message).
+                        SafeLog.e(TAG_UPLOAD, "kickOffPendingCrashUpload: unexpected failure type=${t.javaClass.simpleName}")
                     } finally {
                         phaseRef.set(UploadPhase.DONE)
                         runCatching { watchdog.interrupt() }
@@ -214,10 +234,59 @@ object AppBootstrap {
                     }
                 }
             }.onFailure { t ->
+                // Do not pass Throwable to logger (may print exception.message).
                 SafeLog.w(
                     TAG_UPLOAD,
                     "Failed to start PendingCrashUpload thread (non-fatal) type=${t.javaClass.simpleName}",
-                    t,
+                )
+            }
+        }
+
+        /**
+         * Runs the blocking upload on a daemon sub-thread and joins with a hard timeout.
+         *
+         * Why:
+         * - A network stack can hang indefinitely in rare cases.
+         * - We do not want a non-daemon bootstrap thread to stick around forever.
+         */
+        private fun tryUploadPendingCrashesWithHardTimeout(
+            appCtx: Context,
+            timeoutMs: Long,
+        ): UploadCallMeta {
+            val resultRef = AtomicReference<Result<Any?>?>(null)
+
+            val callThread = thread(
+                start = true,
+                name = "${THREAD_NAME}-Call",
+                isDaemon = true,
+            ) {
+                val r = runCatching {
+                    // IMPORTANT: This may block; we wrap it with a join timeout.
+                    GitHubLogUploadManager.tryUploadPendingCrashesBlocking(appCtx)
+                }
+                // Store only Result; do NOT stringify any payloads.
+                resultRef.set(r as Result<Any?>)
+            }
+
+            runCatching { callThread.join(timeoutMs) }
+
+            val r = resultRef.get()
+            return if (r != null) {
+                val err = r.exceptionOrNull()
+                UploadCallMeta(
+                    finished = true,
+                    ok = r.isSuccess,
+                    resultType = r.getOrNull()?.javaClass?.simpleName,
+                    errType = err?.javaClass?.simpleName,
+                )
+            } else {
+                // Best-effort interrupt; network stacks may ignore it.
+                runCatching { callThread.interrupt() }
+                UploadCallMeta(
+                    finished = false,
+                    ok = false,
+                    resultType = null,
+                    errType = "Timeout",
                 )
             }
         }
@@ -229,7 +298,7 @@ object AppBootstrap {
      * Notes:
      * - Prefer API 28+ getProcessName fast path.
      * - Fallback order: ActivityManager -> /proc/self/cmdline.
-     * - Avoid heavy work; /proc read is last resort and tiny.
+     * - Use ApplicationInfo.processName as the main-process name (handles custom android:process).
      */
     private object ProcessGuards {
 
@@ -239,25 +308,38 @@ object AppBootstrap {
             val cur = cachedProcessName.get()
             if (!cur.isNullOrBlank()) return cur
 
-            val resolved = getCurrentProcessName(context.applicationContext)
-            val name = resolved?.takeIf { it.isNotBlank() } ?: "unknown"
+            val appCtx = context.applicationContext
+            val resolved = getCurrentProcessName(appCtx)
+            val name = resolved?.takeIf { it.isNotBlank() } ?: getMainProcessName(appCtx) ?: "unknown"
             cachedProcessName.set(name)
             return name
         }
 
         fun isMainProcess(context: Context): Boolean {
             val appCtx = context.applicationContext
-            val packageName = appCtx.packageName
+            val mainProcessName = getMainProcessName(appCtx) ?: appCtx.packageName
 
             val current = getCurrentProcessName(appCtx)
             if (current.isNullOrBlank()) {
                 // Fail-open for safety, but leave a breadcrumb for diagnosis.
+                cachedProcessName.set(mainProcessName)
                 SafeLog.w(TAG_BOOT, "process name unavailable; fail-open (treat as main)")
                 return true
             }
 
             cachedProcessName.set(current)
-            return current == packageName
+            return current == mainProcessName
+        }
+
+        /**
+         * Returns the "main process name" declared by the app.
+         *
+         * This is safer than assuming it equals packageName, because android:process can override it.
+         */
+        private fun getMainProcessName(context: Context): String? {
+            return runCatching { context.applicationInfo.processName }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
         }
 
         private fun getCurrentProcessName(context: Context): String? {

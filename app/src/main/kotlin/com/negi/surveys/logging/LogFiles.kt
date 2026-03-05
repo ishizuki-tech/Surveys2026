@@ -17,6 +17,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Looper
 import android.os.Process
+import android.util.Log
 import com.negi.surveys.BuildConfig
 import java.io.BufferedInputStream
 import java.io.File
@@ -72,6 +73,10 @@ object LogFiles {
 
     private const val ZIP_BUFFER_BYTES = 8 * 1024
 
+    /** Cache hygiene: keep last N bundles per kind, and delete bundles older than this age. */
+    private const val MAX_BUNDLES_PER_KIND = 16
+    private const val MAX_BUNDLE_AGE_MS: Long = 14L * 24L * 60L * 60L * 1000L // 14 days
+
     /** Thread-local UTC timestamp formatter (SimpleDateFormat is not thread-safe). */
     private val utcCompact: ThreadLocal<SimpleDateFormat> = ThreadLocal.withInitial {
         SimpleDateFormat("yyyyMMdd-HHmmssSSS", Locale.US).apply {
@@ -124,9 +129,11 @@ object LogFiles {
     fun ensureAppLogFile(context: Context): File {
         val f = appLogFile(context)
         if (!f.exists()) {
-            runCatching {
+            try {
                 f.parentFile?.mkdirs()
                 FileOutputStream(f, true).use { /* touch */ }
+            } catch (_: Throwable) {
+                // Ignore: existence is best-effort.
             }
         }
         return f
@@ -204,8 +211,8 @@ object LogFiles {
         val appContext = context.applicationContext
 
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            // Avoid crashing; warn loudly to prevent ANR incidents in production.
-            AppLog.w(TAG, "createZipBundle: called on main thread (ANR risk). Prefer createZipBundleAsync().")
+            // IMPORTANT: Use Log.* (NOT AppLog/SafeLog) to avoid extra synchronous IO on main thread.
+            Log.w(TAG, "createZipBundle: called on main thread (ANR risk). Prefer createZipBundleAsync().")
         }
 
         val safeMaxApp = maxAppLogs.coerceAtLeast(0)
@@ -216,6 +223,10 @@ object LogFiles {
         ensureAppLogFile(appContext)
 
         val cache = appContext.cacheDir
+
+        // Cache hygiene: avoid growing cache unbounded.
+        pruneOldBundles(cacheDir = cache, kind = kind)
+
         val zipName = "${kind.prefix}-${utcCompactNow()}-${Process.myPid()}.zip"
         val zipFile = File(cache, zipName)
 
@@ -397,7 +408,7 @@ object LogFiles {
         val totalBytes = appBytes + crashBytes
 
         val abis = runCatching { Build.SUPPORTED_ABIS?.joinToString(",") ?: "" }.getOrDefault("")
-        val fingerprintHash = sha256Hex(Build.FINGERPRINT ?: "").take(16)
+        val fingerprintHash = sha256Hex(Build.FINGERPRINT).take(16)
 
         return buildString(2048) {
             append("{")
@@ -412,7 +423,7 @@ object LogFiles {
             append("\"build\":\"").append(escapeJson(build)).append("\",")
             append("\"pid\":").append(Process.myPid()).append(",")
             append("\"sdk\":").append(Build.VERSION.SDK_INT).append(",")
-            append("\"release\":\"").append(escapeJson(Build.VERSION.RELEASE ?: "")).append("\",")
+            append("\"release\":\"").append(escapeJson(Build.VERSION.RELEASE)).append("\",")
             append("\"device\":\"").append(escapeJson("${Build.MANUFACTURER}/${Build.MODEL}")).append("\",")
             append("\"fingerprintHash\":\"").append(escapeJson(fingerprintHash)).append("\",")
             append("\"abis\":\"").append(escapeJson(abis)).append("\",")
@@ -621,6 +632,38 @@ object LogFiles {
             out[i++] = HEX[v and 0x0F]
         }
         return String(out)
+    }
+
+    /**
+     * Deletes old bundles to keep cache bounded.
+     *
+     * Policy:
+     * - Remove bundles older than [MAX_BUNDLE_AGE_MS]
+     * - Then keep only newest [MAX_BUNDLES_PER_KIND] for this kind
+     */
+    private fun pruneOldBundles(cacheDir: File, kind: UploadKind) {
+        val now = System.currentTimeMillis()
+        val prefix = "${kind.prefix}-"
+        val candidates = cacheDir.listFiles()
+            ?.filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(".zip") }
+            .orEmpty()
+
+        // Age-based pruning first.
+        candidates.forEach { f ->
+            val age = now - f.lastModified()
+            if (age > MAX_BUNDLE_AGE_MS) {
+                runCatching { f.delete() }
+            }
+        }
+
+        // Count-based pruning (newest-first).
+        val remaining = cacheDir.listFiles()
+            ?.filter { it.isFile && it.name.startsWith(prefix) && it.name.endsWith(".zip") }
+            ?.sortedByDescending { it.lastModified() }
+            .orEmpty()
+
+        if (remaining.size <= MAX_BUNDLES_PER_KIND) return
+        remaining.drop(MAX_BUNDLES_PER_KIND).forEach { runCatching { it.delete() } }
     }
 
     /** Upload bundle kind. */

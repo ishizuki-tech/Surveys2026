@@ -17,11 +17,15 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import com.negi.surveys.chat.RepositoryI
 
 /**
- * Required CompositionLocal for RepositoryI.
+ * Required CompositionLocal for [RepositoryI].
  *
- * NOTE:
- * - This is intentionally NON-nullable to prevent silent fallback creation.
- * - If you forget to provide it in the root, the app will crash fast with a clear error.
+ * Design:
+ * - Non-nullable to prevent silent fallback creation.
+ * - Fails fast with a clear error if not provided.
+ *
+ * Usage:
+ * - Provide in your app root:
+ *   CompositionLocalProvider(LocalRepositoryI provides repository) { ... }
  */
 val LocalRepositoryI = staticCompositionLocalOf<RepositoryI> {
     error("LocalRepositoryI is not provided. Provide RepositoryI in SurveyAppRoot via CompositionLocalProvider.")

@@ -111,16 +111,21 @@ suspend fun Flow<String>.collectToTextResult(
             collectInto(sb, limit, onChunk)
         }
 
+        // Ensure validity even if upstream produced odd boundaries.
+        dropDanglingHighSurrogateAtEnd(sb)
+
         FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.COMPLETED
         )
     } catch (_: OutputLimitReached) {
+        dropDanglingHighSurrogateAtEnd(sb)
         FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.MAX_CHARS
         )
     } catch (_: TimeoutCancellationException) {
+        dropDanglingHighSurrogateAtEnd(sb)
         FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.TIMEOUT
@@ -128,6 +133,7 @@ suspend fun Flow<String>.collectToTextResult(
     } catch (ce: CancellationException) {
         throw ce
     } catch (t: Throwable) {
+        dropDanglingHighSurrogateAtEnd(sb)
         FlowTextResult(
             text = sb.toString(),
             reason = FlowTextStopReason.ERROR,
@@ -176,17 +182,45 @@ suspend fun Flow<String>.collectToTextResultWithBudget(
  * Callback note:
  * - Exceptions from [onChunk] must not break collection (to avoid losing model output).
  * - [CancellationException] is rethrown to respect structured concurrency.
+ *
+ * Surrogate safety:
+ * - Handles rare cases where upstream splits UTF-16 surrogate pairs across chunk boundaries.
  */
 private suspend fun Flow<String>.collectInto(
     sb: StringBuilder,
     maxChars: Int,
     onChunk: ((chunk: String, totalChars: Int) -> Unit)?
 ) {
-    collect { chunk ->
+    collect { rawChunk ->
+        if (rawChunk.isEmpty()) return@collect
+
+        // --- Cross-chunk surrogate repair ---------------------------------
+        // If sb ends with a dangling high surrogate, decide based on next chunk's head.
+        if (sb.isNotEmpty() && Character.isHighSurrogate(sb[sb.length - 1])) {
+            val head = rawChunk.firstOrNull()
+            if (head == null || !Character.isLowSurrogate(head)) {
+                // Previous chunk ended with an unmatched high surrogate; drop it.
+                sb.setLength(sb.length - 1)
+            }
+        }
+
+        // If a chunk starts with a low surrogate and there is no preceding high surrogate,
+        // drop the leading low surrogate (it cannot be valid).
+        var start = 0
+        if (rawChunk.isNotEmpty() && Character.isLowSurrogate(rawChunk[0])) {
+            val prevIsHigh = sb.isNotEmpty() && Character.isHighSurrogate(sb[sb.length - 1])
+            if (!prevIsHigh) start = 1
+        }
+
+        val chunk = if (start == 0) rawChunk else rawChunk.substring(start)
         if (chunk.isEmpty()) return@collect
 
+        // --- Budget enforcement -------------------------------------------
         val remaining = maxChars - sb.length
-        if (remaining <= 0) throw OutputLimitReached()
+        if (remaining <= 0) {
+            dropDanglingHighSurrogateAtEnd(sb)
+            throw OutputLimitReached()
+        }
 
         val clipped = clipToBudgetPreservingSurrogates(chunk, remaining)
         if (clipped.isNotEmpty()) {
@@ -203,7 +237,11 @@ private suspend fun Flow<String>.collectInto(
             }
         }
 
-        if (sb.length >= maxChars) throw OutputLimitReached()
+        if (sb.length >= maxChars) {
+            // Avoid leaving a dangling high surrogate due to clipping.
+            dropDanglingHighSurrogateAtEnd(sb)
+            throw OutputLimitReached()
+        }
     }
 }
 
@@ -222,6 +260,7 @@ private fun clipToBudgetPreservingSurrogates(chunk: String, budget: Int): String
     var end = budget.coerceAtMost(chunk.length)
     if (end <= 0) return ""
 
+    // If we would split a surrogate pair inside THIS chunk, step back by 1.
     if (end < chunk.length) {
         val last = chunk[end - 1]
         val next = chunk[end]
@@ -231,7 +270,20 @@ private fun clipToBudgetPreservingSurrogates(chunk: String, budget: Int): String
     }
 
     if (end <= 0) return ""
-    return chunk.take(end)
+    return chunk.substring(0, end)
+}
+
+/**
+ * Ensures we never end with a dangling high surrogate.
+ *
+ * This is important when we stop early due to MAX_CHARS/TIMEOUT/ERROR.
+ */
+private fun dropDanglingHighSurrogateAtEnd(sb: StringBuilder) {
+    if (sb.isEmpty()) return
+    val last = sb[sb.length - 1]
+    if (Character.isHighSurrogate(last)) {
+        sb.setLength(sb.length - 1)
+    }
 }
 
 /**

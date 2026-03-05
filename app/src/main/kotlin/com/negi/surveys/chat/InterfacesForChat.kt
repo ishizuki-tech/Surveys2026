@@ -167,7 +167,7 @@ interface AnswerValidatorI {
      * @param questionId Survey question id (e.g., "Q1"), normalized for stable storage/logging.
      * @param answer User's main answer, normalized for stable downstream behavior.
      */
-    suspend fun validateMain(questionId: String, answer: String): ValidationOutcome
+    suspend fun validateMain(questionId: String, answer: String): ChatModels.ValidationOutcome
 
     /**
      * Validate a follow-up answer, given the main answer.
@@ -184,7 +184,7 @@ interface AnswerValidatorI {
         questionId: String,
         mainAnswer: String,
         followUpAnswer: String
-    ): ValidationOutcome
+    ): ChatModels.ValidationOutcome
 
     /**
      * Convenience wrapper that normalizes inputs before calling [validateMain].
@@ -196,7 +196,7 @@ interface AnswerValidatorI {
      * - [answer] is normalized via [AnswerNormalization.normalizeAnswerText] to remove
      *   invisible/hostile characters and collapse whitespace deterministically.
      */
-    suspend fun validateMainRaw(questionId: String, answer: String): ValidationOutcome {
+    suspend fun validateMainRaw(questionId: String, answer: String): ChatModels.ValidationOutcome {
         return validateMain(
             questionId = AnswerNormalization.normalizeId(questionId),
             answer = AnswerNormalization.normalizeAnswerText(answer)
@@ -212,7 +212,7 @@ interface AnswerValidatorI {
         questionId: String,
         mainAnswer: String,
         followUpAnswer: String
-    ): ValidationOutcome {
+    ): ChatModels.ValidationOutcome {
         return validateFollowUp(
             questionId = AnswerNormalization.normalizeId(questionId),
             mainAnswer = AnswerNormalization.normalizeAnswerText(mainAnswer),
