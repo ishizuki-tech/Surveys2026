@@ -15,9 +15,9 @@ package com.negi.surveys.slm
 
 import android.content.Context
 import com.google.ai.edge.litertlm.Message
+import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.chat.DefaultSlmPromptBuilder
-import com.negi.surveys.chat.RepositoryI
-import com.negi.surveys.chat.SlmPromptBuilder
+import com.negi.surveys.chat.SlmPromptBuilderI
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
@@ -91,11 +91,11 @@ class SlmRepository(
      * - Keep it stateless.
      * - Do NOT perform I/O inside the builder.
      */
-    private val promptBuilder: SlmPromptBuilder = DefaultSlmPromptBuilder,
+    private val promptBuilder: SlmPromptBuilderI = DefaultSlmPromptBuilder,
 
     /** Debug options (safe defaults). */
     debug: DebugConfig = DebugConfig(),
-) : RepositoryI, WarmupController.WarmupCapableRepository {
+) : ChatValidation.RepositoryI, WarmupController.WarmupCapableRepository {
 
     data class DebugConfig(
         /** Enable debug logging. */
@@ -148,9 +148,29 @@ class SlmRepository(
         return promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
     }
 
+    /**
+     * Phase-aware prompt building.
+     *
+     * IMPORTANT:
+     * - Validation prompts (from AnswerValidator) are already "strict JSON-only" prompts.
+     *   We still wrap them with the system prompt via buildAnswerLikePrompt() for consistency.
+     * - We do NOT inject any PHASE markers into the prompt text here.
+     */
+    override fun buildPrompt(userPrompt: String, phase: ChatValidation.PromptPhase): String {
+        val u = userPrompt.trim()
+        if (u.isBlank()) return ""
+
+        // No I/O here.
+        val sys = getSystemPromptFromCacheOnly()
+
+        // Today: same wrapping strategy for both phases.
+        // Future: if you want different system prompt text per phase, do it here.
+        return promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
+    }
+
     override suspend fun request(prompt: String): Flow<String> {
-        val userPrompt = prompt.trim()
-        if (userPrompt.isBlank()) return emptyFlow()
+        val input = prompt.trim()
+        if (input.isBlank()) return emptyFlow()
 
         val cfg = getConfigSuspendBestEffort()
 
@@ -175,6 +195,22 @@ class SlmRepository(
             )
         }
 
+        // ------------------------------------------------------------
+        // Validator verdict prompt bypass:
+        // - AnswerValidator sends a model-ready prompt that must return ONE JSON verdict
+        //   (with "assistantMessage" key). This must NOT enter the two-step eval flow.
+        // ------------------------------------------------------------
+        if (isValidationVerdictPrompt(input)) {
+            if (resetConversationEachRequest) {
+                resetConversationBestEffort(model, reason = "validatorVerdict")
+            }
+            return requestOneStep(model = model, prompt = input)
+        }
+
+        // Legacy/chat behavior:
+        // - Treat [input] as "userPrompt" and run the repo's orchestration (two-step or one-step).
+        val userPrompt = input
+
         return if (enableTwoStepEval) {
             requestEvalScoreThenFollowUp(model = model, userPrompt = userPrompt)
         } else {
@@ -186,6 +222,26 @@ class SlmRepository(
             val p = promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = userPrompt)
             requestOneStep(model = model, prompt = p)
         }
+    }
+
+    /**
+     * Heuristic detector for AnswerValidator's "verdict" prompts.
+     *
+     * Rationale:
+     * - We intentionally do NOT rely on "PHASE=..." markers in prompt text.
+     * - Verdict prompts must output JSON containing "assistantMessage".
+     * - Two-step follow-up JSON schema does NOT include "assistantMessage".
+     *
+     * IMPORTANT:
+     * - Keep this conservative to avoid breaking chat prompts.
+     */
+    private fun isValidationVerdictPrompt(modelReadyPrompt: String): Boolean {
+        // The prompt may be wrapped by buildAnswerLikePrompt(), so we scan the whole text.
+        if (!modelReadyPrompt.contains("Return exactly ONE JSON object", ignoreCase = false)) return false
+        if (!modelReadyPrompt.contains("\"assistantMessage\"")) return false
+        if (!modelReadyPrompt.contains("\"followUpQuestion\"")) return false
+        if (!modelReadyPrompt.contains("\"status\"")) return false
+        return true
     }
 
     /**

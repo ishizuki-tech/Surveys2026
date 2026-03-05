@@ -68,7 +68,7 @@ import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import androidx.navigation3.ui.NavDisplay
 import com.negi.surveys.chat.ChatStreamBridge
-import com.negi.surveys.chat.RepositoryI
+import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
@@ -350,7 +350,7 @@ object SurveyAppRoot {
         // Process-scoped services (Repo/Warmup/Downloader)
         // -------------------------------------------------------------
 
-        val repo: RepositoryI = remember(appContext, repoMode) {
+        val repo: ChatValidation.RepositoryI = remember(appContext, repoMode) {
             AppProcessServices.repository(appContext, repoMode)
         }
 

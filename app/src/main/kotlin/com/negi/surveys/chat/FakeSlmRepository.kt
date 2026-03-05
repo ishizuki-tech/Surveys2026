@@ -13,6 +13,7 @@
 
 package com.negi.surveys.chat
 
+import com.negi.surveys.chat.FlowTextCollector.collectToTextResultWithBudget
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
@@ -45,8 +46,8 @@ import org.json.JSONObject
 class FakeSlmRepository(
     config: Config = Config(),
     /** Shared prompt builder to keep prompt contract aligned with the real repository. */
-    private val promptBuilder: SlmPromptBuilder = DefaultSlmPromptBuilder,
-) : RepositoryI {
+    private val promptBuilder: SlmPromptBuilderI = DefaultSlmPromptBuilder,
+) : ChatValidation.RepositoryI {
 
     data class Config(
         /** Delay before returning the Flow to simulate request preparation latency. */
@@ -137,7 +138,7 @@ class FakeSlmRepository(
         return promptBuilder.buildAnswerLikePrompt(systemPrompt = null, userPrompt = userPrompt)
     }
 
-    override fun buildPrompt(userPrompt: String, phase: PromptPhase): String {
+    override fun buildPrompt(userPrompt: String, phase: ChatValidation.PromptPhase): String {
         // IMPORTANT:
         // - Do NOT introduce a nullable overload (PromptPhase?) because JVM signatures collide.
         // This is a legacy validator-style prompt path; it is intentionally NOT shared with the real repository.
@@ -231,14 +232,14 @@ class FakeSlmRepository(
         )
 
         val evalJsonIdeal = generateEvalScoreJson(
-            seed = rawSeed + "#EVAL",
+            seed = "$rawSeed#EVAL",
             questionId = questionId,
             userPrompt = u,
             threshold = cfg.acceptScoreThreshold,
         )
 
         val evalInternalFlow = streamTextAsCallbackFlow(
-            seed = rawSeed + "#EVAL_INTERNAL",
+            seed = "$rawSeed#EVAL_INTERNAL",
             fullText = jsonWithOptionalNoise(seed = rawSeed + "#EVAL_INTERNAL", json = evalJsonIdeal),
             throwAfterEmits = if (cfg.throwOnEvalInternal) cfg.throwAfterEmitsOnEvalInternal else -1,
             firstChunkDelayMs = cfg.firstChunkDelayMs,
@@ -302,11 +303,11 @@ class FakeSlmRepository(
     // Legacy validator-style prompt builder (PHASE overload compatibility)
     // ---------------------------------------------------------------------
 
-    private fun buildValidatorStylePrompt(userPrompt: String, phase: PromptPhase): String {
+    private fun buildValidatorStylePrompt(userPrompt: String, phase: ChatValidation.PromptPhase): String {
         val phaseLine = run {
             val tag = when (phase) {
-                PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
-                PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
+                ChatValidation.PromptPhase.VALIDATE_MAIN -> "VALIDATE_MAIN"
+                ChatValidation.PromptPhase.VALIDATE_FOLLOW_UP -> "VALIDATE_FOLLOW_UP"
             }
             "\nPHASE=$tag\n"
         }
@@ -478,7 +479,7 @@ $userPrompt
     // Legacy validator compatibility path (PHASE=... requests)
     // ---------------------------------------------------------------------
 
-    private fun buildLegacyValidatorJsonFromPrompt(prompt: String, phase: PromptPhase): String {
+    private fun buildLegacyValidatorJsonFromPrompt(prompt: String, phase: ChatValidation.PromptPhase): String {
         // Backward-compatible behavior: old validator flows expect ACCEPTED/NEED_FOLLOW_UP with followUpQuestion.
         val mainAnswer = extractBlockAny(
             text = prompt,
@@ -486,7 +487,7 @@ $userPrompt
         ).orEmpty()
 
         return when (phase) {
-            PromptPhase.VALIDATE_MAIN -> {
+            ChatValidation.PromptPhase.VALIDATE_MAIN -> {
                 if (mainAnswer.trim().length >= 12) {
                     """
 {
@@ -504,7 +505,7 @@ $userPrompt
 """.trimIndent()
                 }
             }
-            PromptPhase.VALIDATE_FOLLOW_UP -> {
+            ChatValidation.PromptPhase.VALIDATE_FOLLOW_UP -> {
                 """
 {
   "status": "NEED_FOLLOW_UP",
@@ -520,11 +521,11 @@ $userPrompt
     // Phase / ID / prompt extraction
     // ---------------------------------------------------------------------
 
-    private fun detectPhaseFromPrompt(prompt: String): PromptPhase? {
+    private fun detectPhaseFromPrompt(prompt: String): ChatValidation.PromptPhase? {
         val m = Regex("""(?m)^\s*PHASE=(VALIDATE_MAIN|VALIDATE_FOLLOW_UP)\s*$""").find(prompt) ?: return null
         return when (m.groupValues.getOrNull(1)) {
-            "VALIDATE_FOLLOW_UP" -> PromptPhase.VALIDATE_FOLLOW_UP
-            else -> PromptPhase.VALIDATE_MAIN
+            "VALIDATE_FOLLOW_UP" -> ChatValidation.PromptPhase.VALIDATE_FOLLOW_UP
+            else -> ChatValidation.PromptPhase.VALIDATE_MAIN
         }
     }
 

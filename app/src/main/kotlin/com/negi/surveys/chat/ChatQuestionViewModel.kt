@@ -61,7 +61,7 @@ import kotlinx.coroutines.withContext
 class ChatQuestionViewModel(
     private val questionId: String,
     private val prompt: String,
-    private val validator: AnswerValidatorI,
+    private val validator: ChatValidation.AnswerValidatorI,
     private val streamBridge: ChatStreamBridge,
     private val draftStore: ChatDrafts.ChatDraftStore,
     private val draftKey: ChatDrafts.DraftKey,
@@ -360,7 +360,7 @@ class ChatQuestionViewModel(
         var didRequestCancel = false
 
         // Cancel active stream without requiring the VM to know the session id yet.
-        val cancelledId = streamBridge.cancelActive(CANCELLED_MESSAGE)
+        val cancelledId = streamBridge.cancelActive(ChatStreamEvent.Codes.CANCELLED)
         if (cancelledId > 0L) {
             didRequestCancel = true
             lastCancelledStreamSessionId = cancelledId
@@ -371,7 +371,7 @@ class ChatQuestionViewModel(
         if (sessionId > 0L) {
             didRequestCancel = true
             lastCancelledStreamSessionId = sessionId
-            streamBridge.cancel(sessionId, CANCELLED_MESSAGE)
+            streamBridge.cancel(sessionId, ChatStreamEvent.Codes.CANCELLED)
         }
 
         return didRequestCancel
@@ -850,10 +850,11 @@ class ChatQuestionViewModel(
             val tokenNorm = token.trim().lowercase(Locale.US)
             val codeNorm = code?.trim()?.lowercase(Locale.US).orEmpty()
 
-            val isReplaced = (tokenNorm == REPLACED_MESSAGE || codeNorm == REPLACED_MESSAGE)
+            val isReplaced =
+                (tokenNorm == ChatStreamEvent.Codes.REPLACED || codeNorm == ChatStreamEvent.Codes.REPLACED)
 
             val suppressedCancel =
-                (tokenNorm == CANCELLED_MESSAGE || codeNorm == CANCELLED_MESSAGE) &&
+                (tokenNorm == ChatStreamEvent.Codes.CANCELLED || codeNorm == ChatStreamEvent.Codes.CANCELLED) &&
                         suppressNextCancelledError.getAndSet(false)
 
             val cancelledSession = isCancelledSession(sessionId)
@@ -1218,9 +1219,6 @@ class ChatQuestionViewModel(
 
         private const val DEFAULT_FOLLOW_UP_MAIN = "Could you add one concrete detail or example?"
         private const val DEFAULT_FOLLOW_UP_MORE = "Could you add one more concrete detail?"
-
-        private const val CANCELLED_MESSAGE = "cancelled"
-        private const val REPLACED_MESSAGE = "replaced"
 
         private const val INPUT_PERSIST_DEBOUNCE_MS: Long = 250L
 

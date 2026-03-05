@@ -52,11 +52,10 @@ import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.negi.surveys.chat.AnswerValidator
-import com.negi.surveys.chat.AnswerValidatorI
 import com.negi.surveys.chat.ChatDrafts
 import com.negi.surveys.chat.ChatQuestionViewModel
 import com.negi.surveys.chat.ChatStreamBridge
-import com.negi.surveys.chat.RepositoryI
+import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.ui.LocalChatStreamBridge
 import com.negi.surveys.ui.ReviewQuestionLog
@@ -91,7 +90,7 @@ fun ChatQuestionScreen(
     prompt: String = "Question prompt for $questionId (placeholder)",
     onNext: (log: ReviewQuestionLog) -> Unit,
     onBack: () -> Unit,
-    repository: RepositoryI = LocalRepositoryI.current,
+    repository: ChatValidation.RepositoryI = LocalRepositoryI.current,
 ) {
     val onNextLatest by rememberUpdatedState(onNext)
     val onBackLatest by rememberUpdatedState(onBack)
@@ -106,7 +105,7 @@ fun ChatQuestionScreen(
         ChatDrafts.DraftKey(questionId = questionId, promptHash = promptHash)
     }
 
-    val validator: AnswerValidatorI = remember(questionId, promptHash, repository, streamBridge) {
+    val validator: ChatValidation.AnswerValidatorI = remember(questionId, promptHash, repository, streamBridge) {
         AnswerValidator(
             repository = repository,
             streamBridge = streamBridge,

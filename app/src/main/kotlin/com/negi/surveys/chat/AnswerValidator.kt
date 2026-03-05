@@ -34,24 +34,28 @@ import org.json.JSONObject
  * - ChatStreamBridge producer APIs are thread-safe; do NOT force Main thread hopping here.
  */
 class AnswerValidator(
-    private val repository: RepositoryI,
+    private val repository: ChatValidation.RepositoryI,
     private val streamBridge: ChatStreamBridge,
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     private val maxChars: Int = 32_000,
     private val logger: ((String) -> Unit)? = null
-) : AnswerValidatorI {
+) : ChatValidation.AnswerValidatorI {
 
-    override suspend fun validateMain(questionId: String, answer: String): ChatModels.ValidationOutcome {
+    override suspend fun validateMain(
+        questionId: String,
+        answer: String
+    ): ChatModels.ValidationOutcome {
         return withContext(Dispatchers.Default) {
             val t0 = SystemClock.elapsedRealtime()
+            val phase = ChatValidation.PromptPhase.VALIDATE_MAIN
 
             val userPrompt = buildValidationUserPrompt(
-                phase = PromptPhaseTag.VALIDATE_MAIN,
+                phase = phase,
                 questionId = questionId,
                 mainAnswer = answer,
                 followUpAnswerPayload = null
             )
-            val modelPrompt = repository.buildPrompt(userPrompt)
+            val modelPrompt = repository.buildPrompt(userPrompt, phase)
 
             log("validateMain: qid=${questionId.trim()} start promptChars=${modelPrompt.length}")
 
@@ -85,14 +89,15 @@ class AnswerValidator(
     ): ChatModels.ValidationOutcome {
         return withContext(Dispatchers.Default) {
             val t0 = SystemClock.elapsedRealtime()
+            val phase = ChatValidation.PromptPhase.VALIDATE_FOLLOW_UP
 
             val userPrompt = buildValidationUserPrompt(
-                phase = PromptPhaseTag.VALIDATE_FOLLOW_UP,
+                phase = phase,
                 questionId = questionId,
                 mainAnswer = mainAnswer,
                 followUpAnswerPayload = followUpAnswer
             )
-            val modelPrompt = repository.buildPrompt(userPrompt)
+            val modelPrompt = repository.buildPrompt(userPrompt, phase)
 
             log("validateFollowUp: qid=${questionId.trim()} start promptChars=${modelPrompt.length}")
 
@@ -125,9 +130,13 @@ class AnswerValidator(
 
     /**
      * Build a strict JSON-only prompt with backward-compatible marker blocks.
+     *
+     * IMPORTANT:
+     * - Phase is provided via Repository.buildPrompt(userPrompt, phase).
+     * - Do NOT embed "PHASE=..." lines here to avoid contract drift.
      */
     private fun buildValidationUserPrompt(
-        phase: PromptPhaseTag,
+        phase: ChatValidation.PromptPhase,
         questionId: String,
         mainAnswer: String,
         followUpAnswerPayload: String?
@@ -150,7 +159,6 @@ class AnswerValidator(
         val followUpAnswerText: String = when {
             !hasFollowUp -> ""
             extracted != null && extracted.answer.isNotBlank() -> extracted.answer.trim()
-            // IMPORTANT FIX:
             // If the payload is NOT a history format, it's a direct answer. Use it as-is.
             !treatAsHistory -> fuRaw
             // History detected but extraction failed (rare). Fallback to raw payload (clipped below).
@@ -166,7 +174,7 @@ class AnswerValidator(
             // Do NOT log raw answers. Only metadata.
             val sha8 = sha256Hex(followUpAnswerText).take(8)
             log(
-                "followUpDetected: phase=${phase.tag} treatAsHistory=$treatAsHistory " +
+                "followUpDetected: phase=${phase.name} treatAsHistory=$treatAsHistory " +
                         "latestQlen=${followUpQuestionText.length} latestAlen=${followUpAnswerText.length} latestAsha8=$sha8"
             )
         }
@@ -216,7 +224,6 @@ Rules:
 - If FOLLOW_UP_ANSWER is non-empty, do NOT repeat the same follow-up question again.
   Either ACCEPTED, or ask a DIFFERENT and more specific follow-up question.
 
-PHASE=${phase.tag}
 QUESTION_ID: $qid
 
 MAIN_ANSWER_BEGIN
@@ -227,11 +234,6 @@ $followUpSection
 """.trimIndent()
     }
 
-    private enum class PromptPhaseTag(val tag: String) {
-        VALIDATE_MAIN("VALIDATE_MAIN"),
-        VALIDATE_FOLLOW_UP("VALIDATE_FOLLOW_UP")
-    }
-
     // ---------------------------------------------------------------------
     // Streaming collection
     // ---------------------------------------------------------------------
@@ -240,14 +242,14 @@ $followUpSection
      * Collect streaming text with bounded output.
      *
      * Threading:
-     * - ChatStreamBridge is thread-safe; do not force Main thread hops here.
+     * - ChatStreamBridge producer APIs are thread-safe; do not force Main thread hops here.
      */
     private suspend fun collectStreamingTextResult(
         promptChars: Int,
         flowProvider: suspend () -> Flow<String>,
         timeoutMs: Long,
         maxChars: Int
-    ): FlowTextResult {
+    ): FlowTextCollector.Result {
         val maxCharsSafe = max(0, maxChars)
         val timeoutMsSafe = max(0L, timeoutMs)
 
@@ -261,58 +263,63 @@ $followUpSection
         )
 
         return try {
-            val result = flowProvider().collectToTextResult(
-                timeoutMs = timeoutMsSafe,
-                maxChars = maxCharsSafe,
-                onChunk = onChunk@{ chunk, _ ->
-                    if (chunk.isEmpty()) return@onChunk
+            val result = FlowTextCollector.run {
+                flowProvider().collectToTextResult(
+                    timeoutMs = timeoutMsSafe,
+                    maxChars = maxCharsSafe,
+                    onChunk = { chunk, _ ->
+                        if (chunk.isEmpty()) return@collectToTextResult
 
-                    val out = coalescer.onChunk(chunk)
-                    if (!out.isNullOrEmpty()) {
-                        streamBridge.emitChunk(sessionId, out)
+                        val out = coalescer.onChunk(chunk)
+                        if (!out.isNullOrEmpty()) {
+                            runCatching { streamBridge.emitChunk(sessionId, out) }
+                        }
                     }
-                }
-            )
+                )
+            }
 
             coalescer.flush(force = true)?.let { tail ->
                 if (tail.isNotEmpty()) {
-                    streamBridge.emitChunk(sessionId, tail)
+                    runCatching { streamBridge.emitChunk(sessionId, tail) }
                 }
             }
 
             when (result.reason) {
-                FlowTextStopReason.COMPLETED -> streamBridge.end(sessionId)
-                FlowTextStopReason.MAX_CHARS -> streamBridge.end(sessionId)
-                FlowTextStopReason.TIMEOUT -> streamBridge.error(sessionId, "timeout")
-                FlowTextStopReason.ERROR -> streamBridge.error(sessionId, result.errorToken ?: "error")
+                FlowTextCollector.StopReason.COMPLETED -> streamBridge.end(sessionId)
+                FlowTextCollector.StopReason.MAX_CHARS -> streamBridge.end(sessionId)
+                FlowTextCollector.StopReason.TIMEOUT -> streamBridge.error(sessionId, ChatStreamEvent.Codes.TIMEOUT)
+                FlowTextCollector.StopReason.ERROR -> streamBridge.error(
+                    sessionId,
+                    result.errorToken ?: ChatStreamEvent.Codes.ERROR
+                )
             }
 
             result
         } catch (ce: CancellationException) {
             runCatching {
                 coalescer.flush(force = true)?.let { tail ->
-                    if (tail.isNotEmpty()) {
-                        streamBridge.emitChunk(sessionId, tail)
-                    }
+                    if (tail.isNotEmpty()) streamBridge.emitChunk(sessionId, tail)
                 }
             }
-            runCatching { streamBridge.error(sessionId, "cancelled") }
+            runCatching { streamBridge.error(sessionId, ChatStreamEvent.Codes.CANCELLED) }
             log("collectStreamingText: session=$sessionId cancelled")
             throw ce
         } catch (t: Throwable) {
-            val token = t.javaClass.simpleName.ifBlank { "error" }.take(32)
+            val token = t.javaClass.simpleName.ifBlank { ChatStreamEvent.Codes.ERROR }.take(32)
 
             runCatching {
                 coalescer.flush(force = true)?.let { tail ->
-                    if (tail.isNotEmpty()) {
-                        streamBridge.emitChunk(sessionId, tail)
-                    }
+                    if (tail.isNotEmpty()) streamBridge.emitChunk(sessionId, tail)
                 }
             }
             runCatching { streamBridge.error(sessionId, token) }
 
             log("collectStreamingText: session=$sessionId crashed err=$token")
-            FlowTextResult(text = "", reason = FlowTextStopReason.ERROR, errorToken = token)
+            FlowTextCollector.Result(
+                text = "",
+                reason = FlowTextCollector.StopReason.ERROR,
+                errorToken = token
+            )
         }
     }
 
@@ -323,7 +330,7 @@ $followUpSection
     private fun parseOutcomeOrFallback(
         questionId: String,
         raw: String,
-        stopReason: FlowTextStopReason,
+        stopReason: FlowTextCollector.StopReason,
         errorToken: String?,
         fallbackFollowUp: String
     ): ChatModels.ValidationOutcome {
@@ -334,16 +341,16 @@ $followUpSection
 
         if (cleaned.isBlank()) {
             val msg = when (stopReason) {
-                FlowTextStopReason.TIMEOUT ->
+                FlowTextCollector.StopReason.TIMEOUT ->
                     "Validation timed out. Please add one more detail."
-                FlowTextStopReason.MAX_CHARS ->
+                FlowTextCollector.StopReason.MAX_CHARS ->
                     "Validation output was too long and got clipped. Please add one more concrete detail."
-                FlowTextStopReason.ERROR ->
+                FlowTextCollector.StopReason.ERROR ->
                     when (errorToken) {
                         "ModelNotReadyException" -> "Model is still warming up. Please try again in a moment."
                         else -> "Validation failed due to a runtime error. Please try again."
                     }
-                FlowTextStopReason.COMPLETED ->
+                FlowTextCollector.StopReason.COMPLETED ->
                     "I couldn't read the validation result. One more detail would help."
             }
 
@@ -358,13 +365,13 @@ $followUpSection
         val jsonStr = extractValidationJsonObject(cleaned)
         if (jsonStr == null) {
             val msg = when (stopReason) {
-                FlowTextStopReason.TIMEOUT ->
+                FlowTextCollector.StopReason.TIMEOUT ->
                     "Validation timed out before producing a full result. One more detail would help."
-                FlowTextStopReason.MAX_CHARS ->
+                FlowTextCollector.StopReason.MAX_CHARS ->
                     "Validation output got clipped before a full JSON result appeared. One more detail would help."
-                FlowTextStopReason.ERROR ->
+                FlowTextCollector.StopReason.ERROR ->
                     "Validation failed before producing a parseable result. Please add one more detail."
-                FlowTextStopReason.COMPLETED ->
+                FlowTextCollector.StopReason.COMPLETED ->
                     "I couldn't reliably parse the validation result. One more detail would help."
             }
 
@@ -618,12 +625,11 @@ $followUpSection
         val digest = MessageDigest.getInstance("SHA-256")
         val bytes = digest.digest(text.toByteArray(Charsets.UTF_8))
 
-        val hex = "0123456789abcdef"
         val sb = StringBuilder(bytes.size * 2)
         for (b in bytes) {
             val v = b.toInt()
-            sb.append(hex[(v ushr 4) and 0xF])
-            sb.append(hex[v and 0xF])
+            sb.append(HEX[(v ushr 4) and 0xF])
+            sb.append(HEX[v and 0xF])
         }
         return sb.toString()
     }
@@ -662,7 +668,7 @@ $followUpSection
         }
 
         fun flush(force: Boolean): String? {
-            if (buffer.isEmpty()) return null
+            if (buffer.length == 0) return null
 
             if (!force) {
                 val now = SystemClock.uptimeMillis()
@@ -676,7 +682,7 @@ $followUpSection
         }
 
         private fun flushInternal(nowMs: Long): String? {
-            if (buffer.isEmpty()) return null
+            if (buffer.length == 0) return null
             val out = buffer.toString()
             buffer.setLength(0)
             lastEmitMs = nowMs
@@ -711,12 +717,16 @@ $followUpSection
 
     private companion object {
         private const val TAG = "AnswerValidator"
+
         private const val DEFAULT_TIMEOUT_MS = 90_000L
 
         // Prompt-size guards (avoid giant follow-up payloads causing prompt bloat).
         private const val MAX_FOLLOW_UP_ANSWER_CHARS = 8_000
         private const val MAX_FOLLOW_UP_QUESTION_CHARS = 2_000
         private const val MAX_FOLLOW_UP_HISTORY_CHARS = 16_000
+
+        // Hex table for sha256 logging tokens.
+        private const val HEX = "0123456789abcdef"
 
         // Precompiled regex (avoid per-call allocations).
         private val FOLLOW_UP_HISTORY_LINE_RE = Regex("""^FOLLOW_UP_\d+_[QA]:\s*.*$""")
