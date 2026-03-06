@@ -34,18 +34,18 @@ import kotlinx.coroutines.SupervisorJob
  * Process-scoped service holder.
  *
  * Why:
- * - Activity/Compose recomposition can recreate objects.
- * - Repository / warmup / model-download controllers should be stable per process.
+ * - Activity / Compose recomposition can recreate objects.
+ * - Repository / warmup / model-download controllers should stay stable per process.
  *
  * Privacy:
- * - Never log tokens, URLs, file names, or any raw user/model content.
- * - Even exception messages may contain sensitive info; do not log exception.message.
+ * - Never log tokens, URLs, file names, or raw user/model content.
+ * - Even exception messages may contain sensitive info, so do not log exception.message.
  *
  * Thread-safety:
  * - Creation is guarded to prevent duplicate heavy instances under contention.
- * - "Swap then close" for replaceable services to keep callers fast.
+ * - Uses "swap then close" for replaceable services to keep callers fast.
  *
- * Key change:
+ * Warmup notes:
  * - WarmupController.Dependencies is removed.
  * - Warmup is driven by explicit WarmupController.Inputs injected via updateWarmupInputs().
  */
@@ -89,24 +89,37 @@ object AppProcessServices {
                 val created: ChatValidation.RepositoryI =
                     when (mode) {
                         RepoMode.ON_DEVICE -> {
-                            // IMPORTANT: Avoid logging raw model outputs in production.
+                            // IMPORTANT:
+                            // - Avoid logging raw model outputs in production.
+                            // - SlmRepository still keeps some legacy constructor / debug names
+                            //   for source compatibility, but the intended protocol here is:
+                            //   Step-1 Assessment -> Step-2 Follow-up.
+                            val twoStepAssessmentEnabled = true
+
                             val dbg =
                                 SlmRepository.DebugConfig(
                                     // NOTE:
                                     // - enabled controls debug logs.
-                                    // - streamEvalOutputToClient controls Step-1 streaming to UI.
+                                    // - streamEvalOutputToClient is a legacy property name kept by SlmRepository.
+                                    //   Its semantic meaning is "stream Step-1 Assessment output to the caller/UI".
                                     enabled = true,
                                     streamEvalOutputToClient = true,
                                 )
 
+                            val streamAssessmentToClient = dbg.streamEvalOutputToClient
+
                             SafeLog.i(
                                 TAG,
-                                "repository: creating SlmRepository twoStepEval=true streamEval=${dbg.streamEvalOutputToClient} dbgLogs=${dbg.enabled}",
+                                "repository: creating SlmRepository " +
+                                        "twoStepAssessment=$twoStepAssessmentEnabled " +
+                                        "streamAssessment=$streamAssessmentToClient " +
+                                        "dbgLogs=${dbg.enabled}",
                             )
 
                             SlmRepository(
                                 context = appCtx,
-                                enableTwoStepEval = true,
+                                // Legacy named argument retained intentionally for compatibility.
+                                enableTwoStepEval = twoStepAssessmentEnabled,
                                 debug = dbg,
                             )
                         }
@@ -208,7 +221,7 @@ object AppProcessServices {
      * - Call this from SurveyAppRoot once modelFile + warmup-capable repo are resolved.
      *
      * Privacy:
-     * - Never logs file path / file name.
+     * - Never logs file path or file name.
      */
     fun updateWarmupInputs(inputs: WarmupController.Inputs?) {
         warmupInputsRef.set(inputs)
@@ -225,11 +238,13 @@ object AppProcessServices {
 
     /**
      * Convenience helper:
-     * - Builds Inputs using the current process-scoped repository IF it implements WarmupCapableRepository.
-     * - Does NOT use reflection guessing. If not supported, it installs null inputs.
+     * - Builds Inputs using the current process-scoped repository if it implements
+     *   WarmupCapableRepository.
+     * - Does not use reflection guessing. If unsupported, installs null inputs.
      *
      * Notes:
-     * - This is best-effort; recommended is calling updateWarmupInputs() with an explicit warmup repo.
+     * - This is best-effort.
+     * - The recommended path is calling updateWarmupInputs() with an explicit warmup repo.
      */
     fun updateWarmupInputsBestEffort(
         context: Context,
@@ -272,12 +287,12 @@ object AppProcessServices {
      * - Never throws.
      *
      * Strategy:
-     * - FAKE mode uses Fake engine immediately.
+     * - FAKE mode uses a fake engine immediately.
      * - ON_DEVICE mode uses SLMWarmupEngine that waits for Inputs via updateInputs().
      */
     private fun createWarmupControllerBestEffort(appCtx: Context, mode: RepoMode): WarmupController {
         val warmupLogger: (String) -> Unit = { msg ->
-            // Sanitize any engine message to avoid leaking URLs/paths/tokens/filenames.
+            // Sanitize any engine message to avoid leaking URLs / paths / tokens / filenames.
             SafeLog.d(TAG_WARMUP_LOG, sanitizeWarmupLog(msg))
         }
 
@@ -314,7 +329,7 @@ object AppProcessServices {
     private var downloader: ModelDownloadController? = null
 
     // Token can change independently; keep it dynamic.
-    // IMPORTANT: Never log this token (PII/secret).
+    // IMPORTANT: Never log this token.
     private val hfTokenRef = AtomicReference<String?>(null)
 
     // Keep the last non-null spec so later callers can pass null without clobbering config.
@@ -404,8 +419,8 @@ object AppProcessServices {
      *
      * Rules:
      * - Never logs exception.message.
-     * - Prefer type-safe close (AutoCloseable/Closeable).
-     * - Reflection is last resort and cached per class.
+     * - Prefer type-safe close first (AutoCloseable / Closeable).
+     * - Reflection is the last resort and is cached per class.
      */
     private fun closeIfSupportedSafely(target: Any) {
         runCatching {
@@ -444,10 +459,14 @@ object AppProcessServices {
 
     /**
      * Sanitizes a warmup-engine log message to avoid leaking:
-     * - URLs, file paths, filenames, and token-like substrings.
+     * - URLs
+     * - file paths
+     * - file names
+     * - token-like substrings
      *
-     * This is intentionally conservative: it may redact non-sensitive details,
-     * but it strongly reduces accidental leakage from engine-side logs.
+     * Notes:
+     * - This is intentionally conservative.
+     * - It may redact non-sensitive details, but strongly reduces accidental leakage.
      */
     private fun sanitizeWarmupLog(raw: String): String {
         var s = raw
@@ -479,7 +498,7 @@ object AppProcessServices {
     }
 
     /**
-     * Returns a stable "stack hint" without printing exception.message.
+     * Returns a stable stack hint without printing exception.message.
      */
     private fun Throwable.toStackHint(): String {
         val e = this.stackTrace.firstOrNull()

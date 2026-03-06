@@ -48,18 +48,22 @@ import org.json.JSONObject
 
 /**
  * Repository that orchestrates a 2-step LLM flow:
- * 1) Eval (internal): Judge if the prompt is answerable / sufficient and return a JSON score.
- * 2) Follow-up (streamed): Generate the next follow-up question as JSON (or ACCEPTED).
+ * 1) Assessment (user-facing Step-1): judge if the prompt is answerable / sufficient and return a JSON score.
+ * 2) Follow-up (streamed Step-2): generate the next follow-up question as JSON (or ACCEPTED).
  *
  * Design notes:
- * - buildPrompt() MUST NOT perform I/O (it is non-suspend and may be called on main thread).
- * - SurveyConfig should come from a single source (installed config).
- * - Optional asset fallback is allowed ONLY in suspend paths and must never auto-install config.
- * - Prompt composition is delegated to [SlmPromptBuilderI] for single-source prompt contract.
+ * - buildPrompt() must not perform I/O because it is non-suspend and may run on the main thread.
+ * - SurveyConfig should come from a single source whenever possible.
+ * - Optional asset fallback is allowed only in suspend paths and must never auto-install config.
+ * - Prompt composition is delegated to [SlmPromptBuilderI] for a single-source prompt contract.
+ *
+ * Compatibility notes:
+ * - Some public constructor and prompt-builder names still contain the legacy term "Eval".
+ * - Those names are intentionally preserved here to avoid breaking existing call sites.
  *
  * Warmup notes:
- * - WarmupController/SLMWarmupEngine will attempt to warm the repository by calling [warmup].
- * - IMPORTANT: warmup() must NOT hop threads internally (to preserve EGL context if the caller provided one).
+ * - WarmupController / SLMWarmupEngine may warm the repository by calling [warmup].
+ * - warmup() must not hop threads internally so the caller can preserve any EGL context it supplied.
  */
 class SlmRepository(
     context: Context,
@@ -68,18 +72,24 @@ class SlmRepository(
     private val fallbackModelFileName: String = "Gemma3n4B.litertlm",
     private val resetConversationEachRequest: Boolean = true,
 
-    /** If true, run Eval -> FollowUpQuestion flow. If false, run a single generation stream. */
+    /**
+     * Legacy constructor name kept for source compatibility.
+     *
+     * Semantic meaning:
+     * - If true, run the 2-step Assessment -> Follow-up flow.
+     * - If false, run a single generation stream.
+     */
     private val enableTwoStepEval: Boolean = true,
 
     /** Score threshold below which we must ask a follow-up question. */
     private val acceptScoreThreshold: Int = 70,
 
     /**
-     * If true, allow loading config from assets when installed config is not available.
+     * If true, allow loading config from assets when installed config is unavailable.
      *
-     * IMPORTANT:
-     * - This is executed ONLY from suspend paths (request()).
-     * - This must never call installProcessConfig() here; Application is the owner.
+     * Important:
+     * - This runs only from suspend paths (request()).
+     * - This must never call installProcessConfig() here; Application remains the owner.
      * - Prefer keeping this false in production to guarantee single-source behavior.
      */
     private val allowAssetConfigFallback: Boolean = false,
@@ -87,9 +97,10 @@ class SlmRepository(
     /**
      * Injected prompt builder.
      *
-     * NOTE:
+     * Notes:
      * - Keep it stateless.
-     * - Do NOT perform I/O inside the builder.
+     * - Do not perform I/O inside the builder.
+     * - The builder API still uses some legacy "Eval" method names for compatibility.
      */
     private val promptBuilder: SlmPromptBuilderI = DefaultSlmPromptBuilder,
 
@@ -104,24 +115,34 @@ class SlmRepository(
         /** If true, logs include clipped prompt/result blocks. */
         val logClippedText: Boolean = true,
 
-        /** If true, logs include FULL prompt/result text (DANGEROUS in prod). */
+        /** If true, logs include full prompt/result text. Dangerous in production. */
         val logFullText: Boolean = false,
 
-        /** Max chars logged for prompt text (when clipped logging is enabled). */
+        /** Max chars logged for prompt text when clipped logging is enabled. */
         val maxPromptLogChars: Int = 2_000,
 
-        /** Max chars logged for result text (when clipped logging is enabled). */
+        /** Max chars logged for result text when clipped logging is enabled. */
         val maxResultLogChars: Int = 2_000,
 
         /**
-         * If true, stream Step-1 (Eval) output to the caller flow.
+         * Legacy property name kept for source compatibility.
          *
-         * IMPORTANT:
-         * - This changes the output stream (Eval output may appear before Follow-up output).
-         * - Keep this OFF in production unless UI expects it.
+         * Semantic meaning:
+         * - If true, stream Step-1 Assessment output to the caller flow.
+         * - This changes the visible output stream because Assessment text may appear before Follow-up text.
          */
         val streamEvalOutputToClient: Boolean = true,
     ) {
+        /**
+         * Canonical alias for Step-1 user-facing streaming.
+         *
+         * Notes:
+         * - Prefer this property in new code.
+         * - The backing constructor field remains [streamEvalOutputToClient] to avoid breaking callers.
+         */
+        val streamAssessmentOutputToClient: Boolean
+            get() = streamEvalOutputToClient
+
         fun normalized(): DebugConfig {
             return copy(
                 maxPromptLogChars = maxPromptLogChars.coerceAtLeast(0),
@@ -134,11 +155,19 @@ class SlmRepository(
     private val appContext: Context = context.applicationContext
 
     /**
+     * Canonical internal flag for the 2-step user-facing protocol.
+     *
+     * Notes:
+     * - The constructor parameter keeps its legacy name for compatibility.
+     */
+    private val enableTwoStepAssessment: Boolean = enableTwoStepEval
+
+    /**
      * Cached config reference for fast paths.
      *
-     * NOTE:
+     * Notes:
      * - Do not assume cached config is always present.
-     * - Installed config should be the canonical source.
+     * - Installed config remains the canonical source.
      */
     private val cachedConfig = AtomicReference<SurveyConfig?>(null)
     private val configLoadMutex = Mutex()
@@ -152,7 +181,7 @@ class SlmRepository(
         val u = userPrompt.trim()
         if (u.isBlank()) return ""
 
-        // IMPORTANT: No I/O here. Only use already-installed or cached config.
+        // No I/O here. Only use installed or already-cached config.
         val sys = getSystemPromptFromCacheOnly()
         return promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
     }
@@ -160,19 +189,18 @@ class SlmRepository(
     /**
      * Phase-aware prompt building.
      *
-     * IMPORTANT:
-     * - Validation prompts may already be "strict JSON-only" prompts.
-     * - We do NOT inject any PHASE markers into the prompt text here.
+     * Important:
+     * - Validation prompts may already be strict JSON-only prompts.
+     * - We do not inject any PHASE markers into prompt text here.
      */
     override fun buildPrompt(userPrompt: String, phase: ChatValidation.PromptPhase): String {
         val u = userPrompt.trim()
         if (u.isBlank()) return ""
 
-        // No I/O here.
         val sys = getSystemPromptFromCacheOnly()
 
         // Today: same wrapping strategy for both phases.
-        // Future: if you want different system prompt text per phase, do it here.
+        // Future: if different system prompt text is needed per phase, do it here.
         return promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
     }
 
@@ -185,16 +213,16 @@ class SlmRepository(
         val stat = safeFileStat(file)
 
         if (!stat.exists || !stat.isFile || stat.length <= 0L) {
-            // Privacy-safe: do not log file name/path.
+            // Privacy-safe: do not log file name or path.
             AppLog.w(TAG, "Model not ready: exists=${stat.exists} isFile=${stat.isFile} len=${stat.length}")
             throw ModelNotReadyException("Model file missing or empty")
         }
 
         val model = getOrCreateModel(cfg = cfg, file = file)
 
-        // IMPORTANT:
+        // Important:
         // - Do not run heavy initialization on the main thread.
-        // - warmup() path may run inside an EGL context; therefore init itself must not hop threads there.
+        // - warmup() may run inside an EGL context, so init itself must not hop threads there.
         withContext(Dispatchers.Default) {
             awaitInitializedModelOnce(
                 model = model,
@@ -202,8 +230,8 @@ class SlmRepository(
             )
         }
 
-        return if (enableTwoStepEval) {
-            requestEvalScoreThenFollowUp(model = model, userPrompt = input)
+        return if (enableTwoStepAssessment) {
+            requestAssessmentThenFollowUp(model = model, userPrompt = input)
         } else {
             val sys = runCatching { cfg?.composeSystemPrompt() }
                 .getOrNull()
@@ -216,12 +244,12 @@ class SlmRepository(
     }
 
     /**
-     * Warmup entry point for WarmupController/SLMWarmupEngine.
+     * Warmup entry point for WarmupController / SLMWarmupEngine.
      *
      * Contract:
-     * - Must not hop threads internally (caller may have provided EGL context).
+     * - Must not hop threads internally.
      * - Must not perform network I/O.
-     * - Safe to call multiple times (idempotent-ish via init signature).
+     * - Safe to call multiple times because initialization is signature-guarded.
      */
     override suspend fun warmup(
         appContext: Context,
@@ -247,15 +275,17 @@ class SlmRepository(
             )
             true
         }.getOrElse { t ->
-            // Privacy-safe: avoid logging exception messages/paths.
+            // Privacy-safe: avoid logging exception messages or paths.
             AppLog.w(TAG, "warmup: failed type=${t.javaClass.simpleName}")
             false
         }
     }
 
     /**
-     * Returns system prompt only if it is already available without I/O.
-     * This protects buildPrompt() from accidental blocking calls.
+     * Return system prompt only if it is already available without I/O.
+     *
+     * Notes:
+     * - This protects buildPrompt() from accidental blocking calls.
      */
     private fun getSystemPromptFromCacheOnly(): String? {
         val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: cachedConfig.get()
@@ -266,50 +296,50 @@ class SlmRepository(
     }
 
     // ---------------------------------------------------------------------
-    // Two-step: Eval score (internal) -> Follow-up question (streamed)
+    // Two-step: Assessment -> Follow-up
     // ---------------------------------------------------------------------
 
-    private fun requestEvalScoreThenFollowUp(model: Model, userPrompt: String): Flow<String> {
+    private fun requestAssessmentThenFollowUp(model: Model, userPrompt: String): Flow<String> {
         val u = userPrompt.trim()
         if (u.isBlank()) return emptyFlow()
 
         return streamingFlow(model = model) { emit, closeOk, closeErr ->
             val traceId = UUID.randomUUID().toString().take(8)
-            val streamEvalToClient = dbg.streamEvalOutputToClient
-
+            val streamAssessmentToClient = dbg.streamAssessmentOutputToClient
             val questionId = extractQuestionId(u) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
 
             // ----------------------------
-            // Step 1: Eval score (optional streaming)
+            // Step 1: Assessment
             // ----------------------------
             if (resetConversationEachRequest) {
-                resetConversationBestEffort(model, reason = "evalScore")
+                resetConversationBestEffort(model, reason = "assessment")
             }
 
-            val evalPrompt = promptBuilder.buildEvalScorePrompt(
+            // Legacy prompt-builder API name retained for compatibility.
+            val assessmentPrompt = promptBuilder.buildEvalScorePrompt(
                 questionId = questionId,
                 userPrompt = u,
                 acceptScoreThreshold = acceptScoreThreshold,
-                userPromptMaxChars = EVAL_USER_PROMPT_MAX_CHARS,
+                userPromptMaxChars = ASSESSMENT_USER_PROMPT_MAX_CHARS,
             )
 
             dbgLogPrompt(
                 traceId = traceId,
-                step = "EVAL PHASE",
+                step = "ASSESSMENT PHASE",
                 questionId = questionId,
-                prompt = evalPrompt,
+                prompt = assessmentPrompt,
             )
 
-            if (streamEvalToClient) {
-                emit(STREAM_EVAL_PREFIX)
+            if (streamAssessmentToClient) {
+                emit(STREAM_ASSESSMENT_PREFIX)
             }
 
-            val evalResult = runSdkAndCollectWithBudget(
+            val assessmentResult = runSdkAndCollectWithBudget(
                 model = model,
-                input = evalPrompt,
-                timeoutMs = EVAL_TIMEOUT_MS,
-                maxChars = EVAL_MAX_CHARS,
-                onDelta = if (streamEvalToClient) { chunk ->
+                input = assessmentPrompt,
+                timeoutMs = ASSESSMENT_TIMEOUT_MS,
+                maxChars = ASSESSMENT_MAX_CHARS,
+                onDelta = if (streamAssessmentToClient) { chunk ->
                     if (chunk.isNotEmpty()) emit(chunk)
                 } else {
                     null
@@ -318,57 +348,58 @@ class SlmRepository(
 
             dbgLogResult(
                 traceId = traceId,
-                step = "EVAL PHASE",
+                step = "ASSESSMENT PHASE",
                 questionId = questionId,
-                reason = evalResult.reason,
-                isEarlyStop = evalResult.isEarlyStop,
-                text = evalResult.text,
+                reason = assessmentResult.reason,
+                isEarlyStop = assessmentResult.isEarlyStop,
+                text = assessmentResult.text,
             )
 
-            val evalJsonRaw = extractFirstCompleteJsonObjectBestEffort(evalResult.text)
-            val evalParsed = parseEvalScoreBestEffort(evalJsonRaw)
+            val assessmentJsonRaw = extractFirstCompleteJsonObjectBestEffort(assessmentResult.text)
+            val assessmentParsed = parseAssessmentScoreBestEffort(assessmentJsonRaw)
 
             dbgLogJsonExtraction(
                 traceId = traceId,
-                step = "EVAL PHASE",
+                step = "ASSESSMENT PHASE",
                 questionId = questionId,
-                raw = evalResult.text,
-                extractedJson = evalJsonRaw,
-                parsedStatus = evalParsed.status,
-                parsedScore = evalParsed.score,
+                raw = assessmentResult.text,
+                extractedJson = assessmentJsonRaw,
+                parsedStatus = assessmentParsed.status,
+                parsedScore = assessmentParsed.score,
             )
 
             AppLog.d(
                 TAG,
-                "eval done: trace=$traceId qid=$questionId score=${evalParsed.score ?: -1} " +
-                        "status=${evalParsed.status ?: "?"} reason=${evalResult.reason} earlyStop=${evalResult.isEarlyStop}",
+                "assessment done: trace=$traceId qid=$questionId score=${assessmentParsed.score ?: -1} " +
+                        "status=${assessmentParsed.status ?: "?"} reason=${assessmentResult.reason} earlyStop=${assessmentResult.isEarlyStop}",
             )
 
-            if (streamEvalToClient) {
-                val s = evalParsed.status ?: "?"
-                val sc = evalParsed.score ?: -1
-                emit("\n$STREAM_EVAL_RESULT_PREFIX status=$s score=$sc\n")
+            if (streamAssessmentToClient) {
+                val s = assessmentParsed.status ?: "?"
+                val sc = assessmentParsed.score ?: -1
+                emit("\n$STREAM_ASSESSMENT_RESULT_PREFIX status=$s score=$sc\n")
                 emit(STREAM_FOLLOWUP_PREFIX)
             }
 
-            if (evalResult.isEarlyStop) {
+            if (assessmentResult.isEarlyStop) {
                 delay(EARLY_STOP_STABILIZE_DELAY_MS)
             }
 
             // ----------------------------
-            // Step 2: Follow-up question (streamed)
+            // Step 2: Follow-up
             // ----------------------------
             if (resetConversationEachRequest) {
                 resetConversationBestEffort(model, reason = "followUp")
             }
 
+            // Legacy builder parameter name retained for compatibility.
             val followUpPrompt = promptBuilder.buildFollowUpPrompt(
                 questionId = questionId,
                 userPrompt = u,
-                evalJson = evalJsonRaw ?: evalResult.text,
+                evalJson = assessmentJsonRaw ?: assessmentResult.text,
                 acceptScoreThreshold = acceptScoreThreshold,
                 userPromptMaxChars = FOLLOWUP_USER_PROMPT_MAX_CHARS,
-                evalJsonMaxChars = FOLLOWUP_EVAL_JSON_MAX_CHARS,
+                evalJsonMaxChars = FOLLOWUP_ASSESSMENT_JSON_MAX_CHARS,
             )
 
             dbgLogPrompt(
@@ -379,7 +410,7 @@ class SlmRepository(
             )
 
             val s2Buffer = if (dbg.enabled) StringBuilder(1024) else null
-            val s2MaxCapture = if (dbg.enabled) (dbg.maxResultLogChars.coerceAtLeast(1024)) else 0
+            val s2MaxCapture = if (dbg.enabled) dbg.maxResultLogChars.coerceAtLeast(1024) else 0
 
             runSdkAndStream(
                 model = model,
@@ -462,15 +493,15 @@ class SlmRepository(
     // ---------------------------------------------------------------------
 
     /**
-     * Builds a streaming flow guarded by a per-model semaphore.
+     * Build a streaming flow guarded by a per-model semaphore.
      *
      * Why:
      * - Avoid concurrent inference on the same model instance.
      * - Provide consistent cancellation behavior.
      * - Reduce callbackFlow boilerplate duplication.
      *
-     * Note:
-     * - We intentionally avoid Semaphore.withPermit() to be resilient to coroutines version differences.
+     * Notes:
+     * - We intentionally avoid Semaphore.withPermit() to stay resilient to coroutines version differences.
      */
     private fun streamingFlow(
         model: Model,
@@ -496,7 +527,6 @@ class SlmRepository(
                 if (r.isSuccess) return
 
                 // Fallback: try a suspending send to reduce drop risk under backpressure.
-                // NOTE: This may enqueue many small sends if callbacks burst; keep buffer capacity reasonable.
                 launch {
                     runCatching { send(chunk) }
                 }
@@ -526,8 +556,6 @@ class SlmRepository(
             }
 
             awaitClose {
-                // If inference already started (permit acquired) and the flow is cancelled,
-                // best-effort cancel to stop SDK callbacks.
                 if (permitAcquired.isCompleted && !closed.get()) {
                     runCatching { SLM.cancel(model) }
                 }
@@ -553,7 +581,6 @@ class SlmRepository(
             return
         }
 
-        // The SDK may signal completion via multiple callbacks.
         val ended = AtomicBoolean(false)
 
         fun terminalOnce(reason: String) {
@@ -696,14 +723,14 @@ class SlmRepository(
     // JSON parsing helpers
     // ---------------------------------------------------------------------
 
-    private data class EvalScore(
+    private data class AssessmentScore(
         val status: String?,
         val score: Int?,
         val reason: String?,
     )
 
     /**
-     * Extracts the first complete JSON object from a text stream.
+     * Extract the first complete JSON object from a text stream.
      */
     private fun extractFirstCompleteJsonObjectBestEffort(text: String): String? {
         val s = text
@@ -758,18 +785,18 @@ class SlmRepository(
         return null
     }
 
-    private fun parseEvalScoreBestEffort(json: String?): EvalScore {
+    private fun parseAssessmentScoreBestEffort(json: String?): AssessmentScore {
         val s = json?.trim().orEmpty()
-        if (s.isEmpty()) return EvalScore(status = null, score = null, reason = null)
+        if (s.isEmpty()) return AssessmentScore(status = null, score = null, reason = null)
 
         return runCatching {
             val obj = JSONObject(s)
             val status = obj.optString("status").takeIf { it.isNotBlank() }
             val score = if (obj.has("score")) obj.optInt("score", -1).takeIf { it in 0..100 } else null
             val reason = obj.optString("reason").takeIf { it.isNotBlank() }
-            EvalScore(status = status, score = score, reason = reason)
+            AssessmentScore(status = status, score = score, reason = reason)
         }.getOrElse {
-            EvalScore(status = null, score = null, reason = null)
+            AssessmentScore(status = null, score = null, reason = null)
         }
     }
 
@@ -1066,7 +1093,7 @@ class SlmRepository(
     ) {
         runCatching { SLM.setApplicationContext(appContext) }
 
-        // Privacy-safe: avoid logging file paths/names.
+        // Privacy-safe: avoid logging file paths or names.
         AppLog.d(TAG, "initializeIfNeeded: model='${model.name}'")
 
         SLM.initializeIfNeeded(
@@ -1112,21 +1139,21 @@ class SlmRepository(
         private const val RESET_CONVERSATION_TIMEOUT_MS: Long = 15_000L
         private const val EARLY_STOP_STABILIZE_DELAY_MS: Long = 250L
 
-        // Eval score budgets
-        private const val EVAL_TIMEOUT_MS: Long = 60_000L
-        private const val EVAL_MAX_CHARS: Int = 8_192
-        private const val EVAL_USER_PROMPT_MAX_CHARS: Int = 4_000
+        // Assessment budgets
+        private const val ASSESSMENT_TIMEOUT_MS: Long = 60_000L
+        private const val ASSESSMENT_MAX_CHARS: Int = 8_192
+        private const val ASSESSMENT_USER_PROMPT_MAX_CHARS: Int = 4_000
 
         // Follow-up budgets
         private const val FOLLOWUP_USER_PROMPT_MAX_CHARS: Int = 4_000
-        private const val FOLLOWUP_EVAL_JSON_MAX_CHARS: Int = 2_000
+        private const val FOLLOWUP_ASSESSMENT_JSON_MAX_CHARS: Int = 2_000
 
-        // Stream buffering (avoid token drops under bursty callbacks).
+        // Stream buffering
         private const val STREAM_BUFFER_CAPACITY: Int = 64
 
-        // Optional stream markers (Step-1 streaming).
-        private const val STREAM_EVAL_PREFIX: String = "\n[EVAL]\n"
-        private const val STREAM_EVAL_RESULT_PREFIX: String = "[EVAL_RESULT]"
+        // Optional stream markers for Step-1 user-facing streaming
+        private const val STREAM_ASSESSMENT_PREFIX: String = "\n[ASSESSMENT]\n"
+        private const val STREAM_ASSESSMENT_RESULT_PREFIX: String = "[ASSESSMENT_RESULT]"
         private const val STREAM_FOLLOWUP_PREFIX: String = "\n[FOLLOWUP]\n"
 
         private val modelGates: ConcurrentHashMap<String, Semaphore> = ConcurrentHashMap()
