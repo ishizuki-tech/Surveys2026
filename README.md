@@ -18,7 +18,12 @@ An Android (Jetpack Compose) **survey runner** prototype that embeds an on-devic
     * `PrefetchState` / `CompileState` (from `utils/WarmupController.kt`)
     * `GatePolicy.MODEL_ONLY` / `GatePolicy.MODEL_PREFETCH_COMPILE`
 * Replaced conceptual “ensureDownloaded” language with the actual controller API (`ensureModelOnce`).
-* Kept “conceptual” labels only where the definitive type lives elsewhere.
+* Updated the repository/protocol explanation to use the current user-facing terminology:
+
+    * **Step-1 = Assessment**
+    * **Step-2 = Follow-up**
+* Kept legacy implementation names only where they still exist in code for source compatibility
+  (for example `enableTwoStepEval`, `buildEvalScorePrompt(...)`, or `streamEvalOutputToClient`).
 
 ---
 
@@ -60,14 +65,21 @@ If you want to understand the whole app quickly, read in this order:
         * `requestCompileAfterPrefetch(reason)`
         * terminal rules: `PrefetchState.isTerminal()` / `CompileState.isTerminal()`
 
-4. **SLM repository (2-step Eval → FollowUp + streaming boundary)**
+4. **SLM repository (2-step Assessment → Follow-up + streaming boundary)**
 
     * `app/src/main/kotlin/com/negi/surveys/slm/SlmRepository.kt`
     * What to look for:
 
         * `buildPrompt(userPrompt)` must be I/O-free (non-suspend)
         * `request(prompt): Flow<String>` (streaming)
-        * `enableTwoStepEval` + JSON contract + `acceptScoreThreshold`
+        * legacy constructor flag `enableTwoStepEval`
+          (semantic meaning: two-step **Assessment → Follow-up**)
+        * JSON contract + `acceptScoreThreshold`
+        * optional Step-1 stream markers when enabled:
+
+            * `[ASSESSMENT]`
+            * `[ASSESSMENT_RESULT]`
+            * `[FOLLOWUP]`
 
 5. **SLM facade + LiteRT runtime wrappers**
 
@@ -119,7 +131,7 @@ Build targets (from Gradle):
 
 ## Repository layout (LiteRT branch)
 
-```
+```text
 Surveys2026/
   app/
     src/main/
@@ -330,7 +342,7 @@ Primary orchestration lives in:
 
 ### 0) Config gate (installed-only)
 
-```
+```text
 SurveyAppRoot()
   └─ produceState: wait for installed config
      ├─ SurveyConfigLoader.getInstalledConfigOrNull()
@@ -345,7 +357,7 @@ ConfigState:
 
 ### 1) Resolve model spec from config
 
-```
+```text
 ConfigState.Ready(cfg)
   └─ cfg.resolveModelDownloadSpec()
       -> ModelDownloadSpec(modelUrl, fileName, timeoutMs, uiThrottleMs, uiMinDeltaBytes, hfToken)
@@ -390,8 +402,14 @@ In this branch the concrete repository is:
 
 It implements a **2-step flow** by default:
 
-1. Eval (internal, strict JSON score)
-2. Follow-up question generation (strict JSON)
+1. **Assessment** (user-facing Step-1, JSON score)
+2. **Follow-up** question generation (streamed Step-2)
+
+Compatibility note:
+
+* Some implementation names still use the legacy term `Eval`
+  (for example `enableTwoStepEval`, `buildEvalScorePrompt(...)`, or `streamEvalOutputToClient`).
+* In current behavior and UI semantics, these correspond to **Assessment**.
 
 ### 5) UI gating
 
@@ -409,7 +427,7 @@ Screens (conceptually):
 
 ### End-to-end ASCII flow
 
-```
+```text
 [SurveyApplication]
   └─ installProcessConfig(from assets/survey.yaml)
 
@@ -423,7 +441,7 @@ Screens (conceptually):
   ├─ warmup.requestCompileAfterPrefetch(...)
   ├─ (optional) warmup.ensureCompiled(...)
   ├─ repo.request(prompt) : Flow<String>
-  └─ UI collects Flow → renders deltas → Export
+  └─ UI collects Flow → renders deltas → Review / Export
 ```
 
 ---
@@ -449,7 +467,7 @@ SDK boundary rule:
 
 ---
 
-## SlmRepository (2-step Eval → FollowUp)
+## SlmRepository (2-step Assessment → Follow-up)
 
 File: `app/src/main/kotlin/com/negi/surveys/slm/SlmRepository.kt`
 
@@ -459,10 +477,55 @@ Key behavior:
 * `request()` is suspend and may load config best-effort depending on `allowAssetConfigFallback`
   (but must never install process config; `SurveyApplication` is the owner).
 
-2-step mode:
+Protocol behavior:
 
-* controlled by `enableTwoStepEval` (default `true`)
-* acceptance threshold: `acceptScoreThreshold` (default `70`)
+* default behavior is a 2-step user-facing flow:
+
+    1. **Assessment**
+    2. **Follow-up**
+
+Legacy implementation names kept for compatibility:
+
+* `enableTwoStepEval` (semantic meaning: enable two-step Assessment → Follow-up)
+* `buildEvalScorePrompt(...)` (semantic meaning: build Step-1 Assessment prompt)
+* `streamEvalOutputToClient` (semantic meaning: stream Step-1 Assessment output)
+
+Optional Step-1 stream markers:
+
+* `[ASSESSMENT]`
+* `[ASSESSMENT_RESULT]`
+* `[FOLLOWUP]`
+
+Acceptance threshold:
+
+* `acceptScoreThreshold` (default `70`)
+
+---
+
+## Review / transcript semantics
+
+Files:
+
+* `app/src/main/kotlin/com/negi/surveys/ui/ReviewModels.kt`
+* `app/src/main/kotlin/com/negi/surveys/ui/ReviewAssembler.kt`
+* `app/src/main/kotlin/com/negi/surveys/ui/chat/ChatReviewLogBuilders.kt`
+* `app/src/main/kotlin/com/negi/surveys/ui/ReviewScreen.kt`
+
+Canonical review/export kinds on this branch:
+
+* `user`
+* `assessment`
+* `follow_up`
+* `assistant`
+* `debug_raw`
+
+Practical meaning:
+
+* `assessment` = Step-1 user-facing evaluation content
+* `follow_up` = Step-2 user-facing next question
+* `debug_raw` = raw/debug model stream retained for inspection
+* `assistant` = reserved generic assistant output bucket
+* `user` = user answer text
 
 ---
 
