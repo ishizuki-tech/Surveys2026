@@ -90,11 +90,27 @@ object AppProcessServices {
                     when (mode) {
                         RepoMode.ON_DEVICE -> {
                             // IMPORTANT: Avoid logging raw model outputs in production.
+                            val dbg =
+                                SlmRepository.DebugConfig(
+                                    // NOTE:
+                                    // - enabled controls debug logs.
+                                    // - streamEvalOutputToClient controls Step-1 streaming to UI.
+                                    enabled = true,
+                                    streamEvalOutputToClient = true,
+                                )
+
+                            SafeLog.i(
+                                TAG,
+                                "repository: creating SlmRepository twoStepEval=true streamEval=${dbg.streamEvalOutputToClient} dbgLogs=${dbg.enabled}",
+                            )
+
                             SlmRepository(
                                 context = appCtx,
                                 enableTwoStepEval = true,
+                                debug = dbg,
                             )
                         }
+
                         RepoMode.FAKE -> {
                             FakeSlmRepository()
                         }

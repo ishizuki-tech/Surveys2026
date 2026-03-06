@@ -46,6 +46,7 @@ import com.charleskorn.kaml.YamlConfiguration
 import com.negi.surveys.logging.AppLog
 import java.io.File
 import java.nio.charset.Charset
+import java.security.MessageDigest
 import java.util.ArrayDeque
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.serialization.SerialName
@@ -482,7 +483,7 @@ data class SurveyConfig(
      *
      * Note:
      * - This includes system prompt previews (which may contain prompt text).
-     * - If you want a safer dump for production, add a "safe" variant that only logs lengths/hashes.
+     * - Prefer [debugDumpSafe] for production logs.
      */
     fun debugDump(maxPreviewChars: Int = 320): String {
         fun preview(s: String): String {
@@ -512,6 +513,53 @@ data class SurveyConfig(
             append("System(oneStep,len=").append(oneSys.length).append("): ").append(preview(oneSys)).append("\n")
             append("System(eval,len=").append(evalSys.length).append("): ").append(preview(evalSys)).append("\n")
             append("System(followup,len=").append(followSys.length).append("): ").append(preview(followSys)).append("\n")
+            append("AI coverage: ").append(coverage.ifBlank { "-" })
+        }
+    }
+
+    /**
+     * Safe debug dump for production logs.
+     *
+     * Guarantees:
+     * - Does NOT include prompt contents.
+     * - Includes only lengths and short hashes.
+     */
+    fun debugDumpSafe(): String {
+        fun sha8(s: String): String {
+            val bytes = s.toByteArray(Charsets.UTF_8)
+            val dig = MessageDigest.getInstance("SHA-256").digest(bytes)
+            val hex = "0123456789abcdef"
+            val sb = StringBuilder(dig.size * 2)
+            for (b in dig) {
+                val v = b.toInt() and 0xFF
+                sb.append(hex[v ushr 4])
+                sb.append(hex[v and 0x0F])
+            }
+            return sb.toString().take(8)
+        }
+
+        val evalSys = composeSystemPromptEval()
+        val followSys = composeSystemPromptFollowup()
+        val oneSys = composeSystemPromptOneStep()
+
+        val aiIds = graph.nodes
+            .asSequence()
+            .filter { it.nodeType() == NodeType.AI }
+            .map { it.id.trim() }
+            .filter { it.isNotBlank() }
+            .toList()
+
+        val coverage = aiIds.joinToString(",") { id ->
+            val one = resolveOneStepPrompt(id) != null
+            val two = resolveEvalPrompt(id) != null && resolveFollowupPrompt(id) != null
+            "$id(one=$one,two=$two)"
+        }
+
+        return buildString {
+            append("SurveyConfigDumpSafe(").append(debugSummary()).append(")\n")
+            append("System(oneStep,len=").append(oneSys.length).append(",sha8=").append(sha8(oneSys)).append(")\n")
+            append("System(eval,len=").append(evalSys.length).append(",sha8=").append(sha8(evalSys)).append(")\n")
+            append("System(followup,len=").append(followSys.length).append(",sha8=").append(sha8(followSys)).append(")\n")
             append("AI coverage: ").append(coverage.ifBlank { "-" })
         }
     }
@@ -1007,9 +1055,18 @@ enum class ConfigFormat { JSON, YAML, AUTO }
 
 object SurveyConfigLoader {
 
+    /**
+     * If true, logs include prompt previews via SurveyConfig.debugDump().
+     *
+     * IMPORTANT:
+     * - This can leak survey/prompt content into Logcat/diagnostics.
+     * - Keep false in production.
+     */
+    private const val LOG_CONFIG_PROMPT_PREVIEW: Boolean = false
+
     // ---------------------------------------------------------------------
-// Process-wide config singleton (installed by SurveyAppRoot)
-// ---------------------------------------------------------------------
+    // Process-wide config singleton (installed by SurveyAppRoot)
+    // ---------------------------------------------------------------------
     private val installedConfig: AtomicReference<SurveyConfig?> = AtomicReference(null)
 
     /**
@@ -1034,7 +1091,6 @@ object SurveyConfigLoader {
     fun clearInstalledConfigForTests() {
         installedConfig.set(null)
     }
-
 
     internal data class FormatDecision(
         val format: ConfigFormat,
@@ -1113,7 +1169,7 @@ object SurveyConfigLoader {
             val issues = it.validate()
             AppLog.d(TAG, "fromAssetsValidated -> issues=${issues.size} (${it.debugSummary()})")
             issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
-            AppLog.d(TAG, it.debugDump())
+            AppLog.d(TAG, if (LOG_CONFIG_PROMPT_PREVIEW) it.debugDump() else it.debugDumpSafe())
             it.requireValid()
         }
 
@@ -1146,7 +1202,7 @@ object SurveyConfigLoader {
             val issues = it.validate()
             AppLog.d(TAG, "fromFileValidated -> issues=${issues.size} (${it.debugSummary()})")
             issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
-            AppLog.d(TAG, it.debugDump())
+            AppLog.d(TAG, if (LOG_CONFIG_PROMPT_PREVIEW) it.debugDump() else it.debugDumpSafe())
             it.requireValid()
         }
 
@@ -1208,7 +1264,7 @@ object SurveyConfigLoader {
         if (firstAttempt.isSuccess) {
             val cfg = firstAttempt.getOrThrow()
             AppLog.d(TAG, "fromString loaded (${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
-            AppLog.d(TAG, cfg.debugDump())
+            AppLog.d(TAG, if (LOG_CONFIG_PROMPT_PREVIEW) cfg.debugDump() else cfg.debugDumpSafe())
             return cfg
         }
 
@@ -1238,7 +1294,7 @@ object SurveyConfigLoader {
         if (secondAttempt.isSuccess) {
             val cfg = secondAttempt.getOrThrow()
             AppLog.d(TAG, "fromString loaded (AUTO retry, ${fileNameHint.orEmpty()}): ${cfg.debugSummary()}")
-            AppLog.d(TAG, cfg.debugDump())
+            AppLog.d(TAG, if (LOG_CONFIG_PROMPT_PREVIEW) cfg.debugDump() else cfg.debugDumpSafe())
             return cfg
         }
 
@@ -1264,7 +1320,7 @@ object SurveyConfigLoader {
             val issues = it.validate()
             AppLog.d(TAG, "fromStringValidated -> issues=${issues.size} (${it.debugSummary()})")
             issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
-            AppLog.d(TAG, it.debugDump())
+            AppLog.d(TAG, if (LOG_CONFIG_PROMPT_PREVIEW) it.debugDump() else it.debugDumpSafe())
             it.requireValid()
         }
 
@@ -1279,7 +1335,7 @@ object SurveyConfigLoader {
             val issues = cfg.validate()
             AppLog.d(TAG, "fromStringYamlStrictValidated -> issues=${issues.size} (${cfg.debugSummary()})")
             issues.forEach { msg -> AppLog.d(TAG, "  - $msg") }
-            AppLog.d(TAG, cfg.debugDump())
+            AppLog.d(TAG, if (LOG_CONFIG_PROMPT_PREVIEW) cfg.debugDump() else cfg.debugDumpSafe())
             cfg.requireValid()
             return cfg
         } catch (ex: Exception) {

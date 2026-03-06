@@ -18,6 +18,7 @@ import android.os.Build
 import android.os.Process
 import android.os.SystemClock
 import com.negi.surveys.config.SurveyConfigLoader
+import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.warmup.WarmupController
 import java.io.File
@@ -142,6 +143,7 @@ class SurveyApplication : Application() {
 
                 val deadlineAt = SystemClock.elapsedRealtime() + MAX_TOTAL_RETRY_MS
                 var attempts = 0
+                var loggedRepoNotCapable = false
 
                 while (SystemClock.elapsedRealtime() < deadlineAt) {
                     attempts += 1
@@ -166,11 +168,14 @@ class SurveyApplication : Application() {
                     val warmupRepo = repo as? WarmupController.WarmupCapableRepository
                     if (warmupRepo == null) {
                         // Retry briefly: repo graph may still be stabilizing.
-                        SafeLog.w(
-                            TAG,
-                            "warmupInputs: earlyInject retry (repo not WarmupCapableRepository) " +
-                                    "repoType=${repo?.javaClass?.simpleName ?: "null"} pid=${Process.myPid()}",
-                        )
+                        if (!loggedRepoNotCapable) {
+                            loggedRepoNotCapable = true
+                            SafeLog.w(
+                                TAG,
+                                "warmupInputs: earlyInject retry (repo not WarmupCapableRepository) " +
+                                        "repoType=${repo?.javaClass?.simpleName ?: "null"} pid=${Process.myPid()}",
+                            )
+                        }
                         delay(RETRY_INTERVAL_MS)
                         continue
                     }
@@ -250,6 +255,7 @@ class SurveyApplication : Application() {
      *
      * Strategy:
      * - Prefer config-resolved file name if installed config is available.
+     * - Fallback to modelDefaults.defaultFileName for backward compatibility.
      * - Otherwise, scan a small set of app-private directories.
      * - Pick the largest plausible model file by extension and minimum size threshold.
      *
@@ -345,15 +351,32 @@ class SurveyApplication : Application() {
          * NOTE:
          * - This does not scan directories.
          * - This does not log any file name.
+         * - Keep file-name resolution aligned with the downloader/UI path as much as possible.
          */
         private fun resolvePreferredFromInstalledConfig(appContext: Context): File? {
             val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: return null
-            val raw = cfg.modelDefaults.defaultFileName?.trim().orEmpty()
-            val safeName = sanitizeSimpleFileName(raw) ?: return null
 
-            val f = File(appContext.filesDir, safeName)
-            val ok = runCatching { f.exists() && f.isFile && f.length() > 0L }.getOrDefault(false)
-            return if (ok) f else null
+            val candidates = LinkedHashSet<String>()
+
+            cfg.resolveModelDownloadSpec()
+                ?.fileName
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { candidates.add(it) }
+
+            cfg.modelDefaults.defaultFileName
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                ?.let { candidates.add(it) }
+
+            for (raw in candidates) {
+                val safeName = sanitizeSimpleFileName(raw) ?: continue
+                val f = File(appContext.filesDir, safeName)
+                val ok = runCatching { f.exists() && f.isFile && f.length() > 0L }.getOrDefault(false)
+                if (ok) return f
+            }
+
+            return null
         }
 
         /**
@@ -362,7 +385,8 @@ class SurveyApplication : Application() {
         private fun sanitizeSimpleFileName(name: String): String? {
             val n = name.trim()
             if (n.isBlank()) return null
-            if (n.contains('/') || n.contains('\\')) return null
+            if (n.contains('/')) return null
+            if (n.contains('\\')) return null
             if (n.contains("..")) return null
             if (n.length > 200) return null
             return n

@@ -54,20 +54,30 @@ internal object ChatReviewLogBuilders {
         "follow up:",
         "followup:",
         "question:",
-        "next question:"
+        "next question:",
     )
 
     private val FOLLOW_UP_GARBAGE: Set<String> = setOf(
-        "none", "(none)", "n/a", "na", "null", "nil",
-        "no", "nope", "no follow up", "no follow-up",
-        "skip", "0", "-"
+        "none",
+        "(none)",
+        "n/a",
+        "na",
+        "null",
+        "nil",
+        "no",
+        "nope",
+        "no follow up",
+        "no follow-up",
+        "skip",
+        "0",
+        "-",
     )
 
     /**
      * Stable 32-bit hash for a prompt.
      *
      * Why:
-     * - [String.hashCode] is stable in JVM, but it's weak and collision-prone for short prompts.
+     * - [String.hashCode] is stable in JVM, but it is weak and collision-prone for short prompts.
      * - This uses SHA-256 and truncates to 32-bit to keep compatibility with existing `DraftKey(promptHash:Int)`.
      */
     internal fun stablePromptHash(prompt: String): Int {
@@ -76,7 +86,10 @@ internal object ChatReviewLogBuilders {
         return ByteBuffer.wrap(bytes, 0, 4).int
     }
 
-    internal fun buildSkippedPayload(questionId: String, prompt: String): String {
+    internal fun buildSkippedPayload(
+        questionId: String,
+        prompt: String,
+    ): String {
         val promptHash = stablePromptHash(prompt)
         return buildString {
             append("[SKIPPED]\n")
@@ -91,7 +104,7 @@ internal object ChatReviewLogBuilders {
         prompt: String,
         isSkipped: Boolean,
         completionPayload: String,
-        messagesSnapshot: List<ChatModels.ChatMessage>
+        messagesSnapshot: List<ChatModels.ChatMessage>,
     ): ReviewQuestionLog {
         val lines = ArrayList<ReviewChatLine>(messagesSnapshot.size * 2)
 
@@ -99,86 +112,121 @@ internal object ChatReviewLogBuilders {
         var seenUser = false
 
         fun appendModelRawOnce(raw: String) {
-            val t = clip(raw.trim(), MAX_MODEL_RAW_CHARS)
-            if (t.isEmpty()) return
+            val clipped = clip(raw.trim(), MAX_MODEL_RAW_CHARS)
+            if (clipped.isEmpty()) return
+
             val last = lines.lastOrNull()
-            if (last != null && last.kind == ReviewChatKind.MODEL_RAW && last.text == t) return
-            lines += ReviewChatLine(kind = ReviewChatKind.MODEL_RAW, text = t)
+            if (last != null && last.kind == ReviewChatKind.MODEL_RAW && last.text == clipped) {
+                return
+            }
+
+            lines += ReviewChatLine(
+                kind = ReviewChatKind.MODEL_RAW,
+                text = clipped,
+            )
         }
 
-        for (m in messagesSnapshot) {
-            when (m.role) {
+        for (message in messagesSnapshot) {
+            when (message.role) {
                 ChatModels.ChatRole.USER -> {
-                    val t = clip(m.text.trim(), MAX_LINE_CHARS)
-                    if (t.isNotEmpty()) {
-                        lines += ReviewChatLine(kind = ReviewChatKind.USER, text = t)
+                    val text = clip(message.text.trim(), MAX_LINE_CHARS)
+                    if (text.isNotEmpty()) {
+                        lines += ReviewChatLine(
+                            kind = ReviewChatKind.USER,
+                            text = text,
+                        )
                         seenUser = true
                     }
                 }
 
                 ChatModels.ChatRole.ASSISTANT -> {
-                    val a = clip(m.assistantMessage?.trim().orEmpty(), MAX_LINE_CHARS)
-                    val fallback = clip(m.text.trim(), MAX_LINE_CHARS)
-                    val q = normalizeFollowUp(m.followUpQuestion)
+                    val assistant = clip(message.assistantMessage?.trim().orEmpty(), MAX_LINE_CHARS)
+                    val fallback = clip(message.text.trim(), MAX_LINE_CHARS)
+                    val followUp = normalizeFollowUp(message.followUpQuestion)
 
-                    // Skip the initial seed prompt bubble (if present).
+                    /**
+                     * Skip the initial seed prompt bubble if present.
+                     */
                     val isSeedPrompt =
                         !seenUser &&
-                                a == "Question: $questionId" &&
-                                (q?.trim().orEmpty() == promptTrimmed)
+                                assistant == "Question: $questionId" &&
+                                followUp?.trim().orEmpty() == promptTrimmed
 
                     if (isSeedPrompt) continue
 
                     if (isSkipped) {
-                        // When skipped, keep assistant/model outputs AFTER the user answered at least once.
+                        /**
+                         * When skipped, keep assistant/model outputs only after the user answered at least once.
+                         */
                         if (!seenUser) continue
 
-                        if (a.isNotEmpty()) {
-                            lines += ReviewChatLine(kind = ReviewChatKind.AI, text = a)
+                        if (assistant.isNotEmpty()) {
+                            lines += ReviewChatLine(
+                                kind = ReviewChatKind.AI,
+                                text = assistant,
+                            )
                         } else if (fallback.isNotEmpty()) {
-                            lines += ReviewChatLine(kind = ReviewChatKind.AI, text = fallback)
+                            lines += ReviewChatLine(
+                                kind = ReviewChatKind.AI,
+                                text = fallback,
+                            )
                         }
 
-                        val q2 = q?.trim()
-                        if (!q2.isNullOrBlank() && q2 != promptTrimmed) {
-                            lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = clip(q2, MAX_LINE_CHARS))
+                        val followUpText = followUp?.trim()
+                        if (!followUpText.isNullOrBlank() && followUpText != promptTrimmed) {
+                            lines += ReviewChatLine(
+                                kind = ReviewChatKind.FOLLOW_UP,
+                                text = clip(followUpText, MAX_LINE_CHARS),
+                            )
                         }
 
-                        val raw = m.streamText?.trim().orEmpty()
-                        if (raw.isNotEmpty() && m.streamState != ChatModels.ChatStreamState.NONE) {
+                        val raw = message.streamText?.trim().orEmpty()
+                        if (raw.isNotEmpty() && message.streamState != ChatModels.ChatStreamState.NONE) {
                             appendModelRawOnce(raw)
                         }
                         continue
                     }
 
-                    if (a.isNotEmpty()) {
-                        lines += ReviewChatLine(kind = ReviewChatKind.AI, text = a)
+                    if (assistant.isNotEmpty()) {
+                        lines += ReviewChatLine(
+                            kind = ReviewChatKind.AI,
+                            text = assistant,
+                        )
                     } else if (fallback.isNotEmpty()) {
-                        lines += ReviewChatLine(kind = ReviewChatKind.AI, text = fallback)
+                        lines += ReviewChatLine(
+                            kind = ReviewChatKind.AI,
+                            text = fallback,
+                        )
                     }
 
-                    val q2 = q?.trim()
-                    if (!q2.isNullOrBlank() && q2 != promptTrimmed) {
-                        lines += ReviewChatLine(kind = ReviewChatKind.FOLLOW_UP, text = clip(q2, MAX_LINE_CHARS))
+                    val followUpText = followUp?.trim()
+                    if (!followUpText.isNullOrBlank() && followUpText != promptTrimmed) {
+                        lines += ReviewChatLine(
+                            kind = ReviewChatKind.FOLLOW_UP,
+                            text = clip(followUpText, MAX_LINE_CHARS),
+                        )
                     }
 
-                    val raw = m.streamText?.trim().orEmpty()
-                    if (raw.isNotEmpty() && m.streamState != ChatModels.ChatStreamState.NONE) {
+                    val raw = message.streamText?.trim().orEmpty()
+                    if (raw.isNotEmpty() && message.streamState != ChatModels.ChatStreamState.NONE) {
                         appendModelRawOnce(raw)
                     }
                 }
 
                 ChatModels.ChatRole.MODEL -> {
                     if (isSkipped && !seenUser) continue
-                    val raw = (m.streamText?.takeIf { it.isNotBlank() } ?: m.text).trim()
-                    if (raw.isNotEmpty()) appendModelRawOnce(raw)
+
+                    val raw = (message.streamText?.takeIf { it.isNotBlank() } ?: message.text).trim()
+                    if (raw.isNotEmpty()) {
+                        appendModelRawOnce(raw)
+                    }
                 }
             }
         }
 
         AppLog.d(
             TAG,
-            "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}"
+            "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}",
         )
 
         return ReviewQuestionLog(
@@ -186,61 +234,38 @@ internal object ChatReviewLogBuilders {
             prompt = prompt,
             isSkipped = isSkipped,
             completionPayload = completionPayload,
-            lines = lines
+            lines = lines,
         )
     }
 
     internal fun normalizeFollowUp(text: String?): String? {
         val raw = text ?: return null
-        var t = raw.trim().replace("\u0000", "")
-        if (t.isBlank()) return null
+        var normalized = raw.trim().replace("\u0000", "")
+        if (normalized.isBlank()) return null
 
-        val lower0 = t.lowercase(Locale.US)
-        for (p in FOLLOW_UP_PREFIX_PATTERNS) {
-            if (lower0.startsWith(p)) {
-                t = t.drop(p.length).trim()
+        val lower = normalized.lowercase(Locale.US)
+        for (prefix in FOLLOW_UP_PREFIX_PATTERNS) {
+            if (lower.startsWith(prefix)) {
+                normalized = normalized.drop(prefix.length).trim()
                 break
             }
         }
 
-        if (t.isBlank()) return null
+        if (normalized.isBlank()) return null
 
-        val l2 = t.lowercase(Locale.US)
-        if (l2 in FOLLOW_UP_GARBAGE) return null
-        if (t.length < 3) return null
+        val folded = normalized.lowercase(Locale.US)
+        if (folded in FOLLOW_UP_GARBAGE) return null
+        if (normalized.length < 3) return null
 
-        return t
+        return normalized
     }
 
-    private fun clip(text: String, maxChars: Int): String {
+    private fun clip(
+        text: String,
+        maxChars: Int,
+    ): String {
         if (text.length <= maxChars) return text
         val keep = min(maxChars, text.length)
         return text.take(keep) + "…[TRUNCATED]"
     }
 }
-
-// Backward-compatible top-level functions (existing call sites keep working).
-
-internal fun buildSkippedPayload(questionId: String, prompt: String): String =
-    ChatReviewLogBuilders.buildSkippedPayload(questionId, prompt)
-
-internal fun buildReviewQuestionLog(
-    questionId: String,
-    prompt: String,
-    isSkipped: Boolean,
-    completionPayload: String,
-    messagesSnapshot: List<ChatModels.ChatMessage>
-): ReviewQuestionLog =
-    ChatReviewLogBuilders.buildReviewQuestionLog(
-        questionId = questionId,
-        prompt = prompt,
-        isSkipped = isSkipped,
-        completionPayload = completionPayload,
-        messagesSnapshot = messagesSnapshot
-    )
-
-internal fun normalizeFollowUp(text: String?): String? =
-    ChatReviewLogBuilders.normalizeFollowUp(text)
-
-internal fun stablePromptHash(prompt: String): Int =
-    ChatReviewLogBuilders.stablePromptHash(prompt)

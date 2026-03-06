@@ -25,6 +25,8 @@ import java.util.Locale
  */
 object ChatModels {
 
+    private const val EVAL_RESULT_PREFIX: String = "[EVAL_RESULT]"
+
     /**
      * Chat message role.
      *
@@ -72,7 +74,17 @@ object ChatModels {
         val streamText: String? = null,
         val streamState: ChatStreamState = ChatStreamState.NONE,
         val streamCollapsed: Boolean = false,
-        val streamSessionId: Long? = null
+        val streamSessionId: Long? = null,
+
+        /**
+         * Step-1 Eval metadata (optional).
+         *
+         * Notes:
+         * - This is intended for UI display (e.g., a score chip).
+         * - Do not log raw model output; this is safe metadata only.
+         */
+        val evalStatus: ValidationStatus? = null,
+        val evalScore: Int? = null
     ) {
         /** True when this message is authored by the end user. */
         val isFromUser: Boolean get() = role == ChatRole.USER
@@ -89,13 +101,17 @@ object ChatModels {
          *
          * Important:
          * - A STREAMING message must be treated as having stream details even if [streamText] is still empty.
+         * - Defensive UX: if upstream forgets to set [streamState] but still appends [streamText],
+         *   the UI should still treat it as stream details.
          */
         val hasStreamDetails: Boolean
-            get() = streamState != ChatStreamState.NONE &&
-                    (streamState == ChatStreamState.STREAMING || !streamText.isNullOrBlank())
+            get() = (streamState == ChatStreamState.STREAMING) || !streamText.isNullOrBlank() || (streamState != ChatStreamState.NONE)
 
         /** True when this message is actively streaming. */
         val isStreaming: Boolean get() = streamState == ChatStreamState.STREAMING
+
+        /** True when this message has eval metadata. */
+        val hasEvalMeta: Boolean get() = (evalStatus != null) || (evalScore != null)
 
         /**
          * A best-effort fallback string to render when the UI does not use structured fields.
@@ -163,6 +179,19 @@ object ChatModels {
             return copy(streamText = base + toAdd)
         }
 
+        /**
+         * Apply eval metadata and return a new instance.
+         *
+         * Notes:
+         * - This is intentionally a simple copy helper to keep UI reducers clean.
+         */
+        fun withEvalMeta(status: ValidationStatus?, score: Int?): ChatMessage {
+            return copy(
+                evalStatus = status ?: evalStatus,
+                evalScore = score ?: evalScore
+            )
+        }
+
         /** Mark the stream as ended (normal). */
         fun markStreamEnded(collapsed: Boolean = true): ChatMessage {
             return copy(
@@ -191,8 +220,10 @@ object ChatModels {
             val aLen = assistantMessage?.length ?: 0
             val qLen = followUpQuestion?.length ?: 0
             val sLen = streamText?.length ?: 0
+            val es = evalStatus?.name ?: "-"
+            val sc = evalScore ?: -1
             return "ChatMessage(id=$id8 role=$role state=$streamState collapsed=$streamCollapsed " +
-                    "lens[text=$textLen a=$aLen q=$qLen stream=$sLen] sid=${streamSessionId ?: 0})"
+                    "lens[text=$textLen a=$aLen q=$qLen stream=$sLen] eval[$es,$sc] sid=${streamSessionId ?: 0})"
         }
 
         companion object {
@@ -243,7 +274,9 @@ object ChatModels {
                 modelState: ChatStreamState = ChatStreamState.ENDED,
                 streamCollapsed: Boolean = true,
                 textFallback: String = "",
-                streamSessionId: Long? = null
+                streamSessionId: Long? = null,
+                evalStatus: ValidationStatus? = null,
+                evalScore: Int? = null
             ): ChatMessage {
                 return ChatMessage(
                     id = id,
@@ -254,7 +287,9 @@ object ChatModels {
                     streamText = modelOutput,
                     streamState = modelState,
                     streamCollapsed = streamCollapsed,
-                    streamSessionId = streamSessionId
+                    streamSessionId = streamSessionId,
+                    evalStatus = evalStatus,
+                    evalScore = evalScore
                 )
             }
 
@@ -329,6 +364,77 @@ object ChatModels {
 
         /** The current answer is insufficient and requires a follow-up question. */
         NEED_FOLLOW_UP
+    }
+
+    /**
+     * A parsed eval metadata event for UI.
+     */
+    @Immutable
+    data class EvalMeta(
+        val status: ValidationStatus?,
+        val score: Int?
+    )
+
+    /**
+     * Best-effort extraction of eval metadata from a streamed chunk.
+     *
+     * Expected format (example):
+     * - "[EVAL_RESULT] status=ACCEPTED score=92"
+     *
+     * Notes:
+     * - This parser is intentionally forgiving.
+     * - It may return null if the chunk does not contain a recognizable event.
+     */
+    fun tryExtractEvalMetaFromChunk(chunk: String): EvalMeta? {
+        val idx = chunk.indexOf(EVAL_RESULT_PREFIX)
+        if (idx < 0) return null
+
+        // Parse only the tail portion to reduce false matches.
+        val tail = chunk.substring(idx + EVAL_RESULT_PREFIX.length)
+
+        val status = runCatching {
+            Regex("""\bstatus=([A-Z_?]+)\b""").find(tail)?.groupValues?.getOrNull(1)
+        }.getOrNull()
+
+        val score = runCatching {
+            Regex("""\bscore=(-?\d+)\b""").find(tail)?.groupValues?.getOrNull(1)?.toInt()
+        }.getOrNull()
+
+        val mappedStatus =
+            when (status) {
+                "ACCEPTED" -> ValidationStatus.ACCEPTED
+                "NEED_FOLLOW_UP" -> ValidationStatus.NEED_FOLLOW_UP
+                else -> null
+            }
+
+        if (mappedStatus == null && score == null) return null
+        return EvalMeta(status = mappedStatus, score = score)
+    }
+
+    /**
+     * Removes eval event lines from a chunk before appending it to streamText.
+     *
+     * Notes:
+     * - This keeps the stream bubble clean while still surfacing the score via structured fields.
+     * - Conservative: removes only the event prefix region line-by-line.
+     */
+    fun stripEvalEventsFromChunk(chunk: String): String {
+        if (!chunk.contains(EVAL_RESULT_PREFIX)) return chunk
+
+        // Remove lines that contain the eval prefix.
+        val lines = chunk.split('\n')
+        if (lines.size <= 1) {
+            // Single-line chunk: if it contains prefix, drop it entirely.
+            return if (chunk.contains(EVAL_RESULT_PREFIX)) "" else chunk
+        }
+
+        return buildString {
+            for (line in lines) {
+                if (line.contains(EVAL_RESULT_PREFIX)) continue
+                if (isNotEmpty()) append('\n')
+                append(line)
+            }
+        }
     }
 
     /**

@@ -59,8 +59,6 @@ import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.ui.LocalChatStreamBridge
 import com.negi.surveys.ui.ReviewQuestionLog
-import java.security.MessageDigest
-import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filterNotNull
@@ -78,12 +76,11 @@ import com.negi.surveys.chat.ChatModels.ChatStreamState as ChatStreamState
  *
  * Assumptions:
  * - [ReviewQuestionLog] is used for local review and not uploaded to analytics as-is.
- * - [RepositoryI] is provided via [LocalRepositoryI] by the app root (no hidden fallback).
+ * - [com.negi.surveys.chat.ChatValidation.RepositoryI] is provided via [LocalRepositoryI] by the app root (no hidden fallback).
  *
  * Privacy:
  * - We never log raw user input, prompt, follow-up question, or model output.
  */
-@OptIn(FlowPreview::class)
 @Composable
 fun ChatQuestionScreen(
     questionId: String,
@@ -96,10 +93,10 @@ fun ChatQuestionScreen(
     val onBackLatest by rememberUpdatedState(onBack)
 
     val streamBridge: ChatStreamBridge = LocalChatStreamBridge.current
-    val draftStore: ChatDrafts.ChatDraftStore = remember { ChatDraftStoreHolder.store }
+    val draftStore: ChatDrafts.ChatDraftStore = remember { ChatQuestionViewModelFactory.sharedDraftStore }
 
     // Use a stable hash to reduce collisions while keeping DraftKey(promptHash:Int) API intact.
-    val promptHash = remember(prompt) { stablePromptHash(prompt) }
+    val promptHash = remember(prompt) { ChatReviewLogBuilders.stablePromptHash(prompt) }
 
     val draftKey = remember(questionId, promptHash) {
         ChatDrafts.DraftKey(questionId = questionId, promptHash = promptHash)
@@ -111,8 +108,8 @@ fun ChatQuestionScreen(
             streamBridge = streamBridge,
             logger = { msg ->
                 // Never log raw validator messages (they may contain user/model text).
-                AppLog.d("AnswerValidator", safeLogSummary(msg))
-            }
+                AppLog.d("AnswerValidator", ChatQuestionScreenLog.safeLogSummary(msg))
+            },
         )
     }
 
@@ -129,9 +126,9 @@ fun ChatQuestionScreen(
                 validator = validator,
                 streamBridge = streamBridge,
                 draftStore = draftStore,
-                draftKey = draftKey
+                draftKey = draftKey,
             )
-        }
+        },
     )
 
     val messages by vm.messages.collectAsStateWithLifecycle()
@@ -152,11 +149,14 @@ fun ChatQuestionScreen(
 
     LaunchedEffect(vmKey) {
         nextInFlight = false
-        AppLog.d(TAG, "Next latch reset. qid=$questionId vmKey=$vmKey")
+        AppLog.d(ChatQuestionScreenLog.TAG, "Next latch reset. qid=$questionId vmKey=$vmKey")
     }
 
     LaunchedEffect(vmKey) {
-        AppLog.d(TAG, "Using shared streamBridge identity=${System.identityHashCode(streamBridge)} qid=$questionId")
+        AppLog.d(
+            ChatQuestionScreenLog.TAG,
+            "Using shared streamBridge identity=${System.identityHashCode(streamBridge)} qid=$questionId",
+        )
     }
 
     // Prevent state map from growing forever across long sessions.
@@ -224,20 +224,20 @@ fun ChatQuestionScreen(
         modifier = Modifier
             .fillMaxSize()
             .windowInsetsPadding(
-                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom)
+                WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal + WindowInsetsSides.Bottom),
             ),
-        color = MaterialTheme.colorScheme.background
+        color = MaterialTheme.colorScheme.background,
     ) {
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .padding(horizontal = 12.dp, vertical = 0.dp)
+                .padding(horizontal = 12.dp, vertical = 0.dp),
         ) {
             HeaderCard(
                 questionId = questionId,
                 statusLabel = statusLabel,
                 isBusy = isBusy,
-                hasCompletion = hasCompletion
+                hasCompletion = hasCompletion,
             )
 
             Spacer(Modifier.height(10.dp))
@@ -248,13 +248,13 @@ fun ChatQuestionScreen(
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(18.dp))
                     .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.35f))
-                    .padding(10.dp)
+                    .padding(10.dp),
             ) {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize(),
                     state = listState,
                     verticalArrangement = Arrangement.spacedBy(10.dp),
-                    contentPadding = PaddingValues(bottom = bottomBarDp + 12.dp)
+                    contentPadding = PaddingValues(bottom = bottomBarDp + 12.dp),
                 ) {
                     items(items = messages, key = { it.id }) { msg: ChatMessage ->
                         ChatBubbleStructured(
@@ -265,10 +265,10 @@ fun ChatQuestionScreen(
                                 detailsExpanded[msg.id] = expand
                                 // Avoid logging message contents.
                                 AppLog.d(
-                                    TAG,
-                                    "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}"
+                                    ChatQuestionScreenLog.TAG,
+                                    "details toggle. id=${msg.id} expand=$expand role=${msg.role} state=${msg.streamState}",
                                 )
-                            }
+                            },
                         )
                     }
                 }
@@ -284,22 +284,22 @@ fun ChatQuestionScreen(
                 nextInFlight = nextInFlight,
                 onInputChange = { vm.setInput(it) },
                 onBack = {
-                    AppLog.d(TAG, "Back clicked. qid=$questionId busy=$isBusy")
+                    AppLog.d(ChatQuestionScreenLog.TAG, "Back clicked. qid=$questionId busy=$isBusy")
                     vm.cancelValidation("back_click")
                     onBackLatest()
                 },
                 onSubmit = {
                     // Avoid logging raw input.
-                    AppLog.d(TAG, "Submit clicked. qid=$questionId inputLen=${input.length}")
+                    AppLog.d(ChatQuestionScreenLog.TAG, "Submit clicked. qid=$questionId inputLen=${input.length}")
                     vm.submit()
                 },
                 onNext = {
                     if (nextInFlight) {
-                        AppLog.w(TAG, "Next clicked while inFlight=true (ignored). qid=$questionId")
+                        AppLog.w(ChatQuestionScreenLog.TAG, "Next clicked while inFlight=true (ignored). qid=$questionId")
                         return@BottomComposerCard
                     }
                     if (isBusy) {
-                        AppLog.w(TAG, "Next clicked while busy=true (ignored). qid=$questionId")
+                        AppLog.w(ChatQuestionScreenLog.TAG, "Next clicked while busy=true (ignored). qid=$questionId")
                         return@BottomComposerCard
                     }
 
@@ -310,54 +310,28 @@ fun ChatQuestionScreen(
 
                         vm.cancelValidation("next_click")
 
-                        val skipped = (payloadNow == null)
-                        val payload = payloadNow ?: buildSkippedPayload(questionId, prompt)
+                        val skipped = payloadNow == null
+                        val payload = payloadNow ?: ChatReviewLogBuilders.buildSkippedPayload(questionId, prompt)
 
-                        val log = buildReviewQuestionLog(
+                        val log = ChatReviewLogBuilders.buildReviewQuestionLog(
                             questionId = questionId,
                             prompt = prompt,
                             isSkipped = skipped,
                             completionPayload = payload,
-                            messagesSnapshot = messagesNow
+                            messagesSnapshot = messagesNow,
                         )
 
                         AppLog.d(
-                            TAG,
-                            "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}"
+                            ChatQuestionScreenLog.TAG,
+                            "Next clicked. qid=$questionId skipped=$skipped payloadLen=${payload.length} lines=${log.lines.size}",
                         )
                         onNextLatest(log)
                     } finally {
                         nextInFlight = false
                     }
                 },
-                onMeasuredHeightPx = { bottomBarPx = it }
+                onMeasuredHeightPx = { bottomBarPx = it },
             )
         }
     }
-}
-
-private const val TAG = "ChatQuestionScreen"
-
-/**
- * Produce a safe summary for logs. Never return raw text.
- */
-private fun safeLogSummary(raw: String?): String {
-    val t = raw?.trim().orEmpty()
-    if (t.isEmpty()) return "(empty)"
-    val len = t.length
-    val sha12 = sha256HexPrefix(t, 12)
-    return "len=$len sha256=$sha12"
-}
-
-private fun sha256HexPrefix(text: String, hexChars: Int): String {
-    val md = MessageDigest.getInstance("SHA-256")
-    val bytes = md.digest(text.toByteArray(Charsets.UTF_8))
-    val sb = StringBuilder(hexChars)
-    val neededBytes = (hexChars + 1) / 2
-    for (i in 0 until neededBytes.coerceAtMost(bytes.size)) {
-        val b = bytes[i].toInt() and 0xFF
-        sb.append("0123456789abcdef"[b ushr 4])
-        sb.append("0123456789abcdef"[b and 0x0F])
-    }
-    return if (sb.length > hexChars) sb.substring(0, hexChars) else sb.toString()
 }
