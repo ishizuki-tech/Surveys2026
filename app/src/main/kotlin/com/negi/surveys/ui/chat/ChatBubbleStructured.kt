@@ -205,7 +205,6 @@ internal fun ChatBubbleStructured(
                             MaterialTheme.colorScheme.onSurfaceVariant,
                             MaterialTheme.colorScheme.secondary
                         )
-                        else -> ChatBubbleUi.Quad("", Color.Transparent, textColor, Color.Transparent)
                     }
 
                     ChatBubbleUi.RoleChip(

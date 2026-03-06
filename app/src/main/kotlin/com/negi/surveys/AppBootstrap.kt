@@ -273,7 +273,7 @@ object AppBootstrap {
                     onSuccess = { value ->
                         UploadCallOutcome(
                             ok = true,
-                            resultType = value?.javaClass?.simpleName,
+                            resultType = value.javaClass?.simpleName,
                             errType = null,
                         )
                     },

@@ -18,6 +18,7 @@ import com.google.ai.edge.litertlm.Message
 import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.chat.DefaultSlmPromptBuilder
 import com.negi.surveys.chat.SlmPromptBuilderI
+import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
@@ -256,7 +257,7 @@ class SlmRepository(
         modelFile: File,
         options: WarmupController.Options,
     ): Boolean {
-        val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: cachedConfig.get()
+        val cfg = InstalledSurveyConfigStore.getOrNull()?: cachedConfig.get()
 
         val stat = safeFileStat(modelFile)
         if (!stat.exists || !stat.isFile || stat.length <= 0L) {
@@ -288,7 +289,7 @@ class SlmRepository(
      * - This protects buildPrompt() from accidental blocking calls.
      */
     private fun getSystemPromptFromCacheOnly(): String? {
-        val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: cachedConfig.get()
+        val cfg = InstalledSurveyConfigStore.getOrNull() ?: cachedConfig.get()
         return runCatching { cfg?.composeSystemPrompt() }
             .getOrNull()
             ?.trim()
@@ -918,7 +919,7 @@ class SlmRepository(
     // ---------------------------------------------------------------------
 
     private suspend fun getConfigSuspendBestEffort(): SurveyConfig? {
-        SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
+        InstalledSurveyConfigStore.getOrNull()?.let { cfg ->
             cachedConfig.set(cfg)
             return cfg
         }
@@ -931,7 +932,7 @@ class SlmRepository(
         }
 
         return configLoadMutex.withLock {
-            SurveyConfigLoader.getInstalledConfigOrNull()?.let { cfg ->
+            InstalledSurveyConfigStore.getOrNull()?.let { cfg ->
                 cachedConfig.set(cfg)
                 return@withLock cfg
             }

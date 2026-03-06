@@ -17,6 +17,7 @@ import android.content.Context
 import android.os.Build
 import android.os.Process
 import android.os.SystemClock
+import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
@@ -39,9 +40,10 @@ import kotlinx.coroutines.launch
  * - Install SurveyConfig as a single source of truth (process-scoped).
  * - Avoid duplicate config loads from UI/repositories.
  *
- * Warmup design (NO Dependencies):
+ * Warmup design (NO dependencies):
  * - WarmupController is created process-scoped by AppProcessServices.
- * - WarmupController receives Inputs (file + WarmupCapableRepository + options) via AppProcessServices.updateWarmupInputs().
+ * - WarmupController receives Inputs (file + WarmupCapableRepository + options)
+ *   via AppProcessServices.updateWarmupInputs().
  * - This Application performs ONLY best-effort early Inputs injection when it can do so safely.
  *
  * Privacy:
@@ -75,25 +77,15 @@ class SurveyApplication : Application() {
         if (!ProcessGuardsEntry.isMainProcess(appContext)) {
             SafeLog.i(
                 TAG,
-                "Config install: skipped (non-main process) process=${ProcessGuardsEntry.currentProcessNameCached(appContext)}",
+                "Config install: skipped (non-main process) " +
+                        "process=${ProcessGuardsEntry.currentProcessNameCached(appContext)}",
             )
             SafeLog.i(TAG, "startup: done in ${SystemClock.elapsedRealtime() - t0}ms (non-main)")
             return
         }
 
         // 3) Install SurveyConfig ONCE per process (single source of truth).
-        val tCfg = SystemClock.elapsedRealtime()
-        runCatching {
-            val cfg = SurveyConfigLoader.fromAssetsValidated(appContext, CONFIG_ASSET_NAME)
-            SurveyConfigLoader.installProcessConfig(cfg)
-            SafeLog.i(
-                TAG,
-                "Config install: success dt=${SystemClock.elapsedRealtime() - tCfg}ms asset=$CONFIG_ASSET_NAME",
-            )
-        }.onFailure { t ->
-            // IMPORTANT: Do not log t.message (may contain sensitive info).
-            SafeLog.e(TAG, "Config install: failed (non-fatal) ${t.safeTypeAndHint()}")
-        }
+        installSurveyConfigOnce(appContext)
 
         // 4) Warmup Inputs (best-effort):
         // - Do NOT use reflection to guess warmup entrypoints.
@@ -102,6 +94,53 @@ class SurveyApplication : Application() {
         WarmupInputsBootstrap.tryInjectOnceBestEffort(appContext)
 
         SafeLog.i(TAG, "startup: done in ${SystemClock.elapsedRealtime() - t0}ms")
+    }
+
+    /**
+     * Installs the validated SurveyConfig once for the current process.
+     *
+     * Contract:
+     * - First successful install wins.
+     * - Duplicate install attempts are ignored.
+     * - Parsing is skipped when a config is already installed.
+     *
+     * Privacy:
+     * - Do not log asset names or file names.
+     * - Do not log exception.message.
+     */
+    private fun installSurveyConfigOnce(appContext: Context) {
+        val tCfg = SystemClock.elapsedRealtime()
+
+        val existing = InstalledSurveyConfigStore.getOrNull()
+        if (existing != null) {
+            SafeLog.w(
+                TAG,
+                "Config install: skipped (already installed) dt=${SystemClock.elapsedRealtime() - tCfg}ms",
+            )
+            return
+        }
+
+        runCatching {
+            val cfg = SurveyConfigLoader.fromAssetsValidated(appContext, CONFIG_ASSET_NAME)
+            when (InstalledSurveyConfigStore.installOnce(cfg)) {
+                InstalledSurveyConfigStore.InstallResult.INSTALLED -> {
+                    SafeLog.i(
+                        TAG,
+                        "Config install: success dt=${SystemClock.elapsedRealtime() - tCfg}ms",
+                    )
+                }
+
+                InstalledSurveyConfigStore.InstallResult.ALREADY_INSTALLED -> {
+                    SafeLog.w(
+                        TAG,
+                        "Config install: ignored duplicate install dt=${SystemClock.elapsedRealtime() - tCfg}ms",
+                    )
+                }
+            }
+        }.onFailure { t ->
+            // IMPORTANT: Do not log t.message (may contain sensitive info).
+            SafeLog.e(TAG, "Config install: failed (non-fatal) ${t.safeTypeAndHint()}")
+        }
     }
 
     private companion object {
@@ -172,8 +211,10 @@ class SurveyApplication : Application() {
                             loggedRepoNotCapable = true
                             SafeLog.w(
                                 TAG,
-                                "warmupInputs: earlyInject retry (repo not WarmupCapableRepository) " +
-                                        "repoType=${repo?.javaClass?.simpleName ?: "null"} pid=${Process.myPid()}",
+                                "warmupInputs: earlyInject retry " +
+                                        "(repo not WarmupCapableRepository) " +
+                                        "repoType=${repo?.javaClass?.simpleName ?: "null"} " +
+                                        "pid=${Process.myPid()}",
                             )
                         }
                         delay(RETRY_INTERVAL_MS)
@@ -191,15 +232,17 @@ class SurveyApplication : Application() {
 
                     SafeLog.i(
                         TAG,
-                        "warmupInputs: earlyInject installed hasInputs=true pid=${Process.myPid()} " +
-                                "repoType=${repo.javaClass.simpleName} attempts=$attempts",
+                        "warmupInputs: earlyInject installed hasInputs=true " +
+                                "pid=${Process.myPid()} repoType=${repo.javaClass.simpleName} " +
+                                "attempts=$attempts",
                     )
                     return@launch
                 }
 
                 SafeLog.w(
                     TAG,
-                    "warmupInputs: earlyInject gave up (best-effort) pid=${Process.myPid()} attempts=$attempts",
+                    "warmupInputs: earlyInject gave up (best-effort) " +
+                            "pid=${Process.myPid()} attempts=$attempts",
                 )
             }
         }
@@ -242,6 +285,7 @@ class SurveyApplication : Application() {
         fun isMainProcess(context: Context): Boolean {
             val name = currentProcessNameCached(context)
             val pkg = context.packageName
+
             // Fail-open: if we cannot determine, treat as main to keep behavior consistent.
             return name.isBlank() || name == "unknown" || name == pkg
         }
@@ -297,7 +341,13 @@ class SurveyApplication : Application() {
             val now = SystemClock.elapsedRealtime()
             val last = lastScanAtMs.get()
 
-            val interval = if (cachedFile.get() == null) SCAN_INTERVAL_EMPTY_MS else SCAN_INTERVAL_READY_MS
+            val interval =
+                if (cachedFile.get() == null) {
+                    SCAN_INTERVAL_EMPTY_MS
+                } else {
+                    SCAN_INTERVAL_READY_MS
+                }
+
             if (now - last < interval) {
                 return cachedFile.get()
             }
@@ -321,6 +371,7 @@ class SurveyApplication : Application() {
                 val list = runCatching { dir.listFiles() ?: emptyArray() }.getOrDefault(emptyArray())
                 for (f in list) {
                     if (!f.isFile) continue
+
                     val name = f.name.lowercase()
                     if (allowedExtensions.none { name.endsWith(it) }) continue
 
@@ -354,14 +405,14 @@ class SurveyApplication : Application() {
          * - Keep file-name resolution aligned with the downloader/UI path as much as possible.
          */
         private fun resolvePreferredFromInstalledConfig(appContext: Context): File? {
-            val cfg = SurveyConfigLoader.getInstalledConfigOrNull() ?: return null
+            val cfg = InstalledSurveyConfigStore.getOrNull() ?: return null
 
             val candidates = LinkedHashSet<String>()
 
             cfg.resolveModelDownloadSpec()
-                ?.fileName
-                ?.trim()
-                ?.takeIf { it.isNotBlank() }
+                .fileName
+                .trim()
+                .takeIf { it.isNotBlank() }
                 ?.let { candidates.add(it) }
 
             cfg.modelDefaults.defaultFileName
@@ -372,7 +423,9 @@ class SurveyApplication : Application() {
             for (raw in candidates) {
                 val safeName = sanitizeSimpleFileName(raw) ?: continue
                 val f = File(appContext.filesDir, safeName)
-                val ok = runCatching { f.exists() && f.isFile && f.length() > 0L }.getOrDefault(false)
+                val ok = runCatching {
+                    f.exists() && f.isFile && f.length() > 0L
+                }.getOrDefault(false)
                 if (ok) return f
             }
 

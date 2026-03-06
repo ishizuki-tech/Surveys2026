@@ -16,38 +16,24 @@ import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBars
-import androidx.compose.foundation.layout.windowInsetsTopHeight
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.Icon
-import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
@@ -57,7 +43,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -66,13 +51,8 @@ import androidx.navigation3.runtime.NavEntry
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
-import androidx.navigation3.ui.NavDisplay
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatValidation
-import com.negi.surveys.config.ModelDownloadSpec
-import com.negi.surveys.config.SurveyConfig
-import com.negi.surveys.config.SurveyConfigLoader
-import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.GitHubLogUploadManager
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.nav.AppNavigator
@@ -85,12 +65,10 @@ import com.negi.surveys.ui.DebugInfo
 import com.negi.surveys.ui.DebugRow
 import com.negi.surveys.ui.ExportScreen
 import com.negi.surveys.ui.HomeScreen
-import com.negi.surveys.ui.LocalChatStreamBridge
 import com.negi.surveys.ui.ReviewQuestionLog
 import com.negi.surveys.ui.ReviewScreen
 import com.negi.surveys.ui.SurveyStartScreen
 import com.negi.surveys.ui.chat.ChatQuestionScreen
-import com.negi.surveys.ui.chat.LocalRepositoryI
 import com.negi.surveys.utils.ModelDownloadController
 import com.negi.surveys.warmup.WarmupController
 import java.util.Locale
@@ -106,7 +84,7 @@ object SurveyAppRoot {
      * Allows calling `SurveyAppRoot(...)` even though this is an object.
      *
      * Why:
-     * - Keeps call-sites unchanged (previously a top-level composable).
+     * - Keeps call-sites unchanged.
      * - Avoids the confusing `SurveyAppRoot.SurveyAppRoot()` pattern.
      */
     @Composable
@@ -120,39 +98,9 @@ object SurveyAppRoot {
 
     const val TAG: String = "SurveyAppRoot"
 
-    /**
-     * Hard guard for switching repository mode.
-     *
-     * Notes:
-     * - Replace with BuildConfig / SurveyConfig / dev menu toggle if needed.
-     * - MUST NOT depend on secrets / tokens.
-     */
-    private const val FORCE_FAKE_REPO: Boolean = false
-
-    /**
-     * How long the UI should wait for Application-installed config to appear.
-     *
-     * Rationale:
-     * - Usually SurveyApplication installs config before first composition.
-     * - However, there are rare edge cases where Compose starts before install is visible.
-     */
-    private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
-    private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
-    private const val STARTUP_AFTER_FIRST_FRAME_DELAY_MS: Long = 150L
-
     // ---------------------------------------------------------------------
     // Models / Formatting
     // ---------------------------------------------------------------------
-
-    sealed interface ConfigState {
-        data object Loading : ConfigState
-        data class Ready(val cfg: SurveyConfig) : ConfigState
-
-        /**
-         * Failure message MUST be safe (no exception.message).
-         */
-        data class Failed(val safeReason: String) : ConfigState
-    }
 
     private data class WarmupUiFormat(
         val idleLabel: String,
@@ -180,24 +128,8 @@ object SurveyAppRoot {
         MODEL_ONLY,
 
         /** Block on model + prefetch + compile busy. */
-        MODEL_PREFETCH_COMPILE
+        MODEL_PREFETCH_COMPILE,
     }
-
-    /**
-     * Stable key for deciding whether the downloader should be recreated.
-     *
-     * Notes:
-     * - ModelDownloadController is stateful (has an internal scope).
-     * - AppProcessServices is responsible for swap+close lifecycle, not UI.
-     */
-    private data class ModelSpecKey(
-        val url: String,
-        val fileName: String,
-        val timeoutMs: Long,
-        val forceFreshOnStart: Boolean,
-        val uiThrottleMs: Long,
-        val uiMinDeltaBytes: Long,
-    )
 
     // ---------------------------------------------------------------------
     // Entry Point (Render)
@@ -274,120 +206,52 @@ object SurveyAppRoot {
         val streamStats: ChatStreamBridge.StreamStats by streamBridge.stats.collectAsStateWithLifecycle()
 
         // -------------------------------------------------------------
-        // Config (installed-only, Application-owned)
+        // Startup orchestration (ViewModel-owned)
         // -------------------------------------------------------------
 
-        val configState: ConfigState by produceState<ConfigState>(
-            initialValue = ConfigState.Loading,
-            key1 = appContext,
-        ) {
-            val t0 = SystemClock.elapsedRealtime()
-            SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
+        val startupVm: AppStartupViewModel = viewModel()
+        val startupUi: AppStartupUiState by startupVm.uiState.collectAsStateWithLifecycle()
 
-            val cfg = withContext(Dispatchers.Default) {
-                val deadline = t0 + INSTALLED_CONFIG_WAIT_MS
-                var installed: SurveyConfig? = null
-
-                while (SystemClock.elapsedRealtime() < deadline && installed == null) {
-                    installed = SurveyConfigLoader.getInstalledConfigOrNull()
-                    if (installed != null) break
-                    delay(INSTALLED_CONFIG_POLL_MS)
-                }
-                installed
-            }
-
-            if (cfg != null) {
-                val dt = SystemClock.elapsedRealtime() - t0
-                SafeLog.i(TAG, "Config: ready (installed) in ${dt}ms")
-                value = ConfigState.Ready(cfg)
-            } else {
-                val dt = SystemClock.elapsedRealtime() - t0
-                SafeLog.e(TAG, "Config: missing (installed config not found) after ${dt}ms")
-                value = ConfigState.Failed("InstalledConfigMissing")
-            }
+        LaunchedEffect(Unit) {
+            withFrameNanos { /* Wait until the first frame is rendered. */ }
+            startupVm.onFirstFrameRendered()
         }
 
-        /**
-         * Resolve ModelDownloadSpec only when config is ready.
-         */
-        val modelSpec: ModelDownloadSpec? = remember(configState) {
-            when (val st = configState) {
-                is ConfigState.Ready -> st.cfg.resolveModelDownloadSpec()
-                else -> null
-            }
+        val configState: StartupConfigState = startupUi.configState
+        val repoMode: AppProcessServices.RepoMode = startupUi.repoMode
+        val onDeviceEnabled: Boolean = startupUi.onDeviceEnabled
+        val startupServicesReady: Boolean = startupUi.servicesReady
+
+        val repo: ChatValidation.RepositoryI? = startupUi.repository
+        val warmup: WarmupController? = startupUi.warmup
+        val modelDownloader: ModelDownloadController? = startupUi.modelDownloader
+
+        val rootModelState: ModelDownloadController.ModelState = startupUi.modelState
+        val rootPrefetchState: WarmupController.PrefetchState = startupUi.prefetchState
+        val rootCompileState: WarmupController.CompileState = startupUi.compileState
+
+        val rootModelStateState: State<ModelDownloadController.ModelState> =
+            rememberUpdatedState(rootModelState)
+        val rootPrefetchStateState: State<WarmupController.PrefetchState> =
+            rememberUpdatedState(rootPrefetchState)
+        val rootCompileStateState: State<WarmupController.CompileState> =
+            rememberUpdatedState(rootCompileState)
+
+        val launchRetryAll: (String) -> Unit = remember(startupVm) {
+            { fromRaw -> startupVm.retryAll(fromRaw) }
         }
 
-        /**
-         * Build a stable "effective key" that decides downloader recreation.
-         */
-        val modelSpecKey: ModelSpecKey? = remember(modelSpec) {
-            val s = modelSpec ?: return@remember null
-            val url = s.modelUrl?.trim().orEmpty()
-            val name = s.fileName.trim().orEmpty()
-            if (url.isBlank() || name.isBlank()) return@remember null
-
-            ModelSpecKey(
-                url = url,
-                fileName = name,
-                timeoutMs = s.timeoutMs,
-                forceFreshOnStart = false,
-                uiThrottleMs = s.uiThrottleMs,
-                uiMinDeltaBytes = s.uiMinDeltaBytes,
-            )
-        }
-
-        // -------------------------------------------------------------
-        // Repo Mode Decision
-        // -------------------------------------------------------------
-
-        val repoMode: AppProcessServices.RepoMode = remember(configState) {
-            if (FORCE_FAKE_REPO) AppProcessServices.RepoMode.FAKE else AppProcessServices.RepoMode.ON_DEVICE
-        }
-
-        val onDeviceEnabled: Boolean = remember(repoMode) { repoMode == AppProcessServices.RepoMode.ON_DEVICE }
-
-        LaunchedEffect(repoMode) {
+        LaunchedEffect(repoMode, onDeviceEnabled) {
             SafeLog.i(TAG, "RepoMode: $repoMode onDeviceEnabled=$onDeviceEnabled")
         }
 
-        // -------------------------------------------------------------
-        // Process-scoped services (Repo/Warmup/Downloader)
-        // -------------------------------------------------------------
-
-        val repo: ChatValidation.RepositoryI = remember(appContext, repoMode) {
-            AppProcessServices.repository(appContext, repoMode)
+        LaunchedEffect(modelDownloader, startupServicesReady, onDeviceEnabled) {
+            SafeLog.i(
+                TAG,
+                "StartupServices: ready=$startupServicesReady " +
+                        "onDevice=$onDeviceEnabled downloaderPresent=${modelDownloader != null}",
+            )
         }
-
-        val warmup: WarmupController = remember(appContext, repoMode) {
-            AppProcessServices.warmupController(appContext, repoMode)
-        }
-
-        /**
-         * NOTE:
-         * - This is process-scoped. Do NOT close() it from UI.
-         * - AppProcessServices is responsible for swap/close when config changes.
-         */
-        val modelDownloader: ModelDownloadController = remember(appContext, repoMode, modelSpecKey) {
-            val specToUse: ModelDownloadSpec? = modelSpecKey?.let { modelSpec }
-
-            AppProcessServices.modelDownloader(appContext, spec = specToUse).also {
-                val key = modelSpecKey
-                SafeLog.i(
-                    TAG,
-                    "ModelDownloader: obtained onDevice=$onDeviceEnabled keyPresent=${key != null} specPresent=${specToUse != null}",
-                )
-            }
-        }
-
-        // Collect state ONCE at root to avoid duplicate subscriptions.
-        val rootModelState: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
-        val rootPrefetchState: WarmupController.PrefetchState by warmup.prefetchState.collectAsStateWithLifecycle()
-        val rootCompileState: WarmupController.CompileState by warmup.compileState.collectAsStateWithLifecycle()
-
-        // Keep stable state containers for NavEntry lambdas.
-        val rootModelStateState: State<ModelDownloadController.ModelState> = rememberUpdatedState(rootModelState)
-        val rootPrefetchStateState: State<WarmupController.PrefetchState> = rememberUpdatedState(rootPrefetchState)
-        val rootCompileStateState: State<WarmupController.CompileState> = rememberUpdatedState(rootCompileState)
 
         // -------------------------------------------------------------
         // Debug: log transitions (centralized)
@@ -398,140 +262,6 @@ object SurveyAppRoot {
             prefetchState = rootPrefetchState,
             compileState = rootCompileState,
         )
-
-        // -------------------------------------------------------------
-        // Retry (model + warmup) unified
-        // -------------------------------------------------------------
-
-        val launchRetryAll: (String) -> Unit = remember(
-            scope,
-            warmup,
-            modelDownloader,
-            modelSpecKey,
-            onDeviceEnabled,
-        ) {
-            { fromRaw ->
-                val from = sanitizeLabel(fromRaw)
-
-                scope.launch(Dispatchers.IO) {
-                    val key = modelSpecKey
-                    SafeLog.w(
-                        TAG,
-                        "RetryAll requested from=$from onDevice=$onDeviceEnabled keyPresent=${key != null}",
-                    )
-
-                    if (onDeviceEnabled) {
-                        runCatching { modelDownloader.resetForRetry(reason = "uiRetry") }
-                            .onFailure { t ->
-                                SafeLog.e(
-                                    TAG,
-                                    "RetryAll: model resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
-                                    t
-                                )
-                            }
-
-                        if (key != null) {
-                            runCatching {
-                                modelDownloader.ensureModelOnce(
-                                    timeoutMs = key.timeoutMs,
-                                    forceFresh = false,
-                                    reason = "uiRetry",
-                                )
-                            }.onFailure { t ->
-                                SafeLog.e(
-                                    TAG,
-                                    "RetryAll: model ensure failed (non-fatal) type=${t::class.java.simpleName}",
-                                    t
-                                )
-                            }
-                        } else {
-                            SafeLog.w(
-                                TAG,
-                                "RetryAll: skip model ensure (modelSpecKey missing)",
-                            )
-                        }
-                    }
-
-                    runCatching { warmup.resetForRetry(reason = "uiRetry") }
-                        .onFailure { t ->
-                            SafeLog.e(
-                                TAG,
-                                "RetryAll: warmup resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
-                                t
-                            )
-                        }
-
-                    if (onDeviceEnabled && key != null) {
-                        runCatching { warmup.requestCompileAfterPrefetch(reason = "uiRetry") }
-                            .onFailure { t ->
-                                SafeLog.e(
-                                    TAG,
-                                    "RetryAll: warmup requestCompileAfterPrefetch failed (non-fatal) type=${t::class.java.simpleName}",
-                                    t
-                                )
-                            }
-                    } else if (onDeviceEnabled) {
-                        SafeLog.w(
-                            TAG,
-                            "RetryAll: skip warmup compile request (modelSpecKey missing)",
-                        )
-                    }
-                }
-            }
-        }
-
-        // -------------------------------------------------------------
-        // Startup effects (single pipeline)
-        // -------------------------------------------------------------
-
-        LaunchedEffect(onDeviceEnabled, modelSpecKey, modelDownloader) {
-            if (!onDeviceEnabled) return@LaunchedEffect
-            val key = modelSpecKey ?: return@LaunchedEffect
-
-            // Wait for the first frame to avoid blocking initial composition.
-            withFrameNanos { /* first frame */ }
-            delay(STARTUP_AFTER_FIRST_FRAME_DELAY_MS)
-
-            runCatching {
-                modelDownloader.ensureModelOnce(
-                    timeoutMs = key.timeoutMs,
-                    forceFresh = key.forceFreshOnStart,
-                    reason = "startupAfterFirstFrame",
-                )
-            }.onFailure { t ->
-                SafeLog.e(TAG, "Model ensure failed (non-fatal) type=${t::class.java.simpleName}", t)
-            }
-        }
-
-        var compileRequestedForCurrentReady by remember(modelSpecKey, warmup, onDeviceEnabled) {
-            mutableStateOf(false)
-        }
-
-        LaunchedEffect(rootModelState, onDeviceEnabled, warmup, modelSpecKey) {
-            if (!onDeviceEnabled) return@LaunchedEffect
-
-            when (rootModelState) {
-                is ModelDownloadController.ModelState.Ready -> {
-                    if (compileRequestedForCurrentReady) {
-                        SafeLog.d(TAG, "Model Ready -> warmup already requested for current ready cycle")
-                        return@LaunchedEffect
-                    }
-
-                    compileRequestedForCurrentReady = true
-                    SafeLog.i(TAG, "Model Ready -> request warmup compileAfterPrefetch")
-
-                    runCatching {
-                        warmup.requestCompileAfterPrefetch(reason = "modelReady")
-                    }.onFailure { t ->
-                        SafeLog.e(TAG, "Warmup request failed (non-fatal) type=${t::class.java.simpleName}", t)
-                    }
-                }
-
-                else -> {
-                    compileRequestedForCurrentReady = false
-                }
-            }
-        }
 
         // -------------------------------------------------------------
         // Debug labels (home-level)
@@ -549,10 +279,17 @@ object SurveyAppRoot {
 
         val cfgLabel = remember(configState) {
             when (val st = configState) {
-                is ConfigState.Loading -> "Loading"
-                is ConfigState.Ready -> "Ready"
-                is ConfigState.Failed -> "Failed (${st.safeReason})"
+                is StartupConfigState.Loading -> "Loading"
+                is StartupConfigState.Ready -> "Ready"
+                is StartupConfigState.Failed -> "Failed (${st.safeReason})"
             }
+        }
+
+        val repoIdLabel = remember(repo) {
+            repo?.let { System.identityHashCode(it).toString() } ?: "null"
+        }
+        val repoTypeLabel = remember(repo) {
+            repo?.javaClass?.simpleName ?: "null"
         }
 
         val debugInfo: DebugInfo = remember(
@@ -573,9 +310,15 @@ object SurveyAppRoot {
             compileUiLabel,
             repoMode,
             onDeviceEnabled,
+            startupServicesReady,
+            repoIdLabel,
+            repoTypeLabel,
         ) {
             val ignoredTotal =
-                streamStats.ignoredDelta + streamStats.ignoredEnd + streamStats.ignoredError + streamStats.ignoredCancel
+                streamStats.ignoredDelta +
+                        streamStats.ignoredEnd +
+                        streamStats.ignoredError +
+                        streamStats.ignoredCancel
 
             DebugInfo(
                 currentRoute = titleFor(currentKey),
@@ -587,6 +330,7 @@ object SurveyAppRoot {
                     DebugRow("Config", cfgLabel),
                     DebugRow("RepoMode", repoMode.name),
                     DebugRow("OnDevice", onDeviceEnabled.toString()),
+                    DebugRow("StartupReady", startupServicesReady.toString()),
                     DebugRow("Logs", logs.size.toString()),
                     DebugRow("ExportLen", exportText.length.toString()),
                     DebugRow("StreamActive", streamStats.activeSessionId.toString()),
@@ -595,8 +339,8 @@ object SurveyAppRoot {
                     DebugRow("SLM Model", modelUiLabel),
                     DebugRow("SLM Prefetch", prefetchUiLabel),
                     DebugRow("SLM Compile", compileUiLabel),
-                    DebugRow("RepoId", System.identityHashCode(repo).toString()),
-                    DebugRow("RepoType", repo.javaClass.simpleName),
+                    DebugRow("RepoId", repoIdLabel),
+                    DebugRow("RepoType", repoTypeLabel),
                 ),
             )
         }
@@ -667,21 +411,30 @@ object SurveyAppRoot {
                 }
 
                 entry<SurveyStart> {
-                    GateOrContent(
-                        enabled = onDeviceEnabled,
-                        policy = GatePolicy.MODEL_ONLY,
-                        modelState = rootModelStateState.value,
-                        prefetchState = rootPrefetchStateState.value,
-                        compileState = rootCompileStateState.value,
-                        onBack = { nav.pop() },
-                        onRetryAll = { launchRetryAll("surveyStartGate") },
-                    ) {
-                        SurveyStartScreen(
-                            onBegin = { nav.beginQuestions("Q1") },
-                            onBack = { nav.pop() },
-                            warmupController = warmup,
-                            debugInfo = debugInfoState.value,
+                    val readyWarmup = warmup
+                    if (readyWarmup == null) {
+                        SurveyAppShell.BlockingBody(
+                            title = "Preparing app services…",
+                            detail = "Warmup service is not ready yet.",
+                            showSpinner = true,
                         )
+                    } else {
+                        GateOrContent(
+                            enabled = onDeviceEnabled,
+                            policy = GatePolicy.MODEL_ONLY,
+                            modelState = rootModelStateState.value,
+                            prefetchState = rootPrefetchStateState.value,
+                            compileState = rootCompileStateState.value,
+                            onBack = { nav.pop() },
+                            onRetryAll = { launchRetryAll("surveyStartGate") },
+                        ) {
+                            SurveyStartScreen(
+                                onBegin = { nav.beginQuestions("Q1") },
+                                onBack = { nav.pop() },
+                                warmupController = readyWarmup,
+                                debugInfo = debugInfoState.value,
+                            )
+                        }
                     }
                 }
 
@@ -733,37 +486,89 @@ object SurveyAppRoot {
         }
 
         // -------------------------------------------------------------
-        // Scaffold
+        // Root startup/blocking state
         // -------------------------------------------------------------
 
-        Scaffold(
-            modifier = modifier.fillMaxSize(),
-            contentWindowInsets = WindowInsets(0, 0, 0, 0),
-            topBar = {
-                CompactTopBar(
-                    title = titleFor(currentKey),
-                    canPop = canPop,
-                    onBack = { nav.pop() },
-                )
-            },
-        ) { innerPadding ->
-            Box(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(innerPadding),
-            ) {
-                CompositionLocalProvider(
-                    LocalChatStreamBridge provides streamBridge,
-                    LocalRepositoryI provides repo,
-                ) {
-                    NavDisplay(
-                        backStack = backStack,
-                        entryProvider = entries,
-                        modifier = Modifier.fillMaxSize(),
-                    )
+        val startupBlockTitle = remember(
+            configState,
+            startupServicesReady,
+            repo,
+            warmup,
+            modelDownloader,
+            onDeviceEnabled,
+        ) {
+            when (configState) {
+                is StartupConfigState.Loading -> "Loading application configuration…"
+                is StartupConfigState.Failed -> "Startup configuration is unavailable."
+                is StartupConfigState.Ready -> {
+                    when {
+                        !startupServicesReady && onDeviceEnabled -> "Preparing on-device services…"
+                        !startupServicesReady -> "Preparing app services…"
+                        repo == null -> "Preparing app services…"
+                        onDeviceEnabled && modelDownloader == null -> "Preparing on-device services…"
+                        onDeviceEnabled && warmup == null -> "Preparing on-device services…"
+                        else -> null
+                    }
                 }
             }
         }
+
+        val startupBlockDetail = remember(
+            configState,
+            startupServicesReady,
+            repo,
+            warmup,
+            modelDownloader,
+            onDeviceEnabled,
+        ) {
+            when (val st = configState) {
+                is StartupConfigState.Loading ->
+                    "Waiting for the Application-installed SurveyConfig."
+
+                is StartupConfigState.Failed ->
+                    "Safe reason: ${st.safeReason}"
+
+                is StartupConfigState.Ready -> {
+                    when {
+                        !startupServicesReady ->
+                            "Process-scoped services are still starting."
+
+                        repo == null ->
+                            "Repository is not ready yet."
+
+                        onDeviceEnabled && modelDownloader == null ->
+                            "Model downloader is not ready yet."
+
+                        onDeviceEnabled && warmup == null ->
+                            "Warmup controller is not ready yet."
+
+                        else -> null
+                    }
+                }
+            }
+        }
+
+        val showStartupSpinner = remember(configState) {
+            configState !is StartupConfigState.Failed
+        }
+
+        // -------------------------------------------------------------
+        // Shell
+        // -------------------------------------------------------------
+
+        SurveyAppShell(
+            modifier = modifier,
+            title = titleFor(currentKey),
+            canPop = canPop,
+            onBack = { nav.pop() },
+            backStack = backStack,
+            entryProvider = entries,
+            streamBridge = streamBridge,
+            repository = repo,
+            blockingTitle = startupBlockTitle,
+            blockingDetail = startupBlockDetail,
+            showBlockingSpinner = showStartupSpinner,
+        )
     }
 
     // ---------------------------------------------------------------------
@@ -812,7 +617,7 @@ object SurveyAppRoot {
     }
 
     // ---------------------------------------------------------------------
-    // UI Components
+    // UI Components (feature-specific)
     // ---------------------------------------------------------------------
 
     @Composable
@@ -963,55 +768,6 @@ object SurveyAppRoot {
 
                 Button(onClick = onBack) {
                     Text("Back")
-                }
-            }
-        }
-    }
-
-    @Composable
-    private fun CompactTopBar(
-        title: String,
-        canPop: Boolean,
-        onBack: () -> Unit,
-    ) {
-        val barHeight = 44.dp
-
-        Surface(
-            modifier = Modifier.fillMaxWidth(),
-            tonalElevation = 2.dp,
-            color = MaterialTheme.colorScheme.surface,
-        ) {
-            Column(modifier = Modifier.fillMaxWidth()) {
-                Spacer(modifier = Modifier.windowInsetsTopHeight(WindowInsets.statusBars))
-
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .height(barHeight)
-                        .padding(horizontal = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.Start,
-                ) {
-                    if (canPop) {
-                        IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
-                            Icon(
-                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "Back",
-                            )
-                        }
-                    } else {
-                        Spacer(modifier = Modifier.size(40.dp))
-                    }
-
-                    Text(
-                        text = title,
-                        style = MaterialTheme.typography.titleSmall,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier
-                            .padding(start = 6.dp)
-                            .weight(1f),
-                    )
                 }
             }
         }
@@ -1227,7 +983,7 @@ object SurveyAppRoot {
         if (ms < 1_000L) return "${ms}ms"
         val sec = ms / 1_000.0
         if (sec < 60.0) return String.format(Locale.US, "%.1fs", sec)
-        val m = (ms / 60_000L)
+        val m = ms / 60_000L
         val s = (ms / 1_000L) % 60
         return String.format(Locale.US, "%dm %02ds", m, s)
     }
@@ -1243,7 +999,9 @@ object SurveyAppRoot {
         if (trimmed.isEmpty()) return "unknown"
         val safe = buildString {
             for (c in trimmed) {
-                if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') append(c)
+                if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') {
+                    append(c)
+                }
                 if (length >= 32) break
             }
         }
