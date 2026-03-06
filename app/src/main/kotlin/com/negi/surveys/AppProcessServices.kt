@@ -91,28 +91,21 @@ object AppProcessServices {
                         RepoMode.ON_DEVICE -> {
                             // IMPORTANT:
                             // - Avoid logging raw model outputs in production.
-                            // - SlmRepository still keeps some legacy constructor / debug names
-                            //   for source compatibility, but the intended protocol here is:
-                            //   Step-1 Assessment -> Step-2 Follow-up.
+                            // - Step-1 Assessment streaming should stay OFF by default unless
+                            //   a deliberate debug/dev switch enables it.
                             val twoStepAssessmentEnabled = true
 
                             val dbg =
                                 SlmRepository.DebugConfig(
-                                    // NOTE:
-                                    // - enabled controls debug logs.
-                                    // - streamEvalOutputToClient is a legacy property name kept by SlmRepository.
-                                    //   Its semantic meaning is "stream Step-1 Assessment output to the caller/UI".
-                                    enabled = true,
-                                    streamEvalOutputToClient = true,
+                                    enabled = BuildConfig.DEBUG,
+                                    streamEvalOutputToClient = false,
                                 )
-
-                            val streamAssessmentToClient = dbg.streamEvalOutputToClient
 
                             SafeLog.i(
                                 TAG,
                                 "repository: creating SlmRepository " +
                                         "twoStepAssessment=$twoStepAssessmentEnabled " +
-                                        "streamAssessment=$streamAssessmentToClient " +
+                                        "streamAssessment=${dbg.streamEvalOutputToClient} " +
                                         "dbgLogs=${dbg.enabled}",
                             )
 
@@ -143,6 +136,14 @@ object AppProcessServices {
 
         createdNow?.let { created ->
             SafeLog.i(TAG, "repository: (re)created mode=$mode type=${created.javaClass.simpleName}")
+
+            // Rebind cached warmup inputs to the current repository when possible.
+            if (mode == RepoMode.ON_DEVICE) {
+                rebindWarmupInputsToCurrentRepoBestEffort(
+                    context = appCtx,
+                    repo = created,
+                )
+            }
         }
 
         return installed
@@ -164,6 +165,11 @@ object AppProcessServices {
      *
      * Privacy:
      * - Never log file paths.
+     *
+     * Notes:
+     * - The cached file/options are treated as durable hints.
+     * - The repository inside cached inputs may become stale after a repo swap,
+     *   so controller restore should always try to rebind to the current repo.
      */
     private val warmupInputsRef = AtomicReference<WarmupController.Inputs?>(null)
 
@@ -194,9 +200,14 @@ object AppProcessServices {
                 warmupRef.set(created)
                 warmupModeRef.set(mode)
 
-                // Apply cached inputs if we have them (ON_DEVICE only).
+                // Restore cached inputs only when they can be safely rebound
+                // to the current ON_DEVICE repository.
                 if (mode == RepoMode.ON_DEVICE) {
-                    created.updateInputs(warmupInputsRef.get())
+                    created.updateInputs(
+                        resolveWarmupInputsForCurrentRepoOrNull(
+                            context = appCtx,
+                        ),
+                    )
                 } else {
                     created.updateInputs(null)
                 }
@@ -218,7 +229,7 @@ object AppProcessServices {
      * Updates warmup inputs explicitly.
      *
      * Recommended usage:
-     * - Call this from SurveyAppRoot once modelFile + warmup-capable repo are resolved.
+     * - Call this from orchestration code once modelFile + warmup-capable repo are resolved.
      *
      * Privacy:
      * - Never logs file path or file name.
@@ -240,11 +251,12 @@ object AppProcessServices {
      * Convenience helper:
      * - Builds Inputs using the current process-scoped repository if it implements
      *   WarmupCapableRepository.
-     * - Does not use reflection guessing. If unsupported, installs null inputs.
+     * - Does not use reflection guessing.
      *
      * Notes:
      * - This is best-effort.
-     * - The recommended path is calling updateWarmupInputs() with an explicit warmup repo.
+     * - If requirements are not met, it keeps the previous inputs instead of clearing them.
+     * - The recommended path is still calling updateWarmupInputs() with explicit inputs.
      */
     fun updateWarmupInputsBestEffort(
         context: Context,
@@ -253,14 +265,13 @@ object AppProcessServices {
         options: WarmupController.Options = WarmupController.Options(),
     ) {
         if (mode != RepoMode.ON_DEVICE) {
-            updateWarmupInputs(null)
+            SafeLog.d(TAG, "warmupInputs: skip best-effort update (mode=$mode)")
             return
         }
 
         val fileOk = modelFile != null && modelFile.exists() && modelFile.isFile && modelFile.length() > 0L
         if (!fileOk) {
-            SafeLog.w(TAG, "warmupInputs: file not ready; installing null inputs")
-            updateWarmupInputs(null)
+            SafeLog.w(TAG, "warmupInputs: file not ready; keeping previous inputs")
             return
         }
 
@@ -268,7 +279,6 @@ object AppProcessServices {
         val warmupRepo = repo as? WarmupController.WarmupCapableRepository
         if (warmupRepo == null) {
             SafeLog.w(TAG, "warmupInputs: repo is not WarmupCapableRepository type=${repo.javaClass.simpleName}")
-            updateWarmupInputs(null)
             return
         }
 
@@ -284,40 +294,147 @@ object AppProcessServices {
     /**
      * Creates WarmupController in a way that:
      * - Never blocks on environment resolution at creation time.
-     * - Never throws.
+     * - Tries hard not to throw to callers.
      *
      * Strategy:
      * - FAKE mode uses a fake engine immediately.
      * - ON_DEVICE mode uses SLMWarmupEngine that waits for Inputs via updateInputs().
+     * - If creation fails, fall back to a fake controller.
      */
-    private fun createWarmupControllerBestEffort(appCtx: Context, mode: RepoMode): WarmupController {
+    private fun createWarmupControllerBestEffort(
+        appCtx: Context,
+        mode: RepoMode,
+    ): WarmupController {
         val warmupLogger: (String) -> Unit = { msg ->
             // Sanitize any engine message to avoid leaking URLs / paths / tokens / filenames.
             SafeLog.d(TAG_WARMUP_LOG, sanitizeWarmupLog(msg))
         }
 
-        return when (mode) {
-            RepoMode.FAKE -> {
-                WarmupController.createFake(
-                    context = appCtx,
-                    logger = warmupLogger,
-                )
-            }
-
-            RepoMode.ON_DEVICE -> {
-                val engine: WarmupController.Engine =
-                    SLMWarmupEngine(
+        return runCatching {
+            when (mode) {
+                RepoMode.FAKE -> {
+                    WarmupController.createFake(
+                        context = appCtx,
                         logger = warmupLogger,
-                        externalScope = warmupEngineScope,
                     )
+                }
 
-                WarmupController.createDefault(
-                    context = appCtx,
-                    engine = engine,
-                    logger = warmupLogger,
-                )
+                RepoMode.ON_DEVICE -> {
+                    val engine: WarmupController.Engine =
+                        SLMWarmupEngine(
+                            logger = warmupLogger,
+                            externalScope = warmupEngineScope,
+                        )
+
+                    WarmupController.createDefault(
+                        context = appCtx,
+                        engine = engine,
+                        logger = warmupLogger,
+                    )
+                }
             }
+        }.getOrElse { t ->
+            SafeLog.e(
+                TAG,
+                "createWarmupControllerBestEffort: fallback to fake " +
+                        "errType=${t::class.java.simpleName} at=${t.toStackHint()}",
+            )
+
+            WarmupController.createFake(
+                context = appCtx,
+                logger = warmupLogger,
+            )
         }
+    }
+
+    /**
+     * Resolves cached warmup inputs rebound to the current repository when possible.
+     *
+     * Returns null when:
+     * - There are no cached inputs
+     * - The cached file is no longer valid
+     * - The current repo is missing or not warmup-capable
+     *
+     * Privacy:
+     * - Never logs file paths or names.
+     */
+    private fun resolveWarmupInputsForCurrentRepoOrNull(
+        context: Context,
+    ): WarmupController.Inputs? {
+        val cached = warmupInputsRef.get() ?: return null
+        val file = cached.file
+
+        val fileOk = runCatching {
+            file.exists() && file.isFile && file.length() > 0L
+        }.getOrDefault(false)
+
+        if (!fileOk) {
+            SafeLog.w(TAG, "warmupInputs: cached file not ready; skipping restore")
+            return null
+        }
+
+        val repo = repoRef.get() ?: return null
+        val repoMode = repoModeRef.get()
+        if (repoMode != RepoMode.ON_DEVICE) return null
+
+        val warmupRepo = repo as? WarmupController.WarmupCapableRepository
+        if (warmupRepo == null) {
+            SafeLog.w(TAG, "warmupInputs: current repo not warmup-capable; skipping restore")
+            return null
+        }
+
+        return WarmupController.Inputs(
+            file = file,
+            repository = warmupRepo,
+            options = cached.options,
+        )
+    }
+
+    /**
+     * Rebinds cached warmup inputs to the currently installed ON_DEVICE repo.
+     *
+     * Notes:
+     * - This keeps cached inputs aligned after repository recreation.
+     * - If rebinding fails, previous cached inputs are left untouched.
+     */
+    private fun rebindWarmupInputsToCurrentRepoBestEffort(
+        context: Context,
+        repo: ChatValidation.RepositoryI,
+    ) {
+        val cached = warmupInputsRef.get() ?: return
+        val file = cached.file
+
+        val fileOk = runCatching {
+            file.exists() && file.isFile && file.length() > 0L
+        }.getOrDefault(false)
+
+        if (!fileOk) {
+            SafeLog.w(TAG, "warmupInputs: cached file not ready; skip repo rebind")
+            return
+        }
+
+        val warmupRepo = repo as? WarmupController.WarmupCapableRepository
+        if (warmupRepo == null) {
+            SafeLog.w(TAG, "warmupInputs: recreated repo not warmup-capable; skip repo rebind")
+            return
+        }
+
+        val rebound =
+            WarmupController.Inputs(
+                file = file,
+                repository = warmupRepo,
+                options = cached.options,
+            )
+
+        warmupInputsRef.set(rebound)
+
+        val controller = warmupRef.get()
+        val mode = warmupModeRef.get()
+        if (controller != null && mode == RepoMode.ON_DEVICE) {
+            controller.updateInputs(rebound)
+        }
+
+        SafeLog.i(TAG, "warmupInputs: rebound to current repository")
     }
 
     // ---------------------------------------------------------------------
@@ -335,7 +452,10 @@ object AppProcessServices {
     // Keep the last non-null spec so later callers can pass null without clobbering config.
     private val lastModelSpecRef = AtomicReference<ModelDownloadSpec?>(null)
 
-    fun modelDownloader(context: Context, spec: ModelDownloadSpec?): ModelDownloadController {
+    fun modelDownloader(
+        context: Context,
+        spec: ModelDownloadSpec?,
+    ): ModelDownloadController {
         val appCtx = context.applicationContext
 
         val effectiveSpec =

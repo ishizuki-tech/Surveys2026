@@ -1065,31 +1065,42 @@ object SurveyConfigLoader {
     private const val LOG_CONFIG_PROMPT_PREVIEW: Boolean = false
 
     // ---------------------------------------------------------------------
-    // Process-wide config singleton (installed by SurveyAppRoot)
+    // Process-wide config singleton (installed by Application)
     // ---------------------------------------------------------------------
-    private val installedConfig: AtomicReference<SurveyConfig?> = AtomicReference(null)
 
     /**
-     * Installs a process-wide SurveyConfig loaded by the app root.
+     * Installs a process-wide SurveyConfig.
      *
-     * Why:
-     * - Avoid re-reading assets multiple times (e.g., warmup/modelResolver paths).
-     * - Make SurveyAppRoot the single source of truth.
+     * Contract:
+     * - First successful install wins for the process lifetime.
+     * - Later install attempts are ignored.
+     * - Intended for single-process app usage (not multi-process sharing).
      *
      * Notes:
-     * - Safe to call multiple times; latest wins.
-     * - Intended for single-process app usage (not multi-process sharing).
+     * - Application remains the owner of the initial install.
+     * - Test code may use explicit test-only replacement APIs.
      */
     fun installProcessConfig(cfg: SurveyConfig) {
-        installedConfig.set(cfg)
+        when (InstalledSurveyConfigStore.installOnce(cfg)) {
+            InstalledSurveyConfigStore.InstallResult.INSTALLED -> Unit
+            InstalledSurveyConfigStore.InstallResult.ALREADY_INSTALLED -> {
+                AppLog.w(TAG, "installProcessConfig: ignored duplicate process install")
+            }
+        }
     }
 
     /** Returns the installed process config if present, otherwise null. */
-    fun getInstalledConfigOrNull(): SurveyConfig? = installedConfig.get()
+    fun getInstalledConfigOrNull(): SurveyConfig? =
+        InstalledSurveyConfigStore.getOrNull()
 
     /** Clears the installed config (tests only). */
     fun clearInstalledConfigForTests() {
-        installedConfig.set(null)
+        InstalledSurveyConfigStore.clearForTests()
+    }
+
+    /** Replaces the installed config (tests only). */
+    fun replaceInstalledConfigForTests(cfg: SurveyConfig) {
+        InstalledSurveyConfigStore.replaceForTests(cfg)
     }
 
     internal data class FormatDecision(
