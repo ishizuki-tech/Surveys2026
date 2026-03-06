@@ -668,7 +668,7 @@ $followUpSection
         }
 
         fun flush(force: Boolean): String? {
-            if (buffer.length == 0) return null
+            if (buffer.isEmpty()) return null
 
             if (!force) {
                 val now = SystemClock.uptimeMillis()
@@ -704,7 +704,7 @@ $followUpSection
         if (t.length <= n) return t
 
         var end = n
-        if (end > 0 && end < t.length) {
+        if (end > 0) {
             val last = t[end - 1]
             val next = t[end]
             if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {

@@ -138,6 +138,7 @@ object SurveyAppRoot {
      */
     private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
     private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
+    private const val STARTUP_AFTER_FIRST_FRAME_DELAY_MS: Long = 150L
 
     // ---------------------------------------------------------------------
     // Models / Formatting
@@ -283,13 +284,16 @@ object SurveyAppRoot {
             val t0 = SystemClock.elapsedRealtime()
             SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
 
-            val deadline = t0 + INSTALLED_CONFIG_WAIT_MS
-            var cfg: SurveyConfig? = null
+            val cfg = withContext(Dispatchers.Default) {
+                val deadline = t0 + INSTALLED_CONFIG_WAIT_MS
+                var installed: SurveyConfig? = null
 
-            while (SystemClock.elapsedRealtime() < deadline && cfg == null) {
-                cfg = SurveyConfigLoader.getInstalledConfigOrNull()
-                if (cfg != null) break
-                delay(INSTALLED_CONFIG_POLL_MS)
+                while (SystemClock.elapsedRealtime() < deadline && installed == null) {
+                    installed = SurveyConfigLoader.getInstalledConfigOrNull()
+                    if (installed != null) break
+                    delay(INSTALLED_CONFIG_POLL_MS)
+                }
+                installed
             }
 
             if (cfg != null) {
@@ -376,9 +380,9 @@ object SurveyAppRoot {
         }
 
         // Collect state ONCE at root to avoid duplicate subscriptions.
+        val rootModelState: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
         val rootPrefetchState: WarmupController.PrefetchState by warmup.prefetchState.collectAsStateWithLifecycle()
         val rootCompileState: WarmupController.CompileState by warmup.compileState.collectAsStateWithLifecycle()
-        val rootModelState: ModelDownloadController.ModelState by modelDownloader.state.collectAsStateWithLifecycle()
 
         // Keep stable state containers for NavEntry lambdas.
         val rootModelStateState: State<ModelDownloadController.ModelState> = rememberUpdatedState(rootModelState)
@@ -440,6 +444,11 @@ object SurveyAppRoot {
                                     t
                                 )
                             }
+                        } else {
+                            SafeLog.w(
+                                TAG,
+                                "RetryAll: skip model ensure (modelSpecKey missing)",
+                            )
                         }
                     }
 
@@ -452,7 +461,7 @@ object SurveyAppRoot {
                             )
                         }
 
-                    if (onDeviceEnabled) {
+                    if (onDeviceEnabled && key != null) {
                         runCatching { warmup.requestCompileAfterPrefetch(reason = "uiRetry") }
                             .onFailure { t ->
                                 SafeLog.e(
@@ -461,6 +470,11 @@ object SurveyAppRoot {
                                     t
                                 )
                             }
+                    } else if (onDeviceEnabled) {
+                        SafeLog.w(
+                            TAG,
+                            "RetryAll: skip warmup compile request (modelSpecKey missing)",
+                        )
                     }
                 }
             }
@@ -476,7 +490,7 @@ object SurveyAppRoot {
 
             // Wait for the first frame to avoid blocking initial composition.
             withFrameNanos { /* first frame */ }
-            delay(150L)
+            delay(STARTUP_AFTER_FIRST_FRAME_DELAY_MS)
 
             runCatching {
                 modelDownloader.ensureModelOnce(
@@ -489,14 +503,32 @@ object SurveyAppRoot {
             }
         }
 
-        LaunchedEffect(rootModelState, onDeviceEnabled, warmup) {
+        var compileRequestedForCurrentReady by remember(modelSpecKey, warmup, onDeviceEnabled) {
+            mutableStateOf(false)
+        }
+
+        LaunchedEffect(rootModelState, onDeviceEnabled, warmup, modelSpecKey) {
             if (!onDeviceEnabled) return@LaunchedEffect
-            if (rootModelState is ModelDownloadController.ModelState.Ready) {
-                SafeLog.i(TAG, "Model Ready -> request warmup compileAfterPrefetch")
-                runCatching {
-                    warmup.requestCompileAfterPrefetch(reason = "modelReady")
-                }.onFailure { t ->
-                    SafeLog.e(TAG, "Warmup request failed (non-fatal) type=${t::class.java.simpleName}", t)
+
+            when (rootModelState) {
+                is ModelDownloadController.ModelState.Ready -> {
+                    if (compileRequestedForCurrentReady) {
+                        SafeLog.d(TAG, "Model Ready -> warmup already requested for current ready cycle")
+                        return@LaunchedEffect
+                    }
+
+                    compileRequestedForCurrentReady = true
+                    SafeLog.i(TAG, "Model Ready -> request warmup compileAfterPrefetch")
+
+                    runCatching {
+                        warmup.requestCompileAfterPrefetch(reason = "modelReady")
+                    }.onFailure { t ->
+                        SafeLog.e(TAG, "Warmup request failed (non-fatal) type=${t::class.java.simpleName}", t)
+                    }
+                }
+
+                else -> {
+                    compileRequestedForCurrentReady = false
                 }
             }
         }
@@ -824,18 +856,21 @@ object SurveyAppRoot {
                         elapsedMs = prefetchElapsedMs,
                         format = WARMUP_UI_FORMAT_GATE,
                     )
+
                 compileState is WarmupController.CompileState.WaitingForPrefetch ->
                     compileLabelForUi(
                         compileState,
                         elapsedMs = compileElapsedMs,
                         format = WARMUP_UI_FORMAT_GATE,
                     )
+
                 compileState is WarmupController.CompileState.Compiling ->
                     compileLabelForUi(
                         compileState,
                         elapsedMs = compileElapsedMs,
                         format = WARMUP_UI_FORMAT_GATE,
                     )
+
                 else -> WARMUP_UI_FORMAT_GATE.idleLabel
             }
         }
@@ -879,23 +914,32 @@ object SurveyAppRoot {
                     when (modelState) {
                         is ModelDownloadController.ModelState.Downloading ->
                             "Downloading the model file. Keep the app open (first run may take a while)."
+
                         is ModelDownloadController.ModelState.Checking ->
                             "Checking local model file…"
+
                         is ModelDownloadController.ModelState.NotConfigured ->
                             "Model URL is not configured in SurveyConfig."
+
                         is ModelDownloadController.ModelState.Failed ->
                             "Download failed. Check connectivity / credentials / configuration."
+
                         is ModelDownloadController.ModelState.Cancelled ->
                             "Download cancelled."
+
                         else -> when (compileState) {
                             is WarmupController.CompileState.WaitingForPrefetch ->
                                 "Waiting for prefetch to complete before compilation."
+
                             is WarmupController.CompileState.Compiling ->
                                 "Compiling/initializing the model. UI may stutter briefly."
+
                             is WarmupController.CompileState.Failed ->
                                 "Warmup compile failed. Try retry."
+
                             is WarmupController.CompileState.Cancelled ->
                                 "Warmup compile cancelled. Try retry."
+
                             else -> ""
                         }
                     }
@@ -1059,6 +1103,7 @@ object SurveyAppRoot {
                     "Downloading ${formatElapsed(state.elapsedMs)}"
                 }
             }
+
             is ModelDownloadController.ModelState.Ready -> "Ready"
             is ModelDownloadController.ModelState.Failed -> "Failed"
             is ModelDownloadController.ModelState.Cancelled -> "Cancelled"

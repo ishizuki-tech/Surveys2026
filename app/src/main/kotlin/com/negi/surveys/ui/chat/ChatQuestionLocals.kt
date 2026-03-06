@@ -17,7 +17,7 @@ import androidx.compose.runtime.staticCompositionLocalOf
 import com.negi.surveys.chat.ChatValidation
 
 /**
- * Required CompositionLocal for [RepositoryI].
+ * Required CompositionLocal for [com.negi.surveys.chat.ChatValidation.RepositoryI].
  *
  * Design:
  * - Non-nullable to prevent silent fallback creation.

@@ -35,13 +35,13 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.channels.awaitClose
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.buffer
 import kotlinx.coroutines.flow.callbackFlow
 import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
-import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
@@ -55,7 +55,7 @@ import org.json.JSONObject
  * - buildPrompt() MUST NOT perform I/O (it is non-suspend and may be called on main thread).
  * - SurveyConfig should come from a single source (installed config).
  * - Optional asset fallback is allowed ONLY in suspend paths and must never auto-install config.
- * - Prompt composition is delegated to [SlmPromptBuilder] for single-source prompt contract.
+ * - Prompt composition is delegated to [SlmPromptBuilderI] for single-source prompt contract.
  *
  * Warmup notes:
  * - WarmupController/SLMWarmupEngine will attempt to warm the repository by calling [warmup].
@@ -112,6 +112,15 @@ class SlmRepository(
 
         /** Max chars logged for result text (when clipped logging is enabled). */
         val maxResultLogChars: Int = 2_000,
+
+        /**
+         * If true, stream Step-1 (Eval) output to the caller flow.
+         *
+         * IMPORTANT:
+         * - This changes the output stream (Eval output may appear before Follow-up output).
+         * - Keep this OFF in production unless UI expects it.
+         */
+        val streamEvalOutputToClient: Boolean = true,
     ) {
         fun normalized(): DebugConfig {
             return copy(
@@ -152,8 +161,7 @@ class SlmRepository(
      * Phase-aware prompt building.
      *
      * IMPORTANT:
-     * - Validation prompts (from AnswerValidator) are already "strict JSON-only" prompts.
-     *   We still wrap them with the system prompt via buildAnswerLikePrompt() for consistency.
+     * - Validation prompts may already be "strict JSON-only" prompts.
      * - We do NOT inject any PHASE markers into the prompt text here.
      */
     override fun buildPrompt(userPrompt: String, phase: ChatValidation.PromptPhase): String {
@@ -173,7 +181,6 @@ class SlmRepository(
         if (input.isBlank()) return emptyFlow()
 
         val cfg = getConfigSuspendBestEffort()
-
         val file = resolveModelFile(cfg)
         val stat = safeFileStat(file)
 
@@ -187,7 +194,7 @@ class SlmRepository(
 
         // IMPORTANT:
         // - Do not run heavy initialization on the main thread.
-        // - warmup() path may run inside an EGL context; therefore init itself must not hop threads.
+        // - warmup() path may run inside an EGL context; therefore init itself must not hop threads there.
         withContext(Dispatchers.Default) {
             awaitInitializedModelOnce(
                 model = model,
@@ -195,53 +202,17 @@ class SlmRepository(
             )
         }
 
-        // ------------------------------------------------------------
-        // Validator verdict prompt bypass:
-        // - AnswerValidator sends a model-ready prompt that must return ONE JSON verdict
-        //   (with "assistantMessage" key). This must NOT enter the two-step eval flow.
-        // ------------------------------------------------------------
-        if (isValidationVerdictPrompt(input)) {
-            if (resetConversationEachRequest) {
-                resetConversationBestEffort(model, reason = "validatorVerdict")
-            }
-            return requestOneStep(model = model, prompt = input)
-        }
-
-        // Legacy/chat behavior:
-        // - Treat [input] as "userPrompt" and run the repo's orchestration (two-step or one-step).
-        val userPrompt = input
-
         return if (enableTwoStepEval) {
-            requestEvalScoreThenFollowUp(model = model, userPrompt = userPrompt)
+            requestEvalScoreThenFollowUp(model = model, userPrompt = input)
         } else {
             val sys = runCatching { cfg?.composeSystemPrompt() }
                 .getOrNull()
                 ?.trim()
                 ?.takeIf { it.isNotBlank() }
 
-            val p = promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = userPrompt)
+            val p = promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = input)
             requestOneStep(model = model, prompt = p)
         }
-    }
-
-    /**
-     * Heuristic detector for AnswerValidator's "verdict" prompts.
-     *
-     * Rationale:
-     * - We intentionally do NOT rely on "PHASE=..." markers in prompt text.
-     * - Verdict prompts must output JSON containing "assistantMessage".
-     * - Two-step follow-up JSON schema does NOT include "assistantMessage".
-     *
-     * IMPORTANT:
-     * - Keep this conservative to avoid breaking chat prompts.
-     */
-    private fun isValidationVerdictPrompt(modelReadyPrompt: String): Boolean {
-        // The prompt may be wrapped by buildAnswerLikePrompt(), so we scan the whole text.
-        if (!modelReadyPrompt.contains("Return exactly ONE JSON object", ignoreCase = false)) return false
-        if (!modelReadyPrompt.contains("\"assistantMessage\"")) return false
-        if (!modelReadyPrompt.contains("\"followUpQuestion\"")) return false
-        if (!modelReadyPrompt.contains("\"status\"")) return false
-        return true
     }
 
     /**
@@ -261,13 +232,15 @@ class SlmRepository(
 
         val stat = safeFileStat(modelFile)
         if (!stat.exists || !stat.isFile || stat.length <= 0L) {
-            AppLog.w(TAG, "warmup: skipped (model file missing/empty) exists=${stat.exists} isFile=${stat.isFile} len=${stat.length}")
+            AppLog.w(
+                TAG,
+                "warmup: skipped (model file missing/empty) exists=${stat.exists} isFile=${stat.isFile} len=${stat.length}",
+            )
             return false
         }
 
         return runCatching {
             val model = getOrCreateModel(cfg = cfg, file = modelFile)
-
             awaitInitializedModelOnce(
                 model = model,
                 initOptions = InitOptions.fromWarmupOptions(options),
@@ -300,170 +273,157 @@ class SlmRepository(
         val u = userPrompt.trim()
         if (u.isBlank()) return emptyFlow()
 
-        return callbackFlow {
-            val closed = AtomicBoolean(false)
-            val terminal = AtomicBoolean(false)
-            val gate = gateFor(model)
-            val gatePermit = CompletableDeferred<Unit>()
+        return streamingFlow(model = model) { emit, closeOk, closeErr ->
+            val traceId = UUID.randomUUID().toString().take(8)
+            val streamEvalToClient = dbg.streamEvalOutputToClient
 
-            fun closeOnce(cause: Throwable? = null) {
-                if (closed.compareAndSet(false, true)) {
-                    terminal.set(true)
-                    if (cause == null) close() else close(cause)
-                }
+            val questionId = extractQuestionId(u) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
+
+            // ----------------------------
+            // Step 1: Eval score (optional streaming)
+            // ----------------------------
+            if (resetConversationEachRequest) {
+                resetConversationBestEffort(model, reason = "evalScore")
             }
 
-            val job = launch(Dispatchers.Default) {
-                val traceId = UUID.randomUUID().toString().take(8)
-                try {
-                    gate.withPermit {
-                        gatePermit.complete(Unit)
+            val evalPrompt = promptBuilder.buildEvalScorePrompt(
+                questionId = questionId,
+                userPrompt = u,
+                acceptScoreThreshold = acceptScoreThreshold,
+                userPromptMaxChars = EVAL_USER_PROMPT_MAX_CHARS,
+            )
 
-                        val questionId = extractQuestionId(u) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
+            dbgLogPrompt(
+                traceId = traceId,
+                step = "EVAL PHASE",
+                questionId = questionId,
+                prompt = evalPrompt,
+            )
 
-                        // ----------------------------
-                        // Step 1: Eval score (internal)
-                        // ----------------------------
-                        if (resetConversationEachRequest) {
-                            resetConversationBestEffort(model, reason = "evalScore")
+            if (streamEvalToClient) {
+                emit(STREAM_EVAL_PREFIX)
+            }
+
+            val evalResult = runSdkAndCollectWithBudget(
+                model = model,
+                input = evalPrompt,
+                timeoutMs = EVAL_TIMEOUT_MS,
+                maxChars = EVAL_MAX_CHARS,
+                onDelta = if (streamEvalToClient) { chunk ->
+                    if (chunk.isNotEmpty()) emit(chunk)
+                } else {
+                    null
+                },
+            )
+
+            dbgLogResult(
+                traceId = traceId,
+                step = "EVAL PHASE",
+                questionId = questionId,
+                reason = evalResult.reason,
+                isEarlyStop = evalResult.isEarlyStop,
+                text = evalResult.text,
+            )
+
+            val evalJsonRaw = extractFirstCompleteJsonObjectBestEffort(evalResult.text)
+            val evalParsed = parseEvalScoreBestEffort(evalJsonRaw)
+
+            dbgLogJsonExtraction(
+                traceId = traceId,
+                step = "EVAL PHASE",
+                questionId = questionId,
+                raw = evalResult.text,
+                extractedJson = evalJsonRaw,
+                parsedStatus = evalParsed.status,
+                parsedScore = evalParsed.score,
+            )
+
+            AppLog.d(
+                TAG,
+                "eval done: trace=$traceId qid=$questionId score=${evalParsed.score ?: -1} " +
+                        "status=${evalParsed.status ?: "?"} reason=${evalResult.reason} earlyStop=${evalResult.isEarlyStop}",
+            )
+
+            if (streamEvalToClient) {
+                val s = evalParsed.status ?: "?"
+                val sc = evalParsed.score ?: -1
+                emit("\n$STREAM_EVAL_RESULT_PREFIX status=$s score=$sc\n")
+                emit(STREAM_FOLLOWUP_PREFIX)
+            }
+
+            if (evalResult.isEarlyStop) {
+                delay(EARLY_STOP_STABILIZE_DELAY_MS)
+            }
+
+            // ----------------------------
+            // Step 2: Follow-up question (streamed)
+            // ----------------------------
+            if (resetConversationEachRequest) {
+                resetConversationBestEffort(model, reason = "followUp")
+            }
+
+            val followUpPrompt = promptBuilder.buildFollowUpPrompt(
+                questionId = questionId,
+                userPrompt = u,
+                evalJson = evalJsonRaw ?: evalResult.text,
+                acceptScoreThreshold = acceptScoreThreshold,
+                userPromptMaxChars = FOLLOWUP_USER_PROMPT_MAX_CHARS,
+                evalJsonMaxChars = FOLLOWUP_EVAL_JSON_MAX_CHARS,
+            )
+
+            dbgLogPrompt(
+                traceId = traceId,
+                step = "FOLLOWUP PHASE",
+                questionId = questionId,
+                prompt = followUpPrompt,
+            )
+
+            val s2Buffer = if (dbg.enabled) StringBuilder(1024) else null
+            val s2MaxCapture = if (dbg.enabled) (dbg.maxResultLogChars.coerceAtLeast(1024)) else 0
+
+            runSdkAndStream(
+                model = model,
+                input = followUpPrompt,
+                onDelta = { chunk ->
+                    if (chunk.isNotEmpty()) {
+                        if (s2Buffer != null && s2Buffer.length < s2MaxCapture) {
+                            val remaining = s2MaxCapture - s2Buffer.length
+                            if (remaining > 0) {
+                                if (chunk.length <= remaining) s2Buffer.append(chunk)
+                                else s2Buffer.append(chunk.take(remaining))
+                            }
                         }
-
-                        val evalPrompt = promptBuilder.buildEvalScorePrompt(
-                            questionId = questionId,
-                            userPrompt = u,
-                            acceptScoreThreshold = acceptScoreThreshold,
-                            userPromptMaxChars = EVAL_USER_PROMPT_MAX_CHARS,
-                        )
-
-                        dbgLogPrompt(
-                            traceId = traceId,
-                            step = "EVAL PHASE",
-                            questionId = questionId,
-                            prompt = evalPrompt,
-                        )
-
-                        val evalResult = runSdkAndCollectWithBudget(
-                            model = model,
-                            input = evalPrompt,
-                            timeoutMs = EVAL_TIMEOUT_MS,
-                            maxChars = EVAL_MAX_CHARS,
-                        )
-
+                        emit(chunk)
+                    }
+                },
+                onTerminal = { msg ->
+                    if (s2Buffer != null) {
                         dbgLogResult(
-                            traceId = traceId,
-                            step = "EVAL PHASE",
-                            questionId = questionId,
-                            reason = evalResult.reason,
-                            isEarlyStop = evalResult.isEarlyStop,
-                            text = evalResult.text,
-                        )
-
-                        val evalJsonRaw = extractFirstCompleteJsonObjectBestEffort(evalResult.text)
-                        val evalParsed = parseEvalScoreBestEffort(evalJsonRaw)
-
-                        dbgLogJsonExtraction(
-                            traceId = traceId,
-                            step = "EVAL PHASE",
-                            questionId = questionId,
-                            raw = evalResult.text,
-                            extractedJson = evalJsonRaw,
-                            parsedStatus = evalParsed.status,
-                            parsedScore = evalParsed.score,
-                        )
-
-                        AppLog.d(
-                            TAG,
-                            "eval done: trace=$traceId qid=$questionId score=${evalParsed.score ?: -1} " +
-                                    "status=${evalParsed.status ?: "?"} reason=${evalResult.reason} earlyStop=${evalResult.isEarlyStop}",
-                        )
-
-                        if (evalResult.isEarlyStop) {
-                            delay(EARLY_STOP_STABILIZE_DELAY_MS)
-                        }
-
-                        // ----------------------------
-                        // Step 2: Follow-up question (streamed)
-                        // ----------------------------
-                        if (resetConversationEachRequest) {
-                            resetConversationBestEffort(model, reason = "followUp")
-                        }
-
-                        val followUpPrompt = promptBuilder.buildFollowUpPrompt(
-                            questionId = questionId,
-                            userPrompt = u,
-                            evalJson = evalJsonRaw ?: evalResult.text,
-                            acceptScoreThreshold = acceptScoreThreshold,
-                            userPromptMaxChars = FOLLOWUP_USER_PROMPT_MAX_CHARS,
-                            evalJsonMaxChars = FOLLOWUP_EVAL_JSON_MAX_CHARS,
-                        )
-
-                        dbgLogPrompt(
                             traceId = traceId,
                             step = "FOLLOWUP PHASE",
                             questionId = questionId,
-                            prompt = followUpPrompt,
-                        )
-
-                        val s2Buffer = if (dbg.enabled) StringBuilder(1024) else null
-                        val s2MaxCapture = if (dbg.enabled) (EVAL_MAX_CHARS.coerceAtLeast(1024)) else 0
-
-                        runSdkAndStream(
-                            model = model,
-                            input = followUpPrompt,
-                            onDelta = { chunk ->
-                                if (chunk.isNotEmpty()) {
-                                    if (s2Buffer != null && s2Buffer.length < s2MaxCapture) {
-                                        val remaining = s2MaxCapture - s2Buffer.length
-                                        if (remaining > 0) {
-                                            if (chunk.length <= remaining) s2Buffer.append(chunk)
-                                            else s2Buffer.append(chunk.take(remaining))
-                                        }
-                                    }
-                                    trySend(chunk)
-                                }
-                            },
-                            onTerminal = { msg ->
-                                if (s2Buffer != null) {
-                                    dbgLogResult(
-                                        traceId = traceId,
-                                        step = "FOLLOWUP PHASE",
-                                        questionId = questionId,
-                                        reason = msg,
-                                        isEarlyStop = false,
-                                        text = s2Buffer.toString(),
-                                    )
-                                }
-                                closeOnce()
-                            },
-                            onError = { msg ->
-                                if (s2Buffer != null) {
-                                    dbgLogResult(
-                                        traceId = traceId,
-                                        step = "FOLLOWUP PHASE",
-                                        questionId = questionId,
-                                        reason = "ERROR:$msg",
-                                        isEarlyStop = true,
-                                        text = s2Buffer.toString(),
-                                    )
-                                }
-                                if (msg.equals("Cancelled", ignoreCase = true)) closeOnce()
-                                else closeOnce(IllegalStateException(msg))
-                            },
+                            reason = msg,
+                            isEarlyStop = false,
+                            text = s2Buffer.toString(),
                         )
                     }
-                } catch (ce: CancellationException) {
-                    closeOnce()
-                } catch (t: Throwable) {
-                    closeOnce(t)
-                }
-            }
-
-            awaitClose {
-                if (!terminal.get() && gatePermit.isCompleted) {
-                    runCatching { SLM.cancel(model) }
-                }
-                job.cancel()
-            }
+                    closeOk()
+                },
+                onError = { msg ->
+                    if (s2Buffer != null) {
+                        dbgLogResult(
+                            traceId = traceId,
+                            step = "FOLLOWUP PHASE",
+                            questionId = questionId,
+                            reason = "ERROR:$msg",
+                            isEarlyStop = true,
+                            text = s2Buffer.toString(),
+                        )
+                    }
+                    if (msg.equals("Cancelled", ignoreCase = true)) closeOk()
+                    else closeErr(IllegalStateException(msg))
+                },
+            )
         }
     }
 
@@ -475,57 +435,105 @@ class SlmRepository(
         val p = prompt.trim()
         if (p.isBlank()) return emptyFlow()
 
-        return callbackFlow {
-            val closed = AtomicBoolean(false)
-            val terminal = AtomicBoolean(false)
-            val gate = gateFor(model)
-            val gatePermit = CompletableDeferred<Unit>()
+        return streamingFlow(model = model) { emit, closeOk, closeErr ->
+            if (resetConversationEachRequest) {
+                resetConversationBestEffort(model, reason = "oneStep")
+            }
 
+            runSdkAndStream(
+                model = model,
+                input = p,
+                onDelta = { chunk ->
+                    if (chunk.isNotEmpty()) emit(chunk)
+                },
+                onTerminal = {
+                    closeOk()
+                },
+                onError = { msg ->
+                    if (msg.equals("Cancelled", ignoreCase = true)) closeOk()
+                    else closeErr(IllegalStateException(msg))
+                },
+            )
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Flow scaffolding
+    // ---------------------------------------------------------------------
+
+    /**
+     * Builds a streaming flow guarded by a per-model semaphore.
+     *
+     * Why:
+     * - Avoid concurrent inference on the same model instance.
+     * - Provide consistent cancellation behavior.
+     * - Reduce callbackFlow boilerplate duplication.
+     *
+     * Note:
+     * - We intentionally avoid Semaphore.withPermit() to be resilient to coroutines version differences.
+     */
+    private fun streamingFlow(
+        model: Model,
+        block: suspend (
+            emit: (String) -> Unit,
+            closeOk: () -> Unit,
+            closeErr: (Throwable) -> Unit,
+        ) -> Unit,
+    ): Flow<String> {
+        return callbackFlow {
+            val gate = gateFor(model)
+            val permitAcquired = CompletableDeferred<Unit>()
+
+            val closed = AtomicBoolean(false)
             fun closeOnce(cause: Throwable? = null) {
-                if (closed.compareAndSet(false, true)) {
-                    terminal.set(true)
-                    if (cause == null) close() else close(cause)
+                if (!closed.compareAndSet(false, true)) return
+                if (cause == null) close() else close(cause)
+            }
+
+            fun emitSafely(chunk: String) {
+                if (chunk.isEmpty()) return
+                val r = trySend(chunk)
+                if (r.isSuccess) return
+
+                // Fallback: try a suspending send to reduce drop risk under backpressure.
+                // NOTE: This may enqueue many small sends if callbacks burst; keep buffer capacity reasonable.
+                launch {
+                    runCatching { send(chunk) }
                 }
             }
 
             val job = launch(Dispatchers.Default) {
+                var acquired = false
                 try {
-                    gate.withPermit {
-                        gatePermit.complete(Unit)
+                    gate.acquire()
+                    acquired = true
+                    permitAcquired.complete(Unit)
 
-                        if (resetConversationEachRequest) {
-                            resetConversationBestEffort(model, reason = "oneStep")
-                        }
-
-                        runSdkAndStream(
-                            model = model,
-                            input = p,
-                            onDelta = { chunk ->
-                                if (chunk.isNotEmpty()) trySend(chunk)
-                            },
-                            onTerminal = {
-                                closeOnce()
-                            },
-                            onError = { msg ->
-                                if (msg.equals("Cancelled", ignoreCase = true)) closeOnce()
-                                else closeOnce(IllegalStateException(msg))
-                            },
-                        )
-                    }
-                } catch (ce: CancellationException) {
-                    closeOnce()
+                    block(
+                        { emitSafely(it) },
+                        { closeOnce(null) },
+                        { closeOnce(it) },
+                    )
+                } catch (_: CancellationException) {
+                    closeOnce(null)
                 } catch (t: Throwable) {
                     closeOnce(t)
+                } finally {
+                    if (acquired) {
+                        runCatching { gate.release() }
+                    }
                 }
             }
 
             awaitClose {
-                if (!terminal.get() && gatePermit.isCompleted) {
+                // If inference already started (permit acquired) and the flow is cancelled,
+                // best-effort cancel to stop SDK callbacks.
+                if (permitAcquired.isCompleted && !closed.get()) {
                     runCatching { SLM.cancel(model) }
                 }
                 job.cancel()
             }
-        }
+        }.buffer(STREAM_BUFFER_CAPACITY)
     }
 
     // ---------------------------------------------------------------------
@@ -580,6 +588,7 @@ class SlmRepository(
         input: String,
         timeoutMs: Long,
         maxChars: Int,
+        onDelta: ((String) -> Unit)? = null,
     ): CollectedResult {
         val p = input.trim()
         if (p.isBlank()) {
@@ -600,11 +609,10 @@ class SlmRepository(
         val finished = AtomicBoolean(false)
 
         fun finishOnce(reason: String, earlyStop: Boolean) {
-            if (finished.compareAndSet(false, true)) {
-                reasonRef.set(reason)
-                if (earlyStop) earlyStopRef.set(true)
-                if (!done.isCompleted) done.complete(Unit)
-            }
+            if (!finished.compareAndSet(false, true)) return
+            reasonRef.set(reason)
+            if (earlyStop) earlyStopRef.set(true)
+            if (!done.isCompleted) done.complete(Unit)
         }
 
         runSdkAndStream(
@@ -612,34 +620,45 @@ class SlmRepository(
             input = p,
             onDelta = { chunk ->
                 if (chunk.isEmpty()) return@runSdkAndStream
+                if (finished.get()) return@runSdkAndStream
+
                 val remaining = safeMax - out.length
                 if (remaining <= 0) {
                     earlyStopRef.set(true)
-                    reasonRef.set("MAX_CHARS")
+                    finishOnce(reason = "MAX_CHARS", earlyStop = true)
                     runCatching { SLM.cancel(model) }
                     return@runSdkAndStream
                 }
 
-                if (chunk.length <= remaining) {
+                val appended: String = if (chunk.length <= remaining) {
                     out.append(chunk)
+                    chunk
                 } else {
-                    out.append(chunk.take(remaining))
+                    val part = chunk.take(remaining)
+                    out.append(part)
                     earlyStopRef.set(true)
-                    reasonRef.set("MAX_CHARS")
+                    finishOnce(reason = "MAX_CHARS", earlyStop = true)
                     runCatching { SLM.cancel(model) }
+                    part
+                }
+
+                if (appended.isNotEmpty()) {
+                    runCatching { onDelta?.invoke(appended) }
                 }
             },
-            onTerminal = { mes ->
+            onTerminal = { msg ->
                 val current = reasonRef.get()
-                if (current == "MAX_CHARS") finishOnce(reason = "MAX_CHARS; $mes", earlyStop = true)
-                else finishOnce(reason = "COMPLETED; $mes", earlyStop = false)
+                if (current == "MAX_CHARS") finishOnce(reason = "MAX_CHARS; $msg", earlyStop = true)
+                else finishOnce(reason = "COMPLETED; $msg", earlyStop = false)
             },
             onError = { msg ->
                 val current = reasonRef.get()
                 if (msg.equals("Cancelled", ignoreCase = true)) {
-                    if (current == "MAX_CHARS") finishOnce(reason = "MAX_CHARS; Cancelled", earlyStop = true)
-                    else if (current == "TIMEOUT") finishOnce(reason = "TIMEOUT; Cancelled", earlyStop = true)
-                    else finishOnce(reason = "CANCELLED", earlyStop = true)
+                    when (current) {
+                        "MAX_CHARS" -> finishOnce(reason = "MAX_CHARS; Cancelled", earlyStop = true)
+                        "TIMEOUT" -> finishOnce(reason = "TIMEOUT; Cancelled", earlyStop = true)
+                        else -> finishOnce(reason = "CANCELLED", earlyStop = true)
+                    }
                 } else {
                     errRef.set(msg)
                     finishOnce(reason = "ERROR", earlyStop = true)
@@ -1101,6 +1120,14 @@ class SlmRepository(
         // Follow-up budgets
         private const val FOLLOWUP_USER_PROMPT_MAX_CHARS: Int = 4_000
         private const val FOLLOWUP_EVAL_JSON_MAX_CHARS: Int = 2_000
+
+        // Stream buffering (avoid token drops under bursty callbacks).
+        private const val STREAM_BUFFER_CAPACITY: Int = 64
+
+        // Optional stream markers (Step-1 streaming).
+        private const val STREAM_EVAL_PREFIX: String = "\n[EVAL]\n"
+        private const val STREAM_EVAL_RESULT_PREFIX: String = "[EVAL_RESULT]"
+        private const val STREAM_FOLLOWUP_PREFIX: String = "\n[FOLLOWUP]\n"
 
         private val modelGates: ConcurrentHashMap<String, Semaphore> = ConcurrentHashMap()
     }

@@ -53,9 +53,10 @@ object AppBootstrap {
 
         // Avoid duplicated heavy work in non-main processes (WorkManager/remote services, etc.).
         if (!ProcessGuards.isMainProcess(appCtx)) {
+            val processName = ProcessGuards.currentProcessNameCached(appCtx)
             SafeLog.i(
                 TAG_BOOT,
-                "bootstrap: non-main process detected (skip) pid=${Process.myPid()} process=${ProcessGuards.currentProcessNameCached(appCtx)}",
+                "bootstrap: non-main process detected (skip) pid=${Process.myPid()} process=$processName",
             )
             return
         }
@@ -66,6 +67,7 @@ object AppBootstrap {
         }
 
         val t0 = SystemClock.elapsedRealtime()
+        val processName = ProcessGuards.currentProcessNameCached(appCtx)
 
         runCatching { AppLog.init(appCtx) }
             .onFailure { t ->
@@ -85,8 +87,7 @@ object AppBootstrap {
         SafeLog.i(
             TAG_BOOT,
             "bootstrap: done in ${dt}ms pid=${Process.myPid()} uid=${Process.myUid()} " +
-                    "process=${ProcessGuards.currentProcessNameCached(appCtx)} " +
-                    "build=${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}",
+                    "process=$processName build=${BuildConfig.BUILD_TYPE} dbg=${BuildConfig.DEBUG}",
         )
     }
 
@@ -253,31 +254,49 @@ object AppBootstrap {
             appCtx: Context,
             timeoutMs: Long,
         ): UploadCallMeta {
-            val resultRef = AtomicReference<Result<Any?>?>(null)
+            data class UploadCallOutcome(
+                val ok: Boolean,
+                val resultType: String?,
+                val errType: String?,
+            )
+
+            val outcomeRef = AtomicReference<UploadCallOutcome?>(null)
 
             val callThread = thread(
                 start = true,
                 name = "${THREAD_NAME}-Call",
                 isDaemon = true,
             ) {
-                val r = runCatching {
-                    // IMPORTANT: This may block; we wrap it with a join timeout.
+                val outcome = runCatching {
                     GitHubLogUploadManager.tryUploadPendingCrashesBlocking(appCtx)
-                }
-                // Store only Result; do NOT stringify any payloads.
-                resultRef.set(r as Result<Any?>)
+                }.fold(
+                    onSuccess = { value ->
+                        UploadCallOutcome(
+                            ok = true,
+                            resultType = value?.javaClass?.simpleName,
+                            errType = null,
+                        )
+                    },
+                    onFailure = { err ->
+                        UploadCallOutcome(
+                            ok = false,
+                            resultType = null,
+                            errType = err.javaClass.simpleName,
+                        )
+                    },
+                )
+                outcomeRef.set(outcome)
             }
 
             runCatching { callThread.join(timeoutMs) }
 
-            val r = resultRef.get()
-            return if (r != null) {
-                val err = r.exceptionOrNull()
+            val outcome = outcomeRef.get()
+            return if (outcome != null) {
                 UploadCallMeta(
                     finished = true,
-                    ok = r.isSuccess,
-                    resultType = r.getOrNull()?.javaClass?.simpleName,
-                    errType = err?.javaClass?.simpleName,
+                    ok = outcome.ok,
+                    resultType = outcome.resultType,
+                    errType = outcome.errType,
                 )
             } else {
                 // Best-effort interrupt; network stacks may ignore it.
@@ -309,10 +328,13 @@ object AppBootstrap {
             if (!cur.isNullOrBlank()) return cur
 
             val appCtx = context.applicationContext
-            val resolved = getCurrentProcessName(appCtx)
-            val name = resolved?.takeIf { it.isNotBlank() } ?: getMainProcessName(appCtx) ?: "unknown"
-            cachedProcessName.set(name)
-            return name
+            val resolved = getCurrentProcessName(appCtx)?.takeIf { it.isNotBlank() }
+            if (resolved != null) {
+                cachedProcessName.set(resolved)
+                return resolved
+            }
+
+            return getMainProcessName(appCtx) ?: "unknown"
         }
 
         fun isMainProcess(context: Context): Boolean {
@@ -321,8 +343,7 @@ object AppBootstrap {
 
             val current = getCurrentProcessName(appCtx)
             if (current.isNullOrBlank()) {
-                // Fail-open for safety, but leave a breadcrumb for diagnosis.
-                cachedProcessName.set(mainProcessName)
+                // Fail-open for safety, but do not cache the fallback as if it were the true current name.
                 SafeLog.w(TAG_BOOT, "process name unavailable; fail-open (treat as main)")
                 return true
             }

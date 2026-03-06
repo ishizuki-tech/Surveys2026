@@ -15,6 +15,7 @@ package com.negi.surveys.ui
 
 import androidx.compose.runtime.Immutable
 import com.negi.surveys.BuildConfig
+import java.util.Locale
 
 /**
  * Review model types.
@@ -44,9 +45,10 @@ enum class ReviewChatKind(val wireName: String) {
          * Notes:
          * - Returns null when unknown to avoid inventing semantics.
          * - Call sites may fallback to MODEL_RAW or AI depending on their policy.
+         * - Locale.ROOT is required for deterministic case folding.
          */
         fun fromWireName(wireName: String?): ReviewChatKind? {
-            val w = wireName?.trim()?.lowercase() ?: return null
+            val w = wireName?.trim()?.lowercase(Locale.ROOT) ?: return null
             return entries.firstOrNull { it.wireName == w }
         }
 
@@ -91,11 +93,14 @@ data class ReviewChatLine(
  * Snapshot log for a single question.
  *
  * Notes:
- * - [lines] must be treated as an immutable snapshot (no mutation after creation).
+ * - [lines] should be treated as an immutable snapshot (no mutation after creation).
  * - [completionPayload] should be non-empty by contract.
  *   If [isSkipped] is true and a blank payload is provided, we auto-generate a stable skipped payload.
+ *
+ * Important:
+ * - This type is intentionally NOT annotated with @Immutable because constructor call sites
+ *   can still provide a mutable list reference. Use [of] or [freeze] when storing snapshots.
  */
-@Immutable
 data class ReviewQuestionLog(
     val questionId: String,
     val prompt: String,
@@ -117,7 +122,7 @@ data class ReviewQuestionLog(
          *
          * Why:
          * - Callers might pass a MutableList and mutate it later by mistake.
-         * - This factory snapshots the list to reduce "accidental mutation" bugs.
+         * - This factory snapshots the list to reduce accidental mutation bugs.
          *
          * Notes:
          * - In debug builds, we validate invariants more strictly.
@@ -144,7 +149,9 @@ data class ReviewQuestionLog(
             if (BuildConfig.DEBUG) {
                 require(qid.isNotBlank()) { "questionId must not be blank" }
                 require(prompt.isNotBlank()) { "prompt must not be blank" }
-                require(payload.isNotBlank()) { "completionPayload must not be blank (or provide isSkipped=true)" }
+                require(payload.isNotBlank()) {
+                    "completionPayload must not be blank (or provide isSkipped=true)"
+                }
             }
 
             return ReviewQuestionLog(
@@ -170,7 +177,7 @@ data class ReviewQuestionLog(
  * Flattened, review-friendly timeline items.
  *
  * Why:
- * - Review UI often wants a single list that shows *everything* in order.
+ * - Review UI often wants a single list that shows everything in order.
  * - Keeping this as a model avoids duplicating flattening logic across screens.
  *
  * Ordering:

@@ -9,8 +9,6 @@
  * =====================================================================
  */
 
-@file:Suppress("unused")
-
 package com.negi.surveys
 
 import androidx.lifecycle.ViewModel
@@ -149,7 +147,7 @@ class SurveySessionViewModel : ViewModel() {
             next.toMap()
         }
 
-        // Reference check is intentional: we want to know if *this exact incoming instance* won.
+        // Reference check is intentional: we want to know if this exact incoming instance won.
         val accepted = after[key] === incoming
 
         val lineChars = transcriptCharCount(incoming.lines)

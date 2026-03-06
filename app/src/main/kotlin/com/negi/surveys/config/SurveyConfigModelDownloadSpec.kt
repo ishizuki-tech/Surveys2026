@@ -20,6 +20,7 @@
 package com.negi.surveys.config
 
 import com.negi.surveys.BuildConfig
+import java.util.Locale
 
 /**
  * Immutable model download configuration resolved from [SurveyConfig].
@@ -94,7 +95,7 @@ private fun normalizeModelUrlOrNull(raw: String): String? {
     if (s.isBlank()) return null
     if (s.any { it.isWhitespace() }) return null
 
-    val lower = s.lowercase()
+    val lower = s.lowercase(Locale.US)
     if (!lower.startsWith("http://") && !lower.startsWith("https://")) return null
 
     return s
@@ -104,31 +105,44 @@ private fun normalizeModelUrlOrNull(raw: String): String? {
  * Sanitizes a file name to avoid path traversal and separators.
  *
  * Behavior:
- * - Removes directory separators and ':'.
+ * - Replaces directory separators and ':' with '_'.
+ * - Replaces ISO control characters with '_'.
+ * - Truncates to a safe max length.
  * - Collapses to a safe fallback if result becomes blank.
  */
 private fun sanitizeFileName(raw: String): String {
     val trimmed = raw.trim()
-    if (trimmed.isBlank()) return "model.litertlm"
+    if (trimmed.isBlank()) return DEFAULT_SAFE_FILE_NAME
 
-    // Remove common path separators and Windows drive colon.
     val cleaned = buildString(trimmed.length) {
         for (c in trimmed) {
-            when (c) {
-                '/', '\\', ':', '\u0000' -> append('_')
+            when {
+                c == '/' || c == '\\' || c == ':' || c == '\u0000' -> append('_')
+                c.isISOControl() -> append('_')
                 else -> append(c)
             }
         }
     }.trim()
 
-    // Prevent weird traversal-ish names.
-    val noDots = cleaned
+    // Stronger traversal-ish suppression.
+    val collapsed = cleaned
         .replace("..", "_")
+        .replace("./", "_")
+        .replace(".\\", "_")
         .trim('.')
         .trim()
 
-    return noDots.ifBlank { "model.litertlm" }
+    // Length cap to keep filesystem/zip/debug sane.
+    val capped = if (collapsed.length <= MAX_FILE_NAME_CHARS) {
+        collapsed
+    } else {
+        collapsed.take(MAX_FILE_NAME_CHARS).trim().trim('.')
+    }
+
+    return capped.ifBlank { DEFAULT_SAFE_FILE_NAME }
 }
+
+private fun Char.isISOControl(): Boolean = Character.isISOControl(this)
 
 /**
  * Resolves Hugging Face token from BuildConfig via reflection.
@@ -138,18 +152,27 @@ private fun sanitizeFileName(raw: String): String {
  * - HUGGINGFACE_TOKEN
  * - HUGGING_FACE_TOKEN
  * - HUGGING_FACE_API_TOKEN
+ *
+ * Caching:
+ * - Token is resolved once per process for efficiency.
  */
 private fun resolveHfTokenOrNull(): String? {
+    // Fast path.
+    HfTokenCache.cachedOrNull()?.let { return it }
+
     val candidates = listOf(
         "HF_TOKEN",
         "HUGGINGFACE_TOKEN",
         "HUGGING_FACE_TOKEN",
         "HUGGING_FACE_API_TOKEN",
     )
-    for (field in candidates) {
-        buildConfigStringOrNull(field)?.let { return it }
-    }
-    return null
+
+    val resolved = candidates.asSequence()
+        .mapNotNull { buildConfigStringOrNull(it) }
+        .firstOrNull()
+
+    HfTokenCache.set(resolved)
+    return resolved
 }
 
 /**
@@ -164,3 +187,20 @@ private fun buildConfigStringOrNull(fieldName: String): String? {
     val t = v.trim()
     return t.takeIf { it.isNotBlank() }
 }
+
+private object HfTokenCache {
+    @Volatile private var resolved: Boolean = false
+    @Volatile private var token: String? = null
+
+    fun cachedOrNull(): String? {
+        return if (resolved) token else null
+    }
+
+    fun set(value: String?) {
+        token = value
+        resolved = true
+    }
+}
+
+private const val DEFAULT_SAFE_FILE_NAME: String = "model.litertlm"
+private const val MAX_FILE_NAME_CHARS: Int = 200
