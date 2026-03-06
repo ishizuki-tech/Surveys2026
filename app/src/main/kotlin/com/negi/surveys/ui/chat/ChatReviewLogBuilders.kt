@@ -26,24 +26,35 @@ import kotlin.math.min
 /**
  * Review log builders for the Chat Question UI.
  *
- * Logging / privacy note:
- * - We never log user/model raw text to AppLog.
- * - This builder *does* put user/model text into [ReviewQuestionLog] for in-app review.
- *   Assumption: This object stays local to the device and is not shipped to analytics.
- *   If it is persisted or uploaded, caller must redact/clip further.
+ * Logging / privacy notes:
+ * - We never log raw user/model text to AppLog.
+ * - This builder does put user/model text into [ReviewQuestionLog] for in-app review.
+ * - If the resulting log is later persisted or uploaded, the caller must redact or clip further.
+ *
+ * Protocol notes:
+ * - Step-1 is user-facing and mapped to [ReviewChatKind.ASSESSMENT].
+ * - Step-2 is user-facing and mapped to [ReviewChatKind.FOLLOW_UP].
+ * - Raw/debug model stream is mapped to [ReviewChatKind.DEBUG_RAW].
  */
 internal object ChatReviewLogBuilders {
 
     private const val TAG = "ChatReviewLogBuilders"
 
     /**
-     * Upper bound for any text we store into [ReviewChatLine.text] to avoid OOM / huge payloads.
-     * Keep this conservative; the UI can still show the full text from the message list.
+     * Upper bound for any text stored into [ReviewChatLine.text].
+     *
+     * Notes:
+     * - Keeps review snapshots bounded in memory.
+     * - The live chat UI may still show the full underlying message text.
      */
     private const val MAX_LINE_CHARS = 12_000
 
     /**
-     * Upper bound for raw model output lines (can be very large in failure cases).
+     * Upper bound for raw model output lines.
+     *
+     * Notes:
+     * - Raw stream output can explode in failure cases.
+     * - Keep this larger than [MAX_LINE_CHARS], but still bounded.
      */
     private const val MAX_MODEL_RAW_CHARS = 24_000
 
@@ -77,8 +88,8 @@ internal object ChatReviewLogBuilders {
      * Stable 32-bit hash for a prompt.
      *
      * Why:
-     * - [String.hashCode] is stable in JVM, but it is weak and collision-prone for short prompts.
-     * - This uses SHA-256 and truncates to 32-bit to keep compatibility with existing `DraftKey(promptHash:Int)`.
+     * - [String.hashCode] is stable on the JVM but relatively weak for short prompts.
+     * - This uses SHA-256 and truncates to 32-bit to stay compatible with existing DraftKey usage.
      */
     internal fun stablePromptHash(prompt: String): Int {
         val md = MessageDigest.getInstance("SHA-256")
@@ -111,17 +122,33 @@ internal object ChatReviewLogBuilders {
         val promptTrimmed = prompt.trim()
         var seenUser = false
 
-        fun appendModelRawOnce(raw: String) {
+        fun appendLine(
+            kind: ReviewChatKind,
+            text: String,
+            maxChars: Int,
+        ) {
+            val clipped = clip(text.trim(), maxChars)
+            if (clipped.isEmpty()) return
+            lines += ReviewChatLine.of(
+                kind = kind,
+                text = clipped,
+            )
+        }
+
+        fun appendDebugRawOnce(raw: String) {
             val clipped = clip(raw.trim(), MAX_MODEL_RAW_CHARS)
             if (clipped.isEmpty()) return
 
             val last = lines.lastOrNull()
-            if (last != null && last.kind == ReviewChatKind.MODEL_RAW && last.text == clipped) {
+            if (last != null &&
+                last.kind.canonical() == ReviewChatKind.DEBUG_RAW &&
+                last.text == clipped
+            ) {
                 return
             }
 
-            lines += ReviewChatLine(
-                kind = ReviewChatKind.MODEL_RAW,
+            lines += ReviewChatLine.of(
+                kind = ReviewChatKind.DEBUG_RAW,
                 text = clipped,
             )
         }
@@ -129,19 +156,20 @@ internal object ChatReviewLogBuilders {
         for (message in messagesSnapshot) {
             when (message.role) {
                 ChatModels.ChatRole.USER -> {
-                    val text = clip(message.text.trim(), MAX_LINE_CHARS)
+                    val text = message.text.trim()
                     if (text.isNotEmpty()) {
-                        lines += ReviewChatLine(
+                        appendLine(
                             kind = ReviewChatKind.USER,
                             text = text,
+                            maxChars = MAX_LINE_CHARS,
                         )
                         seenUser = true
                     }
                 }
 
                 ChatModels.ChatRole.ASSISTANT -> {
-                    val assistant = clip(message.assistantMessage?.trim().orEmpty(), MAX_LINE_CHARS)
-                    val fallback = clip(message.text.trim(), MAX_LINE_CHARS)
+                    val assessment = message.assistantMessage?.trim().orEmpty()
+                    val fallback = message.text.trim()
                     val followUp = normalizeFollowUp(message.followUpQuestion)
 
                     /**
@@ -149,67 +177,73 @@ internal object ChatReviewLogBuilders {
                      */
                     val isSeedPrompt =
                         !seenUser &&
-                                assistant == "Question: $questionId" &&
+                                assessment == "Question: $questionId" &&
                                 followUp?.trim().orEmpty() == promptTrimmed
 
                     if (isSeedPrompt) continue
 
                     if (isSkipped) {
                         /**
-                         * When skipped, keep assistant/model outputs only after the user answered at least once.
+                         * When skipped, keep assistant/debug outputs only after the user answered at least once.
                          */
                         if (!seenUser) continue
 
-                        if (assistant.isNotEmpty()) {
-                            lines += ReviewChatLine(
-                                kind = ReviewChatKind.AI,
-                                text = assistant,
+                        if (assessment.isNotEmpty()) {
+                            appendLine(
+                                kind = ReviewChatKind.ASSESSMENT,
+                                text = assessment,
+                                maxChars = MAX_LINE_CHARS,
                             )
                         } else if (fallback.isNotEmpty()) {
-                            lines += ReviewChatLine(
-                                kind = ReviewChatKind.AI,
+                            appendLine(
+                                kind = ReviewChatKind.ASSESSMENT,
                                 text = fallback,
+                                maxChars = MAX_LINE_CHARS,
                             )
                         }
 
                         val followUpText = followUp?.trim()
                         if (!followUpText.isNullOrBlank() && followUpText != promptTrimmed) {
-                            lines += ReviewChatLine(
+                            appendLine(
                                 kind = ReviewChatKind.FOLLOW_UP,
-                                text = clip(followUpText, MAX_LINE_CHARS),
+                                text = followUpText,
+                                maxChars = MAX_LINE_CHARS,
                             )
                         }
 
                         val raw = message.streamText?.trim().orEmpty()
                         if (raw.isNotEmpty() && message.streamState != ChatModels.ChatStreamState.NONE) {
-                            appendModelRawOnce(raw)
+                            appendDebugRawOnce(raw)
                         }
                         continue
                     }
 
-                    if (assistant.isNotEmpty()) {
-                        lines += ReviewChatLine(
-                            kind = ReviewChatKind.AI,
-                            text = assistant,
+                    if (assessment.isNotEmpty()) {
+                        appendLine(
+                            kind = ReviewChatKind.ASSESSMENT,
+                            text = assessment,
+                            maxChars = MAX_LINE_CHARS,
                         )
                     } else if (fallback.isNotEmpty()) {
-                        lines += ReviewChatLine(
-                            kind = ReviewChatKind.AI,
+                        appendLine(
+                            kind = ReviewChatKind.ASSESSMENT,
                             text = fallback,
+                            maxChars = MAX_LINE_CHARS,
                         )
                     }
 
                     val followUpText = followUp?.trim()
                     if (!followUpText.isNullOrBlank() && followUpText != promptTrimmed) {
-                        lines += ReviewChatLine(
+                        appendLine(
                             kind = ReviewChatKind.FOLLOW_UP,
-                            text = clip(followUpText, MAX_LINE_CHARS),
+                            text = followUpText,
+                            maxChars = MAX_LINE_CHARS,
                         )
                     }
 
                     val raw = message.streamText?.trim().orEmpty()
                     if (raw.isNotEmpty() && message.streamState != ChatModels.ChatStreamState.NONE) {
-                        appendModelRawOnce(raw)
+                        appendDebugRawOnce(raw)
                     }
                 }
 
@@ -218,7 +252,7 @@ internal object ChatReviewLogBuilders {
 
                     val raw = (message.streamText?.takeIf { it.isNotBlank() } ?: message.text).trim()
                     if (raw.isNotEmpty()) {
-                        appendModelRawOnce(raw)
+                        appendDebugRawOnce(raw)
                     }
                 }
             }
@@ -229,7 +263,7 @@ internal object ChatReviewLogBuilders {
             "buildReviewQuestionLog: qid=$questionId skipped=$isSkipped lines=${lines.size} payloadLen=${completionPayload.length}",
         )
 
-        return ReviewQuestionLog(
+        return ReviewQuestionLog.of(
             questionId = questionId,
             prompt = prompt,
             isSkipped = isSkipped,
@@ -238,6 +272,13 @@ internal object ChatReviewLogBuilders {
         )
     }
 
+    /**
+     * Normalize a follow-up question and remove garbage values.
+     *
+     * Notes:
+     * - Uses Locale.US to avoid locale-dependent case folding surprises.
+     * - Removes common wrapper prefixes produced by prompting layers.
+     */
     internal fun normalizeFollowUp(text: String?): String? {
         val raw = text ?: return null
         var normalized = raw.trim().replace("\u0000", "")
@@ -260,6 +301,12 @@ internal object ChatReviewLogBuilders {
         return normalized
     }
 
+    /**
+     * Clip oversized text to a stable bounded representation.
+     *
+     * Notes:
+     * - Appends a marker so the review surface makes truncation visible.
+     */
     private fun clip(
         text: String,
         maxChars: Int,

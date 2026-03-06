@@ -84,7 +84,9 @@ internal object LiteRtLmSessionManager {
      */
     private val cleanupJobs: ConcurrentHashMap<String, Job> = ConcurrentHashMap()
 
-    /** Get or create the per-key session mutex. */
+    /**
+     * Get or create the per-key session mutex.
+     */
     private fun getSessionMutex(key: String): Mutex {
         val existing = sessionMutexes[key]
         if (existing != null) return existing
@@ -98,23 +100,32 @@ internal object LiteRtLmSessionManager {
      * Run a block under the per-key session lock.
      *
      * Note:
-     * - [reason] is intentionally carried for traceability at call sites (loggers may use it upstream).
+     * - [reason] is intentionally carried for traceability at call sites.
      */
-    internal suspend fun <T> withSessionLock(key: String, reason: String, block: suspend () -> T): T {
+    internal suspend fun <T> withSessionLock(
+        key: String,
+        reason: String,
+        block: suspend () -> T,
+    ): T {
         return getSessionMutex(key).withLock { block() }
     }
 
-    internal suspend fun hasInstance(key: String): Boolean = stateMutex.withLock { instances.containsKey(key) }
+    internal suspend fun hasInstance(key: String): Boolean =
+        stateMutex.withLock { instances.containsKey(key) }
 
-    internal suspend fun getInstance(key: String): LiteRtLmInstance? = stateMutex.withLock { instances[key] }
+    internal suspend fun getInstance(key: String): LiteRtLmInstance? =
+        stateMutex.withLock { instances[key] }
 
     internal suspend fun setInstance(key: String, instance: LiteRtLmInstance) {
         stateMutex.withLock { instances[key] = instance }
     }
 
-    internal suspend fun removeInstance(key: String): LiteRtLmInstance? = stateMutex.withLock { instances.remove(key) }
+    internal suspend fun removeInstance(key: String): LiteRtLmInstance? =
+        stateMutex.withLock { instances.remove(key) }
 
-    /** Cancel any scheduled idle cleanup for this key. */
+    /**
+     * Cancel any scheduled idle cleanup for this key.
+     */
     internal fun cancelScheduledCleanup(key: String, reason: String) {
         val job = cleanupJobs.remove(key)
         if (job != null) {
@@ -123,14 +134,19 @@ internal object LiteRtLmSessionManager {
         }
     }
 
-    /** Schedule an idle cleanup (debounced + token-guarded). */
+    /**
+     * Schedule an idle cleanup (debounced + token-guarded).
+     */
     private fun scheduleIdleCleanup(key: String, delayMs: Long, reason: String) {
         cancelScheduledCleanup(key, "reschedule:$reason")
 
         val tokenAtSchedule = LiteRtLmRunController.getCleanupToken(key)
         val job = ioScope.launch {
             try {
-                AppLog.d(LiteRtLmLogging.TAG, "Idle cleanup scheduled: key='$key' in ${delayMs}ms reason='$reason'")
+                AppLog.d(
+                    LiteRtLmLogging.TAG,
+                    "Idle cleanup scheduled: key='$key' in ${delayMs}ms reason='$reason'",
+                )
                 delay(delayMs)
                 closeInstanceIfStillIdle(
                     key = key,
@@ -152,7 +168,12 @@ internal object LiteRtLmSessionManager {
     internal fun cleanUp(key: String, onDone: () -> Unit) {
         ioScope.launch {
             runCatching { LiteRtLmInitCoordinator.awaitInitIfInFlight(key, reason = "cleanUp") }
-                .onFailure { AppLog.w(LiteRtLmLogging.TAG, "cleanUp: init wait failed: key='$key' err=${it.message}") }
+                .onFailure {
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "cleanUp: init wait failed: key='$key' err=${it.message}",
+                    )
+                }
 
             val action: () -> Unit = {
                 scheduleIdleCleanup(key, Const.IDLE_CLEANUP_MS, "explicit-cleanUp")
@@ -162,7 +183,10 @@ internal object LiteRtLmSessionManager {
             val defer = LiteRtLmRunController.isRunOccupiedKey(key)
             if (defer) {
                 LiteRtLmRunController.deferAfterStream(key) { action.invoke() }
-                AppLog.w(LiteRtLmLogging.TAG, "cleanUp deferred (will schedule after termination): key='$key'")
+                AppLog.w(
+                    LiteRtLmLogging.TAG,
+                    "cleanUp deferred (will schedule after termination): key='$key'",
+                )
                 return@launch
             }
 
@@ -180,13 +204,22 @@ internal object LiteRtLmSessionManager {
     internal fun forceCleanUp(key: String, onDone: () -> Unit) {
         ioScope.launch {
             runCatching { LiteRtLmInitCoordinator.awaitInitIfInFlight(key, reason = "forceCleanUp") }
-                .onFailure { AppLog.w(LiteRtLmLogging.TAG, "forceCleanUp: init wait failed: key='$key' err=${it.message}") }
+                .onFailure {
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "forceCleanUp: init wait failed: key='$key' err=${it.message}",
+                    )
+                }
 
             suspend fun runAndNotify() {
                 runCatching {
                     closeInstanceNowBestEffort(key, reason = "forceCleanUp")
                 }.onFailure { t ->
-                    AppLog.w(LiteRtLmLogging.TAG, "forceCleanUp failed: key='$key' err=${t.message}", t)
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "forceCleanUp failed: key='$key' err=${t.message}",
+                        t,
+                    )
                 }
                 onDone()
             }
@@ -194,7 +227,10 @@ internal object LiteRtLmSessionManager {
             val defer = LiteRtLmRunController.isRunOccupiedKey(key)
             if (defer) {
                 LiteRtLmRunController.deferAfterStream(key) { ioScope.launch { runAndNotify() } }
-                AppLog.w(LiteRtLmLogging.TAG, "forceCleanUp deferred (active/recovering run): key='$key'")
+                AppLog.w(
+                    LiteRtLmLogging.TAG,
+                    "forceCleanUp deferred (active/recovering run): key='$key'",
+                )
                 return@launch
             }
 
@@ -223,7 +259,10 @@ internal object LiteRtLmSessionManager {
             try {
                 val conv = engine.createConversation(cfg)
                 if (attempt > 1) {
-                    AppLog.w(LiteRtLmLogging.TAG, "createConversationWithRetry succeeded: key='$key' attempts=$attempt reason='$reason'")
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "createConversationWithRetry succeeded: key='$key' attempts=$attempt reason='$reason'",
+                    )
                 }
                 return conv
             } catch (t: Throwable) {
@@ -234,7 +273,8 @@ internal object LiteRtLmSessionManager {
                 if (elapsed >= timeoutMs) {
                     AppLog.e(
                         LiteRtLmLogging.TAG,
-                        "createConversationWithRetry timed out: key='$key' attempts=$attempt elapsed=${elapsed}ms reason='$reason' err=${t.message}",
+                        "createConversationWithRetry timed out: key='$key' attempts=$attempt " +
+                                "elapsed=${elapsed}ms reason='$reason' err=${t.message}",
                         t,
                     )
                     throw t
@@ -273,11 +313,18 @@ internal object LiteRtLmSessionManager {
             }
 
             if (inst == null) {
-                AppLog.w(LiteRtLmLogging.TAG, "resetConversationInternal skipped: not initialized key='$key'")
+                AppLog.w(
+                    LiteRtLmLogging.TAG,
+                    "resetConversationInternal skipped: not initialized key='$key'",
+                )
                 return@withSessionLock
             }
+
             if (occupied) {
-                AppLog.w(LiteRtLmLogging.TAG, "resetConversationInternal rejected: active/recovering run key='$key'")
+                AppLog.w(
+                    LiteRtLmLogging.TAG,
+                    "resetConversationInternal rejected: active/recovering run key='$key'",
+                )
                 return@withSessionLock
             }
 
@@ -285,17 +332,21 @@ internal object LiteRtLmSessionManager {
                 AppLog.w(
                     LiteRtLmLogging.TAG,
                     "resetConversationInternal rejected: capability mismatch key='$key' " +
-                            "have(image=${inst.supportImage},audio=${inst.supportAudio}) want(image=$supportImage,audio=$supportAudio)",
+                            "have(image=${inst.supportImage},audio=${inst.supportAudio}) " +
+                            "want(image=$supportImage,audio=$supportAudio)",
                 )
                 return@withSessionLock
             }
 
             val cfg = runCatching {
-                // Rebuild config via InitCoordinator logic (sampler, system, tools).
-                // Keep it local to avoid leaking builder into SessionManager surface.
+                // Rebuild config via InitCoordinator logic.
                 val topK = model.getIntConfigValue(Model.ConfigKey.TOP_K, 40).coerceAtLeast(1)
-                val topP = model.getFloatConfigValue(Model.ConfigKey.TOP_P, 0.9f).toDouble().coerceIn(0.0, 1.0)
-                val temp = model.getFloatConfigValue(Model.ConfigKey.TEMPERATURE, 0.7f).toDouble().coerceIn(0.0, 2.0)
+                val topP = model.getFloatConfigValue(Model.ConfigKey.TOP_P, 0.9f)
+                    .toDouble()
+                    .coerceIn(0.0, 1.0)
+                val temp = model.getFloatConfigValue(Model.ConfigKey.TEMPERATURE, 0.7f)
+                    .toDouble()
+                    .coerceIn(0.0, 2.0)
 
                 ConversationConfig(
                     samplerConfig = com.google.ai.edge.litertlm.SamplerConfig(
@@ -307,7 +358,11 @@ internal object LiteRtLmSessionManager {
                     tools = tools,
                 )
             }.getOrElse { e ->
-                AppLog.w(LiteRtLmLogging.TAG, "resetConversationInternal config build failed: key='$key' err=${e.message}", e)
+                AppLog.w(
+                    LiteRtLmLogging.TAG,
+                    "resetConversationInternal config build failed: key='$key' err=${e.message}",
+                    e,
+                )
                 return@withSessionLock
             }
 
@@ -315,7 +370,13 @@ internal object LiteRtLmSessionManager {
             val old = inst.conversation
 
             runCatching { old.close() }
-                .onFailure { AppLog.w(LiteRtLmLogging.TAG, "resetConversationInternal: close old conversation failed: ${it.message}", it) }
+                .onFailure {
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "resetConversationInternal: close old conversation failed: ${it.message}",
+                        it,
+                    )
+                }
 
             delay(Const.POST_TERMINATE_COOLDOWN_MS)
 
@@ -328,10 +389,21 @@ internal object LiteRtLmSessionManager {
                     timeoutMs = Const.CLOSE_GRACE_MS + Const.RETIRED_CLOSE_GRACE_MS,
                 )
             } catch (t: Throwable) {
-                AppLog.e(LiteRtLmLogging.TAG, "resetConversationInternal failed: key='$key' err=${t.message}", t)
+                AppLog.e(
+                    LiteRtLmLogging.TAG,
+                    "resetConversationInternal failed: key='$key' err=${t.message}",
+                    t,
+                )
 
-                runCatching { closeInstanceNowBestEffort(key, reason = "resetConversationInternal-recover") }
-                    .onFailure { AppLog.w(LiteRtLmLogging.TAG, "resetConversationInternal recovery close failed: key='$key' err=${it.message}", it) }
+                runCatching {
+                    closeInstanceNowBestEffort(key, reason = "resetConversationInternal-recover")
+                }.onFailure {
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "resetConversationInternal recovery close failed: key='$key' err=${it.message}",
+                        it,
+                    )
+                }
 
                 if (appContext != null) {
                     runCatching {
@@ -344,7 +416,11 @@ internal object LiteRtLmSessionManager {
                             tools = tools,
                         )
                     }.onFailure { re ->
-                        AppLog.e(LiteRtLmLogging.TAG, "resetConversationInternal recovery re-init failed: key='$key' err=${re.message}", re)
+                        AppLog.e(
+                            LiteRtLmLogging.TAG,
+                            "resetConversationInternal recovery re-init failed: key='$key' err=${re.message}",
+                            re,
+                        )
                     }
                 }
                 return@withSessionLock
@@ -352,7 +428,25 @@ internal object LiteRtLmSessionManager {
 
             inst.conversation = fresh
             inst.conversationConfigSnapshot = cfg
-            AppLog.d(LiteRtLmLogging.TAG, "resetConversationInternal done: key='$key' reason='$reason'")
+
+            /**
+             * Clear transient run-controller state after a successful conversation reset.
+             *
+             * Why:
+             * - Reset creates a fresh conversation boundary.
+             * - Any stale cancel / hook / terminal state from an older run should not
+             *   leak into the next run after reset.
+             *
+             * Safety:
+             * - This reset path is already rejected when a run is occupied.
+             * - We are under the per-key session lock here.
+             */
+            LiteRtLmRunController.clearTransientStateForReuse(key)
+
+            AppLog.d(
+                LiteRtLmLogging.TAG,
+                "resetConversationInternal done: key='$key' reason='$reason'",
+            )
         }
     }
 
@@ -385,13 +479,18 @@ internal object LiteRtLmSessionManager {
                 LiteRtLmRunController.clearPendingAfterStream(key)
 
                 instances.remove(key)
-                ClosePlan(instance = instance, nowMs = nowMs, lastTerminateAtMs = lastTerminateAtMs)
+                ClosePlan(
+                    instance = instance,
+                    nowMs = nowMs,
+                    lastTerminateAtMs = lastTerminateAtMs,
+                )
             }
 
             if (plan == null) {
                 AppLog.d(
                     LiteRtLmLogging.TAG,
-                    "closeInstanceNowBestEffort: nothing to close (or active/recovering/initInFlight): key='$key' reason='$reason'",
+                    "closeInstanceNowBestEffort: nothing to close (or active/recovering/initInFlight): " +
+                            "key='$key' reason='$reason'",
                 )
                 return@withSessionLock
             }
@@ -399,12 +498,27 @@ internal object LiteRtLmSessionManager {
             delayCloseGraceIfNeeded(plan.nowMs, plan.lastTerminateAtMs)
 
             runCatching { plan.instance.conversation.close() }
-                .onFailure { AppLog.e(LiteRtLmLogging.TAG, "close conversation failed: key='$key' reason='$reason' err=${it.message}", it) }
+                .onFailure {
+                    AppLog.e(
+                        LiteRtLmLogging.TAG,
+                        "close conversation failed: key='$key' reason='$reason' err=${it.message}",
+                        it,
+                    )
+                }
 
             runCatching { plan.instance.engine.close() }
-                .onFailure { AppLog.e(LiteRtLmLogging.TAG, "close engine failed: key='$key' reason='$reason' err=${it.message}", it) }
+                .onFailure {
+                    AppLog.e(
+                        LiteRtLmLogging.TAG,
+                        "close engine failed: key='$key' reason='$reason' err=${it.message}",
+                        it,
+                    )
+                }
 
-            AppLog.d(LiteRtLmLogging.TAG, "LiteRT-LM closed: key='$key' reason='$reason'")
+            AppLog.d(
+                LiteRtLmLogging.TAG,
+                "LiteRT-LM closed: key='$key' reason='$reason'",
+            )
         }
     }
 
@@ -418,7 +532,10 @@ internal object LiteRtLmSessionManager {
         reason: String,
     ) {
         if (LiteRtLmInitCoordinator.isInitInFlight(key)) {
-            AppLog.d(LiteRtLmLogging.TAG, "Idle cleanup skipped (init in flight): key='$key'")
+            AppLog.d(
+                LiteRtLmLogging.TAG,
+                "Idle cleanup skipped (init in flight): key='$key'",
+            )
             return
         }
 
@@ -440,7 +557,11 @@ internal object LiteRtLmSessionManager {
                 LiteRtLmRunController.clearPendingAfterStream(key)
 
                 instances.remove(key)
-                ClosePlan(instance = instance, nowMs = nowMs, lastTerminateAtMs = lastTerminateAtMs)
+                ClosePlan(
+                    instance = instance,
+                    nowMs = nowMs,
+                    lastTerminateAtMs = lastTerminateAtMs,
+                )
             }
 
             if (plan == null) return@withSessionLock
@@ -448,12 +569,27 @@ internal object LiteRtLmSessionManager {
             delayCloseGraceIfNeeded(plan.nowMs, plan.lastTerminateAtMs)
 
             runCatching { plan.instance.conversation.close() }
-                .onFailure { AppLog.e(LiteRtLmLogging.TAG, "idle close conversation failed: key='$key' err=${it.message}", it) }
+                .onFailure {
+                    AppLog.e(
+                        LiteRtLmLogging.TAG,
+                        "idle close conversation failed: key='$key' err=${it.message}",
+                        it,
+                    )
+                }
 
             runCatching { plan.instance.engine.close() }
-                .onFailure { AppLog.e(LiteRtLmLogging.TAG, "idle close engine failed: key='$key' err=${it.message}", it) }
+                .onFailure {
+                    AppLog.e(
+                        LiteRtLmLogging.TAG,
+                        "idle close engine failed: key='$key' err=${it.message}",
+                        it,
+                    )
+                }
 
-            AppLog.d(LiteRtLmLogging.TAG, "LiteRT-LM closed: key='$key' reason='$reason'")
+            AppLog.d(
+                LiteRtLmLogging.TAG,
+                "LiteRT-LM closed: key='$key' reason='$reason'",
+            )
         }
     }
 
@@ -461,15 +597,24 @@ internal object LiteRtLmSessionManager {
      * Delay close to respect a grace window after native termination.
      *
      * Why:
-     * - Some runtimes keep a native session around briefly; closing/recreating too soon can trigger
-     *   FAILED_PRECONDITION ("session already exists") on the next createConversation().
+     * - Some runtimes keep a native session around briefly.
+     * - Closing/recreating too soon can trigger FAILED_PRECONDITION ("session already exists").
      */
     private suspend fun delayCloseGraceIfNeeded(nowMs: Long, lastTerminateAtMs: Long) {
         if (lastTerminateAtMs <= 0L) return
+
         val sinceTerminate = nowMs - lastTerminateAtMs
         if (sinceTerminate < 0L) return
 
-        val extraDelay = if (sinceTerminate in 0..Const.CLOSE_GRACE_MS) (Const.CLOSE_GRACE_MS - sinceTerminate) else 0L
-        if (extraDelay > 0L) delay(extraDelay)
+        val extraDelay =
+            if (sinceTerminate in 0..Const.CLOSE_GRACE_MS) {
+                Const.CLOSE_GRACE_MS - sinceTerminate
+            } else {
+                0L
+            }
+
+        if (extraDelay > 0L) {
+            delay(extraDelay)
+        }
     }
 }
