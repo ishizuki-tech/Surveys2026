@@ -34,9 +34,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.math.max
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -48,6 +48,10 @@ import kotlinx.coroutines.launch
  * - RunState + runStates
  * - watchdog / hard-close
  * - pendingAfterStream
+ *
+ * Important lifecycle rule:
+ * - Cancellation must be scoped to a single run.
+ * - A cancelled previous run must never poison the next run for the same runtime key.
  */
 internal object LiteRtLmRunController {
 
@@ -67,7 +71,8 @@ internal object LiteRtLmRunController {
     private val mainHandler: Handler = Handler(Looper.getMainLooper())
     private val ioScope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    private val pendingAfterStream = ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>>()
+    private val pendingAfterStream =
+        ConcurrentHashMap<String, java.util.concurrent.ConcurrentLinkedQueue<() -> Unit>>()
 
     internal data class RunState(
         /**
@@ -78,35 +83,79 @@ internal object LiteRtLmRunController {
          * - Use [preparing] to block concurrent runs during destructive init/upgrade steps.
          */
         val active: AtomicBoolean = AtomicBoolean(false),
+
+        /** True while recovery is rebuilding the conversation and retrying the send. */
         val recovering: AtomicBoolean = AtomicBoolean(false),
+
         /**
          * Preparation phase lock (auto-init / capability upgrade).
          *
          * Why:
          * - We must block concurrent runs for the same key while performing destructive init/upgrade.
-         * - We must NOT mark the stream as active yet (otherwise init rejects it).
+         * - We must NOT mark the stream as active yet.
          */
         val preparing: AtomicBoolean = AtomicBoolean(false),
+
+        /** Native terminal state for the current run. */
         val terminated: AtomicBoolean = AtomicBoolean(false),
+
+        /** Logical terminal state for the current run. */
         val logicalDone: AtomicBoolean = AtomicBoolean(false),
+
+        /**
+         * Cancellation requested for the current run only.
+         *
+         * Important:
+         * - This flag is transient and must be cleared before every new run.
+         * - Pending cancellation for start-race windows is tracked separately via [pendingCancel].
+         */
         val cancelRequested: AtomicBoolean = AtomicBoolean(false),
+
+        /**
+         * Short-lived pending cancellation used only for no-active start-race windows.
+         *
+         * This is converted into [cancelRequested] only if still fresh for the new run.
+         */
         val pendingCancel: AtomicBoolean = AtomicBoolean(false),
+
+        /** Timestamp for [pendingCancel]. */
         val pendingCancelAtMs: AtomicLong = AtomicLong(0L),
+
+        /** Monotonic run id for the runtime key. */
         val runId: AtomicLong = AtomicLong(0L),
+
+        /** Best-effort timestamps for close / cleanup coordination. */
         val lastTerminateAtMs: AtomicLong = AtomicLong(0L),
         val lastUseAtMs: AtomicLong = AtomicLong(0L),
         val lastMessageAtMs: AtomicLong = AtomicLong(0L),
         val cooldownUntilMs: AtomicLong = AtomicLong(0L),
-        val logicalTerminator: AtomicReference<(() -> Unit)?> = AtomicReference(null),
+
         /**
-         * Best-effort hook to deliver logical completion (resultListener(done=true)) from out-of-band
-         * paths such as hard-close watchdog.
+         * Best-effort logical cancellation entry point for the current run.
          *
-         * Must be runId-scoped by setter.
+         * Must be set / cleared per run.
+         */
+        val logicalTerminator: AtomicReference<(() -> Unit)?> = AtomicReference(null),
+
+        /**
+         * Best-effort hook to deliver logical completion from out-of-band paths
+         * such as hard-close watchdog.
+         *
+         * Must be set / cleared per run.
          */
         val logicalDoneHook: AtomicReference<(() -> Unit)?> = AtomicReference(null),
+
+        /** Ensures only one hard-close watchdog is active for the key at a time. */
         val hardCloseRunning: AtomicBoolean = AtomicBoolean(false),
+
+        /** Cleanup invalidation token. */
         val cleanupToken: AtomicLong = AtomicLong(0L),
+
+        /**
+         * Best-effort native-done hook for deferred cleanup listener / after-stream actions.
+         *
+         * Must be set / cleared per run.
+         */
         val nativeDoneHook: AtomicReference<(() -> Unit)?> = AtomicReference(null),
     )
 
@@ -136,7 +185,9 @@ internal object LiteRtLmRunController {
         return rs.active.get() || rs.recovering.get()
     }
 
-    internal fun anyRunOccupied(): Boolean = runStates.values.any { it.preparing.get() || it.active.get() || it.recovering.get() }
+    internal fun anyRunOccupied(): Boolean {
+        return runStates.values.any { it.preparing.get() || it.active.get() || it.recovering.get() }
+    }
 
     internal fun anyRunOccupiedForPrefix(prefix: String): Boolean {
         return runStates.entries.any { (k, rs) ->
@@ -145,10 +196,14 @@ internal object LiteRtLmRunController {
     }
 
     internal fun getLastUseAtMs(key: String): Long = getRunState(key).lastUseAtMs.get()
+
     internal fun getLastTerminateAtMs(key: String): Long = getRunState(key).lastTerminateAtMs.get()
+
     internal fun getCleanupToken(key: String): Long = getRunState(key).cleanupToken.get()
 
-    /** Touch last-use time and invalidate any scheduled cleanup. */
+    /**
+     * Touch last-use time and invalidate any scheduled cleanup.
+     */
     internal fun markUsed(key: String) {
         val now = SystemClock.elapsedRealtime()
         val rs = getRunState(key)
@@ -161,24 +216,103 @@ internal object LiteRtLmRunController {
     }
 
     internal fun deferAfterStream(key: String, action: () -> Unit) {
-        val q = pendingAfterStream.computeIfAbsent(key) { java.util.concurrent.ConcurrentLinkedQueue() }
+        val q = pendingAfterStream.computeIfAbsent(key) {
+            java.util.concurrent.ConcurrentLinkedQueue()
+        }
         q.add(action)
     }
 
-    /** Reset RunState flags for "we are tearing down this instance". */
-    internal fun resetStateForClose(key: String) {
-        val rs = getRunState(key)
+    /**
+     * Clear transient cancellation state for the current / previous run.
+     *
+     * Important:
+     * - This must be called before starting a new run so a cancelled old run
+     *   cannot poison the next one.
+     */
+    private fun clearTransientCancelState(rs: RunState) {
         rs.cancelRequested.set(false)
         rs.pendingCancel.set(false)
         rs.pendingCancelAtMs.set(0L)
-        rs.preparing.set(false)
-        rs.recovering.set(false)
+    }
+
+    /**
+     * Clear transient logical hooks for the current / previous run.
+     *
+     * Important:
+     * - These hooks are run-scoped and must never leak across run ids.
+     * - This intentionally does NOT clear [RunState.nativeDoneHook].
+     *   Native done still needs to fire cleanup/deferred actions on terminal paths.
+     */
+    private fun clearTransientLogicalHooks(rs: RunState) {
         rs.logicalTerminator.set(null)
         rs.logicalDoneHook.set(null)
+    }
+
+    /**
+     * Clear all transient hooks for the current / previous run.
+     *
+     * Use this only when it is safe to drop native-done cleanup delivery as well.
+     */
+    private fun clearTransientAllHooks(rs: RunState) {
+        clearTransientLogicalHooks(rs)
         rs.nativeDoneHook.set(null)
+    }
+
+    /**
+     * Prepare a fresh run boundary.
+     *
+     * Why:
+     * - Previous terminal / cancellation state is key-scoped storage.
+     * - A new run must explicitly discard stale transient state before it starts.
+     */
+    private fun prepareFreshRunState(rs: RunState) {
+        rs.terminated.set(false)
+        rs.logicalDone.set(false)
+        rs.recovering.set(false)
+        clearTransientCancelState(rs)
+        clearTransientAllHooks(rs)
+    }
+
+    /**
+     * Consume the short-lived pending cancel and decide whether it should be applied
+     * to the new run.
+     */
+    private fun consumeFreshPendingCancel(rs: RunState, nowStartMs: Long): Boolean {
+        val pending = rs.pendingCancel.getAndSet(false)
+        val pendingAtMs = rs.pendingCancelAtMs.getAndSet(0L)
+        return pending &&
+                pendingAtMs > 0L &&
+                (nowStartMs - pendingAtMs) <= PENDING_CANCEL_TTL_MS
+    }
+
+    /**
+     * Reset RunState flags for "we are tearing down this instance".
+     */
+    internal fun resetStateForClose(key: String) {
+        val rs = getRunState(key)
+        clearTransientCancelState(rs)
+        clearTransientAllHooks(rs)
+        rs.preparing.set(false)
+        rs.recovering.set(false)
         rs.terminated.set(true)
         rs.logicalDone.set(true)
         rs.active.set(false)
+    }
+
+    /**
+     * Best-effort helper for callers that want to reuse the same engine/session
+     * boundary and explicitly clear stale transient run state first.
+     *
+     * Safe usage:
+     * - Only call when no run is occupied for the key.
+     */
+    internal fun clearTransientStateForReuse(key: String) {
+        val rs = getRunState(key)
+        if (isRunOccupiedKey(key)) return
+        clearTransientCancelState(rs)
+        clearTransientAllHooks(rs)
+        rs.terminated.set(true)
+        rs.logicalDone.set(true)
     }
 
     private suspend fun awaitCooldownIfNeeded(key: String, reason: String) {
@@ -187,16 +321,25 @@ internal object LiteRtLmRunController {
         val until = rs.cooldownUntilMs.get()
         val delayMs = max(0L, until - now)
         if (delayMs > 0) {
-            AppLog.d(LiteRtLmLogging.TAG, "Cooldown delay: key='$key' delay=${delayMs}ms reason='$reason'")
+            AppLog.d(
+                LiteRtLmLogging.TAG,
+                "Cooldown delay: key='$key' delay=${delayMs}ms reason='$reason'",
+            )
             delay(delayMs)
         }
     }
 
     private fun postToMain(block: () -> Unit) {
-        if (Looper.myLooper() == Looper.getMainLooper()) block() else mainHandler.post(block)
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            block()
+        } else {
+            mainHandler.post(block)
+        }
     }
 
-    /** Convert this Bitmap to PNG bytes. */
+    /**
+     * Convert this Bitmap to PNG bytes.
+     */
     private fun Bitmap.toPngByteArray(): ByteArray {
         return ByteArrayOutputStream().use { stream ->
             compress(Bitmap.CompressFormat.PNG, 100, stream)
@@ -204,13 +347,25 @@ internal object LiteRtLmRunController {
         }
     }
 
-    /** Build Content list for a single message (multimodal first, then text). */
-    private fun buildContentList(input: String, images: List<Bitmap>, audioClips: List<ByteArray>): List<Content> {
+    /**
+     * Build Content list for a single message.
+     */
+    private fun buildContentList(
+        input: String,
+        images: List<Bitmap>,
+        audioClips: List<ByteArray>,
+    ): List<Content> {
         val contents = mutableListOf<Content>()
-        for (image in images) contents.add(Content.ImageBytes(image.toPngByteArray()))
-        for (audio in audioClips) contents.add(Content.AudioBytes(audio))
+        for (image in images) {
+            contents.add(Content.ImageBytes(image.toPngByteArray()))
+        }
+        for (audio in audioClips) {
+            contents.add(Content.AudioBytes(audio))
+        }
         val t = input.trim()
-        if (t.isNotEmpty()) contents.add(Content.Text(t))
+        if (t.isNotEmpty()) {
+            contents.add(Content.Text(t))
+        }
         return contents
     }
 
@@ -225,7 +380,7 @@ internal object LiteRtLmRunController {
                 val p = c.parameterTypes
                 p.size == 1 && List::class.java.isAssignableFrom(p[0])
             } ?: return@runCatching null
-            (ctor.newInstance(contents) as Contents)
+            ctor.newInstance(contents) as Contents
         }.getOrNull()?.let { return it }
 
         runCatching {
@@ -234,7 +389,7 @@ internal object LiteRtLmRunController {
                 p.size == 1 && p[0].isArray
             } ?: return@runCatching null
             val arr = contents.toTypedArray()
-            (ctor.newInstance(arr) as Contents)
+            ctor.newInstance(arr) as Contents
         }.getOrNull()?.let { return it }
 
         runCatching {
@@ -242,11 +397,16 @@ internal object LiteRtLmRunController {
                 (m.name == "of" || m.name == "from" || m.name == "create") &&
                         Modifier.isStatic(m.modifiers) &&
                         m.parameterTypes.size == 1 &&
-                        (m.parameterTypes[0].isArray || List::class.java.isAssignableFrom(m.parameterTypes[0]))
+                        (m.parameterTypes[0].isArray ||
+                                List::class.java.isAssignableFrom(m.parameterTypes[0]))
             } ?: return@runCatching null
 
-            val inst = if (m.parameterTypes[0].isArray) m.invoke(null, contents.toTypedArray()) else m.invoke(null, contents)
-            (inst as Contents)
+            val inst = if (m.parameterTypes[0].isArray) {
+                m.invoke(null, contents.toTypedArray())
+            } else {
+                m.invoke(null, contents)
+            }
+            inst as Contents
         }.getOrNull()?.let { return it }
 
         runCatching {
@@ -255,11 +415,16 @@ internal object LiteRtLmRunController {
             val m = companion.javaClass.methods.firstOrNull { m ->
                 (m.name == "of" || m.name == "from" || m.name == "create") &&
                         m.parameterTypes.size == 1 &&
-                        (m.parameterTypes[0].isArray || List::class.java.isAssignableFrom(m.parameterTypes[0]))
+                        (m.parameterTypes[0].isArray ||
+                                List::class.java.isAssignableFrom(m.parameterTypes[0]))
             } ?: return@runCatching null
 
-            val inst = if (m.parameterTypes[0].isArray) m.invoke(companion, contents.toTypedArray()) else m.invoke(companion, contents)
-            (inst as Contents)
+            val inst = if (m.parameterTypes[0].isArray) {
+                m.invoke(companion, contents.toTypedArray())
+            } else {
+                m.invoke(companion, contents)
+            }
+            inst as Contents
         }.getOrNull()?.let { return it }
 
         throw IllegalStateException("Unable to construct Contents for current LiteRT-LM SDK.")
@@ -299,20 +464,30 @@ internal object LiteRtLmRunController {
                 val newlineReady = delta.indexOf('\n') >= 0
 
                 if (!scheduled) {
-                    scheduleDelayMs = if (timeReady || sizeReady || newlineReady) 0L
-                    else (maxEmitIntervalMs - timeSince).coerceAtLeast(0L)
+                    scheduleDelayMs = if (timeReady || sizeReady || newlineReady) {
+                        0L
+                    } else {
+                        (maxEmitIntervalMs - timeSince).coerceAtLeast(0L)
+                    }
                     scheduled = true
                 }
             }
 
             val d = scheduleDelayMs ?: return
             handler.removeCallbacks(flushRunnable)
-            if (d <= 0L) handler.post(flushRunnable) else handler.postDelayed(flushRunnable, d)
+            if (d <= 0L) {
+                handler.post(flushRunnable)
+            } else {
+                handler.postDelayed(flushRunnable, d)
+            }
         }
 
         fun flushNow(force: Boolean = false) {
-            if (Looper.myLooper() == Looper.getMainLooper()) flushOnMain(force = force)
-            else handler.post { flushOnMain(force = force) }
+            if (Looper.myLooper() == Looper.getMainLooper()) {
+                flushOnMain(force = force)
+            } else {
+                handler.post { flushOnMain(force = force) }
+            }
         }
 
         fun cancel() {
@@ -352,21 +527,31 @@ internal object LiteRtLmRunController {
 
             val ok = if (force) isSameRun() else isStillActive()
             if (out.isNotEmpty() && ok) {
-                runCatching { deliver(out) }.onFailure { /* Keep UI stable */ }
+                runCatching { deliver(out) }
+                    .onFailure { /* Keep UI stable */ }
             }
         }
     }
 
-    /** Fire native done hook once (safe no-op if already cleared). */
+    /**
+     * Fire native done hook once.
+     */
     private fun fireNativeDoneHookOnce(key: String) {
         val rs = getRunState(key)
         val hook = rs.nativeDoneHook.getAndSet(null) ?: return
         runCatching { hook.invoke() }
-            .onFailure { t -> AppLog.w(LiteRtLmLogging.TAG, "nativeDoneHook failed: key='$key' err=${t.message}", t) }
+            .onFailure { t ->
+                AppLog.w(
+                    LiteRtLmLogging.TAG,
+                    "nativeDoneHook failed: key='$key' err=${t.message}",
+                    t,
+                )
+            }
     }
 
     private fun debugState(key: String, rs: RunState, prefix: String) {
         if (!LiteRtLmLogging.DEBUG_STATE) return
+
         val rid = rs.runId.get()
         val preparing = rs.preparing.get()
         val active = rs.active.get()
@@ -377,10 +562,12 @@ internal object LiteRtLmRunController {
         val pending = rs.pendingCancel.get()
         val lastMsg = rs.lastMessageAtMs.get()
         val lastTerm = rs.lastTerminateAtMs.get()
+
         AppLog.d(
             LiteRtLmLogging.TAG,
-            "state[$prefix] key='$key' runId=$rid preparing=$preparing active=$active recovering=$recovering terminated=$term logicalDone=$logical " +
-                    "cancel=$cancel pendingCancel=$pending lastMsgAt=$lastMsg lastTermAt=$lastTerm"
+            "state[$prefix] key='$key' runId=$rid preparing=$preparing active=$active " +
+                    "recovering=$recovering terminated=$term logicalDone=$logical cancel=$cancel " +
+                    "pendingCancel=$pending lastMsgAt=$lastMsg lastTermAt=$lastTerm",
         )
     }
 
@@ -399,7 +586,8 @@ internal object LiteRtLmRunController {
                 val start = SystemClock.elapsedRealtime()
                 AppLog.w(
                     LiteRtLmLogging.TAG,
-                    "Hard-close watchdog started: key='$key' runId=$expectedRunId reason='$reason' timeout=${HARD_CLOSE_TIMEOUT_MS}ms"
+                    "Hard-close watchdog started: key='$key' runId=$expectedRunId " +
+                            "reason='$reason' timeout=${HARD_CLOSE_TIMEOUT_MS}ms",
                 )
 
                 while (true) {
@@ -408,13 +596,17 @@ internal object LiteRtLmRunController {
                     if (rs.runId.get() != expectedRunId) {
                         AppLog.d(
                             LiteRtLmLogging.TAG,
-                            "Hard-close watchdog exit: key='$key' runId changed (expected=$expectedRunId actual=${rs.runId.get()})"
+                            "Hard-close watchdog exit: key='$key' runId changed " +
+                                    "(expected=$expectedRunId actual=${rs.runId.get()})",
                         )
                         return@launch
                     }
 
                     if (!isRunOccupiedKey(key) || rs.terminated.get()) {
-                        AppLog.d(LiteRtLmLogging.TAG, "Hard-close watchdog exit: key='$key' already terminated/free")
+                        AppLog.d(
+                            LiteRtLmLogging.TAG,
+                            "Hard-close watchdog exit: key='$key' already terminated/free",
+                        )
                         return@launch
                     }
 
@@ -432,14 +624,20 @@ internal object LiteRtLmRunController {
 
                         AppLog.e(
                             LiteRtLmLogging.TAG,
-                            "Hard-close watchdog firing: key='$key' runId=$expectedRunId elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms"
+                            "Hard-close watchdog firing: key='$key' runId=$expectedRunId " +
+                                    "elapsed=${elapsed}ms sinceMsg=${sinceMsg}ms",
                         )
                         debugState(key, rs, "hardClose:firing")
 
-                        // Best-effort: deliver logical completion for this run.
                         rs.logicalDoneHook.getAndSet(null)?.let { hook ->
                             runCatching { hook.invoke() }
-                                .onFailure { t -> AppLog.w(LiteRtLmLogging.TAG, "hardClose logicalDoneHook failed: key='$key' err=${t.message}", t) }
+                                .onFailure { t ->
+                                    AppLog.w(
+                                        LiteRtLmLogging.TAG,
+                                        "hardClose logicalDoneHook failed: key='$key' err=${t.message}",
+                                        t,
+                                    )
+                                }
                         }
 
                         LiteRtLmSessionManager.withSessionLock(key, reason = "hardClose:$reason") {
@@ -448,9 +646,21 @@ internal object LiteRtLmRunController {
 
                             if (inst != null) {
                                 runCatching { inst.conversation.close() }
-                                    .onFailure { AppLog.e(LiteRtLmLogging.TAG, "Hard-close: conversation.close failed: key='$key' err=${it.message}", it) }
+                                    .onFailure {
+                                        AppLog.e(
+                                            LiteRtLmLogging.TAG,
+                                            "Hard-close: conversation.close failed: key='$key' err=${it.message}",
+                                            it,
+                                        )
+                                    }
                                 runCatching { inst.engine.close() }
-                                    .onFailure { AppLog.e(LiteRtLmLogging.TAG, "Hard-close: engine.close failed: key='$key' err=${it.message}", it) }
+                                    .onFailure {
+                                        AppLog.e(
+                                            LiteRtLmLogging.TAG,
+                                            "Hard-close: engine.close failed: key='$key' err=${it.message}",
+                                            it,
+                                        )
+                                    }
                             }
 
                             val tNow = SystemClock.elapsedRealtime()
@@ -461,13 +671,17 @@ internal object LiteRtLmRunController {
                             rs.active.set(false)
                             rs.recovering.set(false)
                             rs.logicalDone.set(true)
-                            rs.logicalTerminator.set(null)
-                            rs.logicalDoneHook.set(null)
+                            clearTransientCancelState(rs)
+                            clearTransientLogicalHooks(rs)
 
+                            // Native-done cleanup must still fire before we consider the run fully closed.
                             fireNativeDoneHookOnce(key)
                         }
 
-                        AppLog.e(LiteRtLmLogging.TAG, "Hard-close completed: key='$key' runId=$expectedRunId")
+                        AppLog.e(
+                            LiteRtLmLogging.TAG,
+                            "Hard-close completed: key='$key' runId=$expectedRunId",
+                        )
                         debugState(key, rs, "hardClose:done")
                         return@launch
                     }
@@ -504,7 +718,12 @@ internal object LiteRtLmRunController {
             LiteRtLmSessionManager.cancelScheduledCleanup(key, "runInference")
 
             fun failFast(message: String, t: Throwable? = null) {
-                if (t != null) AppLog.e(LiteRtLmLogging.TAG, message, t) else AppLog.e(LiteRtLmLogging.TAG, message)
+                if (t != null) {
+                    AppLog.e(LiteRtLmLogging.TAG, message, t)
+                } else {
+                    AppLog.e(LiteRtLmLogging.TAG, message)
+                }
+
                 postToMain {
                     onError(message)
                     resultListener("", true)
@@ -514,7 +733,9 @@ internal object LiteRtLmRunController {
 
             val rs = getRunState(key)
 
-            // Acquire preparation lock first (blocks concurrent runs during init/upgrade).
+            /**
+             * Acquire preparation lock first.
+             */
             if (!rs.preparing.compareAndSet(false, true)) {
                 failFast(cleanError("Busy (already preparing)"))
                 return@launch
@@ -526,27 +747,34 @@ internal object LiteRtLmRunController {
             }
 
             val myRunId = rs.runId.incrementAndGet()
-            rs.terminated.set(false)
-            rs.logicalDone.set(false)
-            rs.recovering.set(false)
+
+            /**
+             * Start a brand-new run boundary.
+             *
+             * Important:
+             * - Clear stale terminal / cancel / hook state from any previous run.
+             * - Only after that, optionally import a fresh pending cancel for race windows.
+             */
+            prepareFreshRunState(rs)
+
             val nowStartMs = SystemClock.elapsedRealtime()
             rs.lastMessageAtMs.set(nowStartMs)
 
-            // Transfer pending cancel into the current run window WITHOUT clobbering an already requested cancel.
-            val preCancelled = rs.pendingCancel.getAndSet(false)
-            val preCancelAtMs = rs.pendingCancelAtMs.getAndSet(0L)
-            val preCancelFresh = preCancelled && preCancelAtMs > 0L && (nowStartMs - preCancelAtMs) <= PENDING_CANCEL_TTL_MS
-            if (preCancelFresh) rs.cancelRequested.set(true)
+            if (consumeFreshPendingCancel(rs, nowStartMs)) {
+                rs.cancelRequested.set(true)
+            }
 
-            runCatching { LiteRtLmInitCoordinator.awaitInitIfInFlight(key, reason = "runInference") }
-                .onFailure { t ->
-                    rs.preparing.set(false)
-                    failFast(
-                        "LiteRT-LM cannot start inference while initialization is in progress: ${LiteRtLmLogging.cleanError(t.message)}",
-                        t
-                    )
-                    return@launch
-                }
+            runCatching {
+                LiteRtLmInitCoordinator.awaitInitIfInFlight(key, reason = "runInference")
+            }.onFailure { t ->
+                rs.preparing.set(false)
+                failFast(
+                    "LiteRT-LM cannot start inference while initialization is in progress: " +
+                            LiteRtLmLogging.cleanError(t.message),
+                    t,
+                )
+                return@launch
+            }
 
             val wantImage = images.isNotEmpty()
             val wantAudio = audioClips.isNotEmpty()
@@ -558,7 +786,7 @@ internal object LiteRtLmRunController {
                     rs.preparing.set(false)
                     failFast(
                         "LiteRT-LM model '${model.name}' is not initialized, and no application context is set. " +
-                                "Call setApplicationContext() or initializeIfNeeded() first."
+                                "Call setApplicationContext() or initializeIfNeeded() first.",
                     )
                     return@launch
                 }
@@ -577,7 +805,9 @@ internal object LiteRtLmRunController {
                 }
             }
 
-            // Upgrade capabilities if needed (allowed during preparing).
+            /**
+             * Upgrade capabilities if needed.
+             */
             val appContext = appContextProvider()
             if ((wantImage || wantAudio) && appContext != null) {
                 runCatching {
@@ -625,18 +855,21 @@ internal object LiteRtLmRunController {
                 return@launch
             }
 
-            val i = inst ?: run {
+            inst ?: run {
                 rs.preparing.set(false)
                 failFast("Not initialized")
                 return@launch
             }
+
             var conv = conversation ?: run {
                 rs.preparing.set(false)
                 failFast("Not initialized")
                 return@launch
             }
 
-            // Transition to active streaming now.
+            /**
+             * Transition to active streaming now.
+             */
             rs.active.set(true)
             rs.preparing.set(false)
 
@@ -646,7 +879,8 @@ internal object LiteRtLmRunController {
 
             AppLog.d(
                 LiteRtLmLogging.TAG,
-                "runInference start: key='$key' runId=$myRunId hasText=$hasText textLen=${trimmed.length} images=${images.size} audioClips=${audioClips.size}"
+                "runInference start: key='$key' runId=$myRunId hasText=$hasText " +
+                        "textLen=${trimmed.length} images=${images.size} audioClips=${audioClips.size}",
             )
 
             val callbackLock = Any()
@@ -660,24 +894,39 @@ internal object LiteRtLmRunController {
                 minEmitChars = MAIN_DELTA_MIN_CHARS,
                 maxEmitIntervalMs = MAIN_DELTA_MAX_INTERVAL_MS,
                 isSameRun = { rs.runId.get() == myRunId },
-                isStillActive = { rs.runId.get() == myRunId && !rs.terminated.get() && !rs.logicalDone.get() },
-                deliver = { chunk -> resultListener(chunk, false) }
+                isStillActive = {
+                    rs.runId.get() == myRunId &&
+                            !rs.terminated.get() &&
+                            !rs.logicalDone.get()
+                },
+                deliver = { chunk -> resultListener(chunk, false) },
             )
 
             fun scheduleDeferredActions() {
                 val q = pendingAfterStream.remove(key) ?: return
                 while (true) {
                     val act = q.poll() ?: break
-                    runCatching { act.invoke() }.onFailure { t ->
-                        AppLog.w(LiteRtLmLogging.TAG, "Deferred action failed for key='$key': ${t.message}", t)
-                    }
+                    runCatching { act.invoke() }
+                        .onFailure { t ->
+                            AppLog.w(
+                                LiteRtLmLogging.TAG,
+                                "Deferred action failed for key='$key': ${t.message}",
+                                t,
+                            )
+                        }
                 }
             }
 
             fun scheduleCleanUpListener() {
                 postToMain {
                     runCatching { cleanUpListener.invoke() }
-                        .onFailure { t -> AppLog.w(LiteRtLmLogging.TAG, "cleanUpListener failed: ${t.message}", t) }
+                        .onFailure { t ->
+                            AppLog.w(
+                                LiteRtLmLogging.TAG,
+                                "cleanUpListener failed: ${t.message}",
+                                t,
+                            )
+                        }
                 }
             }
 
@@ -691,27 +940,35 @@ internal object LiteRtLmRunController {
 
             fun deliverLogicalDoneOnce(errorMessage: String? = null, isCancel: Boolean = false) {
                 if (!rs.logicalDone.compareAndSet(false, true)) return
-                if (LiteRtLmLogging.DEBUG_STATE) debugState(key, rs, "logicalDone")
+                if (LiteRtLmLogging.DEBUG_STATE) {
+                    debugState(key, rs, "logicalDone")
+                }
 
                 postToMain {
                     mainDelta.flushNow(force = true)
 
                     val cancelled = isCancel || rs.cancelRequested.get()
                     if (cancelled) {
-                        if (notifyCancelToOnError && !errorMessage.isNullOrBlank()) onError(errorMessage)
+                        if (notifyCancelToOnError && !errorMessage.isNullOrBlank()) {
+                            onError(errorMessage)
+                        }
                     } else if (!errorMessage.isNullOrBlank()) {
                         onError(errorMessage)
                     }
+
                     resultListener("", true)
                     mainDelta.cancel()
                 }
             }
 
-            // Allow hard-close watchdog to deliver logical completion for this run.
             rs.logicalDoneHook.set(hook@{
                 if (rs.runId.get() != myRunId) return@hook
                 val cancelled = rs.cancelRequested.get()
-                val msg = if (cancelled) "Cancelled" else "Hard-close watchdog terminated stream"
+                val msg = if (cancelled) {
+                    "Cancelled"
+                } else {
+                    "Hard-close watchdog terminated stream"
+                }
                 deliverLogicalDoneOnce(errorMessage = msg, isCancel = cancelled)
             })
 
@@ -719,11 +976,21 @@ internal object LiteRtLmRunController {
                 ioScope.launch {
                     val convNow = LiteRtLmSessionManager.getInstance(key)?.conversation
                     if (convNow == null) {
-                        AppLog.w(LiteRtLmLogging.TAG, "cancelProcess skipped: conversation missing key='$key' stage='$stage'")
+                        AppLog.w(
+                            LiteRtLmLogging.TAG,
+                            "cancelProcess skipped: conversation missing key='$key' stage='$stage'",
+                        )
                         return@launch
                     }
+
                     runCatching { convNow.cancelProcess() }
-                        .onFailure { t -> AppLog.w(LiteRtLmLogging.TAG, "cancelProcess() failed: key='$key' stage='$stage' err=${t.message}", t) }
+                        .onFailure { t ->
+                            AppLog.w(
+                                LiteRtLmLogging.TAG,
+                                "cancelProcess() failed: key='$key' stage='$stage' err=${t.message}",
+                                t,
+                            )
+                        }
                 }
             }
 
@@ -740,18 +1007,30 @@ internal object LiteRtLmRunController {
                 rs.preparing.set(false)
                 rs.active.set(false)
                 rs.recovering.set(false)
-                rs.logicalTerminator.set(null)
-                rs.logicalDoneHook.set(null)
 
-                if (!isCancel) {
-                    rs.cancelRequested.set(false)
-                    rs.pendingCancel.set(false)
-                }
+                /**
+                 * Clear transient per-run state on every terminal path, including cancellation.
+                 *
+                 * Why:
+                 * - A cancelled old run must never poison the next run.
+                 * - `isCancel` is passed explicitly to logical completion, so we do not need
+                 *   to keep cancelRequested alive after the terminal boundary.
+                 *
+                 * Important:
+                 * - Keep nativeDoneHook alive until after fireNativeDoneHookOnce().
+                 *   Otherwise cleanUpListener / deferred actions are lost.
+                 */
+                clearTransientCancelState(rs)
+                clearTransientLogicalHooks(rs)
 
                 deliverLogicalDoneOnce(errorMessage = errorMessage, isCancel = isCancel)
+
+                // Fire cleanup/deferred actions before dropping the native hook.
                 fireNativeDoneHookOnce(key)
 
-                if (LiteRtLmLogging.DEBUG_STATE) debugState(key, rs, "nativeDone")
+                if (LiteRtLmLogging.DEBUG_STATE) {
+                    debugState(key, rs, "nativeDone")
+                }
             }
 
             fun requestLogicalCancel(reason: String) {
@@ -759,13 +1038,22 @@ internal object LiteRtLmRunController {
                 deliverLogicalDoneOnce(errorMessage = reason, isCancel = true)
 
                 cancelProcessBestEffort(stage = "logicalCancel")
-                if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "logicalCancel", expectedRunId = myRunId)
+                if (HARD_CLOSE_ENABLE) {
+                    startHardCloseWatchdog(
+                        key = key,
+                        reason = "logicalCancel",
+                        expectedRunId = myRunId,
+                    )
+                }
             }
 
             rs.logicalTerminator.set { requestLogicalCancel("Cancelled") }
 
             if (rs.cancelRequested.get()) {
-                AppLog.i(LiteRtLmLogging.TAG, "LiteRT-LM start cancelled before sendMessageAsync: key='$key'")
+                AppLog.i(
+                    LiteRtLmLogging.TAG,
+                    "LiteRT-LM start cancelled before sendMessageAsync: key='$key'",
+                )
                 markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
                 return@launch
             }
@@ -775,14 +1063,26 @@ internal object LiteRtLmRunController {
                 if (rs.runId.get() != myRunId) return@launch
                 if (rs.terminated.get()) return@launch
 
-                AppLog.e(LiteRtLmLogging.TAG, "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms")
+                AppLog.e(
+                    LiteRtLmLogging.TAG,
+                    "Stream watchdog fired: key='$key' runId=$myRunId timeout=${STREAM_WATCHDOG_MS}ms",
+                )
                 debugState(key, rs, "watchdog:fired")
 
                 deliverLogicalDoneOnce("Timeout: inference did not complete in ${STREAM_WATCHDOG_MS}ms")
                 cancelProcessBestEffort(stage = "watchdog")
-                if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "watchdog", expectedRunId = myRunId)
 
-                if (!nativeStarted.get()) markNativeDoneOnce("Timeout before native start")
+                if (HARD_CLOSE_ENABLE) {
+                    startHardCloseWatchdog(
+                        key = key,
+                        reason = "watchdog",
+                        expectedRunId = myRunId,
+                    )
+                }
+
+                if (!nativeStarted.get()) {
+                    markNativeDoneOnce("Timeout before native start")
+                }
             }
 
             val callback = object : MessageCallback {
@@ -816,12 +1116,17 @@ internal object LiteRtLmRunController {
                     if (LiteRtLmLogging.DEBUG_STREAM) {
                         val c: Int = synchronized(callbackLock) { msgCount }
                         if (c == 1 || c % LiteRtLmLogging.DEBUG_STREAM_EVERY_N == 0) {
-                            val dPreview = delta.take(LiteRtLmLogging.DEBUG_PREFIX_CHARS).replace("\n", "\\n")
-                            val sPreview = snapshotRaw.take(LiteRtLmLogging.DEBUG_PREFIX_CHARS).replace("\n", "\\n")
+                            val dPreview = delta
+                                .take(LiteRtLmLogging.DEBUG_PREFIX_CHARS)
+                                .replace("\n", "\\n")
+                            val sPreview = snapshotRaw
+                                .take(LiteRtLmLogging.DEBUG_PREFIX_CHARS)
+                                .replace("\n", "\\n")
                             AppLog.d(
                                 LiteRtLmLogging.TAG,
-                                "stream[key=$key runId=$myRunId] msg#$c snapLen=${snapshotRaw.length} deltaLen=${delta.length} " +
-                                        "snapPreview='$sPreview' deltaPreview='$dPreview' emittedLen=${nextEmitted.length}"
+                                "stream[key=$key runId=$myRunId] msg#$c snapLen=${snapshotRaw.length} " +
+                                        "deltaLen=${delta.length} snapPreview='$sPreview' " +
+                                        "deltaPreview='$dPreview' emittedLen=${nextEmitted.length}",
                             )
                         }
                     }
@@ -841,15 +1146,29 @@ internal object LiteRtLmRunController {
                     val msg = LiteRtLmLogging.cleanError(rawMsg)
                     val code = LiteRtLmLogging.extractStatusCodeBestEffort(throwable)
 
-                    val cancelled = rs.cancelRequested.get() || LiteRtLmLogging.isCancellationThrowable(throwable, msg)
+                    val cancelled =
+                        rs.cancelRequested.get() ||
+                                LiteRtLmLogging.isCancellationThrowable(throwable, msg)
+
                     if (cancelled) {
-                        AppLog.i(LiteRtLmLogging.TAG, "LiteRT-LM inference cancelled: key='$key' runId=$myRunId")
+                        AppLog.i(
+                            LiteRtLmLogging.TAG,
+                            "LiteRT-LM inference cancelled: key='$key' runId=$myRunId",
+                        )
                         markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
                         return
                     }
 
-                    val decorated = if (code != null) "Error($code): $msg" else "Error: $msg"
-                    AppLog.e(LiteRtLmLogging.TAG, "LiteRT-LM inference error: key='$key' runId=$myRunId $decorated")
+                    val decorated = if (code != null) {
+                        "Error($code): $msg"
+                    } else {
+                        "Error: $msg"
+                    }
+
+                    AppLog.e(
+                        LiteRtLmLogging.TAG,
+                        "LiteRT-LM inference error: key='$key' runId=$myRunId $decorated",
+                    )
                     markNativeDoneOnce(decorated)
                 }
             }
@@ -859,16 +1178,21 @@ internal object LiteRtLmRunController {
                     if (BuildConfig.DEBUG) {
                         AppLog.i(
                             LiteRtLmLogging.TAG,
-                            "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length} preview='${LiteRtLmLogging.safeLogPreview(trimmed)}'"
+                            "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId " +
+                                    "len=${trimmed.length} preview='${LiteRtLmLogging.safeLogPreview(trimmed)}'",
                         )
                     } else {
-                        AppLog.i(LiteRtLmLogging.TAG, "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length}")
+                        AppLog.i(
+                            LiteRtLmLogging.TAG,
+                            "LiteRT-LM sendMessageAsync(text): key='$key' runId=$myRunId len=${trimmed.length}",
+                        )
                     }
                     conv.sendMessageAsync(trimmed, callback)
                 } else {
                     AppLog.i(
                         LiteRtLmLogging.TAG,
-                        "LiteRT-LM sendMessageAsync(mm): key='$key' runId=$myRunId textLen=${trimmed.length} images=${images.size} audio=${audioClips.size}"
+                        "LiteRT-LM sendMessageAsync(mm): key='$key' runId=$myRunId " +
+                                "textLen=${trimmed.length} images=${images.size} audio=${audioClips.size}",
                     )
                     val contentList = buildContentList(trimmed, images, audioClips)
                     val contentsObj = buildContentsObject(contentList)
@@ -877,16 +1201,26 @@ internal object LiteRtLmRunController {
                 nativeStarted.set(true)
             } catch (e: Exception) {
                 val recoverable = LiteRtLmLogging.isConversationNotAliveError(e)
-                AppLog.e(LiteRtLmLogging.TAG, "LiteRT-LM sendMessageAsync failed: key='$key' msg=${e.message}", e)
+                AppLog.e(
+                    LiteRtLmLogging.TAG,
+                    "LiteRT-LM sendMessageAsync failed: key='$key' msg=${e.message}",
+                    e,
+                )
 
                 if (recoverable) {
                     rs.recovering.set(true)
                     rs.lastMessageAtMs.set(SystemClock.elapsedRealtime())
 
-                    AppLog.w(LiteRtLmLogging.TAG, "Recovering from not-alive conversation: key='$key' runId=$myRunId")
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "Recovering from not-alive conversation: key='$key' runId=$myRunId",
+                    )
 
                     if (rs.cancelRequested.get()) {
-                        AppLog.i(LiteRtLmLogging.TAG, "Recovery aborted due to cancellation: key='$key' runId=$myRunId")
+                        AppLog.i(
+                            LiteRtLmLogging.TAG,
+                            "Recovery aborted due to cancellation: key='$key' runId=$myRunId",
+                        )
                         markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
                         return@launch
                     }
@@ -913,7 +1247,10 @@ internal object LiteRtLmRunController {
 
                     if (ok) {
                         if (rs.cancelRequested.get()) {
-                            AppLog.i(LiteRtLmLogging.TAG, "Recovery retry skipped due to cancellation: key='$key' runId=$myRunId")
+                            AppLog.i(
+                                LiteRtLmLogging.TAG,
+                                "Recovery retry skipped due to cancellation: key='$key' runId=$myRunId",
+                            )
                             markNativeDoneOnce(errorMessage = "Cancelled", isCancel = true)
                             return@launch
                         }
@@ -927,11 +1264,18 @@ internal object LiteRtLmRunController {
                                 conv.sendMessageAsync(contentsObj, callback)
                             }
                         }.onSuccess {
-                            AppLog.w(LiteRtLmLogging.TAG, "Recovery retry succeeded: key='$key' runId=$myRunId")
+                            AppLog.w(
+                                LiteRtLmLogging.TAG,
+                                "Recovery retry succeeded: key='$key' runId=$myRunId",
+                            )
                             nativeStarted.set(true)
                             rs.recovering.set(false)
                         }.onFailure { e2 ->
-                            AppLog.e(LiteRtLmLogging.TAG, "Recovery retry failed: key='$key' runId=$myRunId err=${e2.message}", e2)
+                            AppLog.e(
+                                LiteRtLmLogging.TAG,
+                                "Recovery retry failed: key='$key' runId=$myRunId err=${e2.message}",
+                                e2,
+                            )
                             markNativeDoneOnce(LiteRtLmLogging.cleanError(e2.message))
                         }
                     } else {
@@ -941,7 +1285,9 @@ internal object LiteRtLmRunController {
                     markNativeDoneOnce(LiteRtLmLogging.cleanError(e.message))
                 }
             } finally {
-                if (rs.runId.get() == myRunId && rs.terminated.get()) rs.recovering.set(false)
+                if (rs.runId.get() == myRunId && rs.terminated.get()) {
+                    rs.recovering.set(false)
+                }
                 rs.preparing.set(false)
             }
         }
@@ -952,7 +1298,7 @@ internal object LiteRtLmRunController {
      *
      * Behavior:
      * - Cancels an ACTIVE native stream (or recovery-owned run slot).
-     * - If preparing (init/upgrade), records cancelRequested so the upcoming sendMessageAsync is skipped.
+     * - If preparing, records cancelRequested so the upcoming sendMessageAsync is skipped.
      * - If not occupied, sets a short-lived pending cancel for start-race windows.
      */
     internal fun cancel(key: String) {
@@ -960,16 +1306,27 @@ internal object LiteRtLmRunController {
             val rs = getRunState(key)
             val nowMs = SystemClock.elapsedRealtime()
 
-            // If we are in preparation phase, record cancellation and let runInference abort naturally.
+            /**
+             * If we are in preparation phase, record cancellation and let runInference abort naturally.
+             */
             if (rs.preparing.get() && !rs.active.get() && !rs.recovering.get()) {
                 rs.cancelRequested.set(true)
                 rs.pendingCancelAtMs.set(nowMs)
                 rs.pendingCancel.set(true)
-                AppLog.d(LiteRtLmLogging.TAG, "cancel requested during preparing: key='$key'")
+                AppLog.d(
+                    LiteRtLmLogging.TAG,
+                    "cancel requested during preparing: key='$key'",
+                )
                 return@launch
             }
 
+            /**
+             * No occupied run:
+             * - Do not leave a permanent cancellation mark.
+             * - Use only a short-lived pending cancel for start-race windows.
+             */
             if (!isRunOccupiedKey(key)) {
+                rs.cancelRequested.set(false)
                 rs.pendingCancelAtMs.set(nowMs)
                 rs.pendingCancel.set(true)
 
@@ -977,10 +1334,18 @@ internal object LiteRtLmRunController {
                     val conv = LiteRtLmSessionManager.getInstance(key)?.conversation
                     conv?.cancelProcess()
                 }.onFailure { t ->
-                    AppLog.w(LiteRtLmLogging.TAG, "cancelProcess() failed (no-active best-effort): key='$key' err=${t.message}", t)
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "cancelProcess() failed (no-active best-effort): key='$key' err=${t.message}",
+                        t,
+                    )
                 }
 
-                AppLog.d(LiteRtLmLogging.TAG, "cancel requested (no active/recovering/preparing run): key='$key' (pending TTL ${PENDING_CANCEL_TTL_MS}ms)")
+                AppLog.d(
+                    LiteRtLmLogging.TAG,
+                    "cancel requested (no active/recovering/preparing run): key='$key' " +
+                            "(pending TTL ${PENDING_CANCEL_TTL_MS}ms)",
+                )
                 return@launch
             }
 
@@ -994,12 +1359,24 @@ internal object LiteRtLmRunController {
                     val conv = LiteRtLmSessionManager.getInstance(key)?.conversation
                     conv?.cancelProcess()
                 }.onFailure {
-                    AppLog.w(LiteRtLmLogging.TAG, "cancelProcess() failed in cancel(): key='$key' err=${it.message}", it)
+                    AppLog.w(
+                        LiteRtLmLogging.TAG,
+                        "cancelProcess() failed in cancel(): key='$key' err=${it.message}",
+                        it,
+                    )
                 }
-                if (HARD_CLOSE_ENABLE) startHardCloseWatchdog(key, reason = "cancel()", expectedRunId = rs.runId.get())
+                if (HARD_CLOSE_ENABLE) {
+                    startHardCloseWatchdog(
+                        key = key,
+                        reason = "cancel()",
+                        expectedRunId = rs.runId.get(),
+                    )
+                }
             }
 
-            if (LiteRtLmLogging.DEBUG_STATE) debugState(key, rs, "cancel")
+            if (LiteRtLmLogging.DEBUG_STATE) {
+                debugState(key, rs, "cancel")
+            }
         }
     }
 }

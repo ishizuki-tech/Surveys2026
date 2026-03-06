@@ -52,6 +52,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -66,9 +67,10 @@ import kotlinx.coroutines.withContext
  * Review screen (frame-ready).
  *
  * Goals:
- * - Display all interactions (USER/AI/FOLLOW_UP/MODEL_RAW) deterministically.
- * - Provide lightweight debug metadata (count/lines/chars/sha256) to catch regressions.
+ * - Display all interactions (USER / ASSESSMENT / FOLLOW_UP / ASSISTANT / DEBUG_RAW) deterministically.
+ * - Provide lightweight debug metadata (count / lines / chars / sha256) to catch regressions.
  * - Keep it UI-only: navigation and persistence happen outside via callbacks.
+ * - Normalize legacy aliases at the screen boundary to avoid UI drift during migration.
  */
 @Composable
 fun ReviewScreen(
@@ -83,15 +85,20 @@ fun ReviewScreen(
     val timelineKey: List<Int>? = timeline?.let { buildTimelineFingerprint(it) }
 
     val sortedLogs: List<ReviewQuestionLog> = remember(logsKey) {
-        sortLogsNaturally(logs)
+        sortLogsNaturally(logs).map { it.freeze() }
     }
 
     val resolvedTimeline: List<ReviewTimelineItem> = remember(timelineKey, logsKey) {
-        timeline ?: buildTimelineFromLogs(sortedLogs)
+        normalizeTimeline(timeline ?: buildTimelineFromLogs(sortedLogs))
     }
 
-    
-    /** Debug: detect duplicate timeline keys early (should be impossible after index-based keys). */
+    /**
+     * Debug: detect duplicate timeline keys early.
+     *
+     * Notes:
+     * - Index-based keys should already guarantee uniqueness.
+     * - This validation helps catch accidental producer regressions.
+     */
     LaunchedEffect(timelineKey ?: logsKey) {
         if (!BuildConfig.DEBUG) return@LaunchedEffect
 
@@ -139,11 +146,20 @@ fun ReviewScreen(
     LaunchedEffect(timelineKey ?: logsKey) {
         val alive = HashSet<String>(256)
 
-        for (item in resolvedTimeline) {
+        resolvedTimeline.forEachIndexed { index, item ->
             if (item is ReviewTimelineItem.Line) {
-                val line = item.line
-                if (line.kind == ReviewChatKind.MODEL_RAW && line.text.length > 260) {
-                    alive.add(rawLineKey(item.questionId, line.text))
+                val line = item.line.normalized()
+                if (isExpandableRawLine(line)) {
+                    alive.add(rawLineKeyForRow(item.questionId, index, line.text))
+                }
+            }
+        }
+
+        sortedLogs.forEach { log ->
+            log.lines.forEachIndexed { index, line ->
+                val normalizedLine = line.normalized()
+                if (isExpandableRawLine(normalizedLine)) {
+                    alive.add(rawLineKeyForRow(log.questionId, index, normalizedLine.text))
                 }
             }
         }
@@ -223,15 +239,21 @@ fun ReviewScreen(
                 )
             }
 
-            if (sortedLogs.isEmpty()) {
-                item { Text("No answers yet.") }
-            } else {
-                when (mode) {
-                    ReviewViewMode.TIMELINE -> {
+            when (mode) {
+                ReviewViewMode.TIMELINE -> {
+                    if (resolvedTimeline.isEmpty()) {
+                        item { Text("No answers yet.") }
+                    } else {
                         itemsIndexed(
                             items = resolvedTimeline,
-                            
-                            // Keys MUST be unique among siblings. Never use content-based keys for MODEL_RAW.
+
+                            /**
+                             * Keys must be unique among siblings.
+                             *
+                             * Notes:
+                             * - Use index-based keys to guarantee uniqueness.
+                             * - Never use content-only keys for DEBUG_RAW rows.
+                             */
                             key = { idx, item -> timelineRowKey(idx, item) }
                         ) { idx, item ->
                             when (item) {
@@ -240,12 +262,18 @@ fun ReviewScreen(
                             }
                         }
                     }
+                }
 
-                    ReviewViewMode.BY_QUESTION -> {
+                ReviewViewMode.BY_QUESTION -> {
+                    if (sortedLogs.isEmpty()) {
+                        item { Text("No question snapshots available.") }
+                    } else {
                         itemsIndexed(
                             items = sortedLogs,
-                            
-                            // Be robust even if questionId duplicates by mistake.
+
+                            /**
+                             * Be robust even if questionId duplicates by mistake.
+                             */
                             key = { idx, item -> "${item.questionId}:$idx" }
                         ) { _, log ->
                             QuestionTranscriptCard(
@@ -397,12 +425,23 @@ private fun buildTimelineFromLogs(sortedLogs: List<ReviewQuestionLog>): List<Rev
                     questionId = q.questionId,
                     prompt = q.prompt,
                     isSkipped = q.isSkipped,
-                    line = line
+                    line = line.normalized()
                 )
             )
         }
     }
     return out
+}
+
+private fun normalizeTimeline(timeline: List<ReviewTimelineItem>): List<ReviewTimelineItem> {
+    if (timeline.isEmpty()) return emptyList()
+
+    return timeline.map { item ->
+        when (item) {
+            is ReviewTimelineItem.QuestionHeader -> item
+            is ReviewTimelineItem.Line -> item.copy(line = item.line.normalized())
+        }
+    }
 }
 
 private fun buildTimelineFingerprint(timeline: List<ReviewTimelineItem>): List<Int> {
@@ -422,8 +461,9 @@ private fun timelineItemFingerprint(item: ReviewTimelineItem): Int {
         }
 
         is ReviewTimelineItem.Line -> {
+            val canonicalKind = item.line.kind.canonical()
             var h = item.questionId.hashCode()
-            h = (h * 31) + item.line.kind.ordinal
+            h = (h * 31) + canonicalKind.wireName.hashCode()
             h = (h * 31) + item.line.text.hashCode()
             h = (h * 31) + item.line.text.length
             h
@@ -432,11 +472,16 @@ private fun timelineItemFingerprint(item: ReviewTimelineItem): Int {
 }
 
 private fun timelineRowKey(index: Int, item: ReviewTimelineItem): String {
-    
-    // Compose requires unique keys among sibling items. Use index-based keys to guarantee uniqueness.
+    /**
+     * Compose requires unique keys among sibling items.
+     *
+     * Notes:
+     * - Use index-based keys to guarantee uniqueness.
+     * - Use canonical wire names to avoid key drift from legacy aliases.
+     */
     return when (item) {
         is ReviewTimelineItem.QuestionHeader -> "H:${item.questionId}:$index"
-        is ReviewTimelineItem.Line -> "L:${item.questionId}:${item.line.kind.name}:$index"
+        is ReviewTimelineItem.Line -> "L:${item.questionId}:${item.line.kind.canonical().wireName}:$index"
     }
 }
 
@@ -515,44 +560,23 @@ private fun TimelineLineBubble(
     item: ReviewTimelineItem.Line,
     rawExpanded: MutableMap<String, Boolean>
 ) {
-    val line = item.line
-    val isRaw = line.kind == ReviewChatKind.MODEL_RAW
-    val canToggle = isRaw && line.text.length > 260
+    val line = item.line.normalized()
+    val bubbleSpec = bubbleSpecFor(line.kind)
 
-    
-    // Stable expansion key: prefer per-row key so identical raw text does not cross-toggle.
-    val key = if (isRaw) rawLineKeyForRow(item.questionId, index, line.text) else null
+    val canToggle = isExpandableRawLine(line)
+
+    /**
+     * Stable expansion key:
+     * - Use per-row identity to avoid cross-toggle when identical raw text appears multiple times.
+     */
+    val key = if (canToggle) rawLineKeyForRow(item.questionId, index, line.text) else null
     val expanded = if (key == null) false else (rawExpanded[key] ?: false)
 
-    val header = when (line.kind) {
-        ReviewChatKind.USER -> "USER"
-        ReviewChatKind.AI -> "AI"
-        ReviewChatKind.FOLLOW_UP -> "FOLLOW-UP"
-        ReviewChatKind.MODEL_RAW -> "MODEL RAW"
-    }
-
-    val bg = when (line.kind) {
-        ReviewChatKind.USER -> MaterialTheme.colorScheme.primaryContainer
-        ReviewChatKind.AI -> MaterialTheme.colorScheme.secondaryContainer
-        ReviewChatKind.FOLLOW_UP -> MaterialTheme.colorScheme.tertiaryContainer
-        ReviewChatKind.MODEL_RAW -> MaterialTheme.colorScheme.surfaceVariant
-    }
-
-    val fg = when (line.kind) {
-        ReviewChatKind.USER -> MaterialTheme.colorScheme.onPrimaryContainer
-        ReviewChatKind.AI -> MaterialTheme.colorScheme.onSecondaryContainer
-        ReviewChatKind.FOLLOW_UP -> MaterialTheme.colorScheme.onTertiaryContainer
-        ReviewChatKind.MODEL_RAW -> MaterialTheme.colorScheme.onSurfaceVariant
-    }
-
-    val outline = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
-
-    val bodyText = if (!isRaw) {
-        line.text
-    } else {
-        if (expanded) line.text
-        else line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
-    }
+    val bodyText = collapsedOrFullText(
+        text = line.text,
+        isExpandableRaw = canToggle,
+        expanded = expanded
+    )
 
     val clickMod = if (canToggle && key != null) {
         Modifier.clickable { rawExpanded[key] = !expanded }
@@ -565,24 +589,24 @@ private fun TimelineLineBubble(
             .fillMaxWidth()
             .padding(top = 8.dp)
             .clip(RoundedCornerShape(12.dp))
-            .background(bg)
-            .border(1.dp, outline, RoundedCornerShape(12.dp))
+            .background(bubbleSpec.background)
+            .border(1.dp, bubbleSpec.outline, RoundedCornerShape(12.dp))
             .then(clickMod)
             .padding(horizontal = 10.dp, vertical = 8.dp)
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text(
-                text = "${item.questionId} • $header",
+                text = "${item.questionId} • ${bubbleSpec.header}",
                 style = MaterialTheme.typography.labelMedium,
                 fontWeight = FontWeight.SemiBold,
-                color = fg,
+                color = bubbleSpec.foreground,
                 modifier = Modifier.weight(1f)
             )
             if (canToggle) {
                 Text(
                     text = if (expanded) "Collapse" else "Expand",
                     style = MaterialTheme.typography.labelSmall,
-                    color = fg
+                    color = bubbleSpec.foreground
                 )
             }
         }
@@ -593,8 +617,8 @@ private fun TimelineLineBubble(
             Text(
                 text = bodyText,
                 style = MaterialTheme.typography.bodySmall,
-                color = fg,
-                maxLines = if (isRaw && !expanded) 10 else Int.MAX_VALUE,
+                color = bubbleSpec.foreground,
+                maxLines = if (canToggle && !expanded) 10 else Int.MAX_VALUE,
                 overflow = TextOverflow.Clip
             )
         }
@@ -667,44 +691,28 @@ private fun QuestionTranscriptCard(
                 return@Column
             }
 
-            val outline = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+            log.lines.forEachIndexed { index, originalLine ->
+                val line = originalLine.normalized()
+                val bubbleSpec = bubbleSpecFor(line.kind)
+                val canToggle = isExpandableRawLine(line)
 
-            log.lines.forEachIndexed { index, line ->
-                val isRaw = line.kind == ReviewChatKind.MODEL_RAW
-                
-                // Stable expansion key: keep per-row uniqueness to avoid cross-question collisions.
-                val key = if (isRaw) rawLineKeyForRow(log.questionId, index, line.text) else "${log.questionId}:$index"
+                /**
+                 * Stable expansion key:
+                 * - Keep per-row uniqueness to avoid cross-question collisions.
+                 */
+                val key = if (canToggle) {
+                    rawLineKeyForRow(log.questionId, index, line.text)
+                } else {
+                    "${log.questionId}:$index"
+                }
                 val expanded = rawExpanded[key] ?: false
 
-                val header = when (line.kind) {
-                    ReviewChatKind.USER -> "USER"
-                    ReviewChatKind.AI -> "AI"
-                    ReviewChatKind.FOLLOW_UP -> "FOLLOW-UP"
-                    ReviewChatKind.MODEL_RAW -> "MODEL RAW"
-                }
+                val bodyText = collapsedOrFullText(
+                    text = line.text,
+                    isExpandableRaw = canToggle,
+                    expanded = expanded
+                )
 
-                val bg = when (line.kind) {
-                    ReviewChatKind.USER -> MaterialTheme.colorScheme.primaryContainer
-                    ReviewChatKind.AI -> MaterialTheme.colorScheme.secondaryContainer
-                    ReviewChatKind.FOLLOW_UP -> MaterialTheme.colorScheme.tertiaryContainer
-                    ReviewChatKind.MODEL_RAW -> MaterialTheme.colorScheme.surfaceVariant
-                }
-
-                val fg = when (line.kind) {
-                    ReviewChatKind.USER -> MaterialTheme.colorScheme.onPrimaryContainer
-                    ReviewChatKind.AI -> MaterialTheme.colorScheme.onSecondaryContainer
-                    ReviewChatKind.FOLLOW_UP -> MaterialTheme.colorScheme.onTertiaryContainer
-                    ReviewChatKind.MODEL_RAW -> MaterialTheme.colorScheme.onSurfaceVariant
-                }
-
-                val bodyText = if (!isRaw) {
-                    line.text
-                } else {
-                    if (expanded) line.text
-                    else line.text.take(260).let { if (line.text.length > 260) "$it …" else it }
-                }
-
-                val canToggle = isRaw && line.text.length > 260
                 val clickMod = if (canToggle) {
                     Modifier.clickable { rawExpanded[key] = !expanded }
                 } else {
@@ -716,24 +724,24 @@ private fun QuestionTranscriptCard(
                         .fillMaxWidth()
                         .padding(top = 8.dp)
                         .clip(RoundedCornerShape(12.dp))
-                        .background(bg)
-                        .border(1.dp, outline, RoundedCornerShape(12.dp))
+                        .background(bubbleSpec.background)
+                        .border(1.dp, bubbleSpec.outline, RoundedCornerShape(12.dp))
                         .then(clickMod)
                         .padding(horizontal = 10.dp, vertical = 8.dp)
                 ) {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(
-                            text = header,
+                            text = bubbleSpec.header,
                             style = MaterialTheme.typography.labelMedium,
                             fontWeight = FontWeight.SemiBold,
-                            color = fg,
+                            color = bubbleSpec.foreground,
                             modifier = Modifier.weight(1f)
                         )
                         if (canToggle) {
                             Text(
                                 text = if (expanded) "Collapse" else "Expand",
                                 style = MaterialTheme.typography.labelSmall,
-                                color = fg
+                                color = bubbleSpec.foreground
                             )
                         }
                     }
@@ -744,8 +752,8 @@ private fun QuestionTranscriptCard(
                         Text(
                             text = bodyText,
                             style = MaterialTheme.typography.bodySmall,
-                            color = fg,
-                            maxLines = if (isRaw && !expanded) 10 else Int.MAX_VALUE,
+                            color = bubbleSpec.foreground,
+                            maxLines = if (canToggle && !expanded) 10 else Int.MAX_VALUE,
                             overflow = TextOverflow.Clip
                         )
                     }
@@ -800,11 +808,12 @@ private fun computeTimelineMetrics(timeline: List<ReviewTimelineItem>): ReviewMe
             }
 
             is ReviewTimelineItem.Line -> {
+                val canonicalKind = item.line.kind.canonical()
                 totalLines += 1
                 totalChars += item.line.text.length
 
                 sb.append("L=").append(item.questionId).append(':')
-                    .append(item.line.kind.name).append(':')
+                    .append(canonicalKind.wireName).append(':')
                     .append(item.line.text).append('\n')
             }
         }
@@ -827,6 +836,82 @@ private fun computeTimelineMetrics(timeline: List<ReviewTimelineItem>): ReviewMe
     )
 }
 
+private data class BubbleSpec(
+    val header: String,
+    val background: Color,
+    val foreground: Color,
+    val outline: Color
+)
+
+@Composable
+private fun bubbleSpecFor(kind: ReviewChatKind): BubbleSpec {
+    val canonicalKind = kind.canonical()
+    val outline = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
+
+    return when (canonicalKind) {
+        ReviewChatKind.USER -> BubbleSpec(
+            header = "USER",
+            background = MaterialTheme.colorScheme.primaryContainer,
+            foreground = MaterialTheme.colorScheme.onPrimaryContainer,
+            outline = outline
+        )
+
+        ReviewChatKind.ASSESSMENT -> BubbleSpec(
+            header = "ASSESSMENT",
+            background = MaterialTheme.colorScheme.secondaryContainer,
+            foreground = MaterialTheme.colorScheme.onSecondaryContainer,
+            outline = outline
+        )
+
+        ReviewChatKind.FOLLOW_UP -> BubbleSpec(
+            header = "FOLLOW-UP",
+            background = MaterialTheme.colorScheme.tertiaryContainer,
+            foreground = MaterialTheme.colorScheme.onTertiaryContainer,
+            outline = outline
+        )
+
+        ReviewChatKind.ASSISTANT -> BubbleSpec(
+            header = "ASSISTANT",
+            background = MaterialTheme.colorScheme.secondaryContainer,
+            foreground = MaterialTheme.colorScheme.onSecondaryContainer,
+            outline = outline
+        )
+
+        ReviewChatKind.DEBUG_RAW -> BubbleSpec(
+            header = "DEBUG RAW",
+            background = MaterialTheme.colorScheme.surfaceVariant,
+            foreground = MaterialTheme.colorScheme.onSurfaceVariant,
+            outline = outline
+        )
+    }
+}
+
+private fun isDebugRawKind(kind: ReviewChatKind): Boolean {
+    return when (kind.canonical()) {
+        ReviewChatKind.DEBUG_RAW -> true
+        ReviewChatKind.USER,
+        ReviewChatKind.ASSESSMENT,
+        ReviewChatKind.FOLLOW_UP,
+        ReviewChatKind.ASSISTANT -> false
+    }
+}
+
+private fun isExpandableRawLine(line: ReviewChatLine): Boolean {
+    return isDebugRawKind(line.kind) && line.text.length > RAW_COLLAPSE_THRESHOLD
+}
+
+private fun collapsedOrFullText(
+    text: String,
+    isExpandableRaw: Boolean,
+    expanded: Boolean
+): String {
+    if (!isExpandableRaw) return text
+    if (expanded) return text
+    return text.take(RAW_COLLAPSE_THRESHOLD).let { prefix ->
+        if (text.length > RAW_COLLAPSE_THRESHOLD) "$prefix …" else prefix
+    }
+}
+
 private val HEX_CHARS: CharArray = charArrayOf(
     '0', '1', '2', '3', '4', '5', '6', '7',
     '8', '9', 'a', 'b', 'c', 'd', 'e', 'f'
@@ -835,7 +920,9 @@ private val HEX_CHARS: CharArray = charArrayOf(
 /**
  * Returns a fixed-length (64 chars) lowercase hex SHA-256.
  *
- * This implementation avoids String indexing pitfalls and never throws on hex conversion.
+ * Notes:
+ * - This implementation avoids String indexing pitfalls.
+ * - This implementation never throws on hex conversion.
  */
 private fun sha256Hex(text: String): String {
     val bytes = text.toByteArray(StandardCharsets.UTF_8)
@@ -857,22 +944,31 @@ private fun logFingerprint(log: ReviewQuestionLog): Int {
     h = (h * 31) + log.completionPayload.hashCode()
     h = (h * 31) + if (log.isSkipped) 1 else 0
     for (l in log.lines) {
-        h = (h * 31) + l.kind.ordinal
+        val canonicalKind = l.kind.canonical()
+        h = (h * 31) + canonicalKind.wireName.hashCode()
         h = (h * 31) + l.text.hashCode()
     }
     return h
 }
 
 private fun rawLineKey(questionId: String, rawText: String): String {
-    
-    // This key is ONLY for expansion-state tracking (not for LazyColumn item keys).
-    // NOTE: This can collide across rows if text is identical. Prefer rawLineKeyForRow for per-row toggles.
+    /**
+     * This key is only for content-based fallback tracking.
+     *
+     * Notes:
+     * - Do not use this for LazyColumn item keys.
+     * - Prefer [rawLineKeyForRow] for actual UI expansion state.
+     */
     return "$questionId:raw:${rawText.length}:${rawText.hashCode()}"
 }
 
 private fun rawLineKeyForRow(questionId: String, index: Int, rawText: String): String {
-    
-    // Stable expansion key per row: avoids cross-toggle when identical raw text appears multiple times.
+    /**
+     * Stable expansion key per row.
+     *
+     * Notes:
+     * - Avoids cross-toggle when identical raw text appears multiple times.
+     */
     return "$questionId:rawRow:$index:${rawText.length}:${rawText.hashCode()}"
 }
 
@@ -908,4 +1004,5 @@ private fun questionIdKey(id: String): QuestionIdKey {
 
 private const val TAG = "ReviewScreen"
 private const val SHA_COMPUTING = "__computing__"
+private const val RAW_COLLAPSE_THRESHOLD = 260
 private val ID_PATTERN = Regex("^([A-Za-z]+)(\\d+)$")

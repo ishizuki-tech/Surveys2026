@@ -22,12 +22,17 @@ import java.util.Locale
  * Review assembly helpers.
  *
  * Responsibilities:
- * - Build ReviewQuestionLog list from survey question definitions + ChatDraftStore.
- * - Avoid relying on DraftStore key enumeration (SmallStep "latter" approach).
+ * - Build [ReviewQuestionLog] snapshots from survey question definitions + ChatDraftStore.
+ * - Avoid relying on DraftStore key enumeration.
+ * - Convert draft chat messages into canonical review transcript kinds.
  *
  * Notes:
- * - This layer intentionally stays "dumb": no persistence, no navigation.
- * - It is designed to be called from SurveyAppRoot/SurveyVM at Review entry.
+ * - This layer intentionally stays dumb: no persistence, no navigation.
+ * - It is designed to be called from SurveyAppRoot / Survey VM at Review entry.
+ * - This assembler follows the user-facing two-step protocol:
+ *   - Step-1 => ASSESSMENT
+ *   - Step-2 => FOLLOW_UP
+ *   - Raw model/debug stream => DEBUG_RAW
  */
 object ReviewAssembler {
 
@@ -42,11 +47,12 @@ object ReviewAssembler {
     /**
      * Build review logs for all questions in [defs].
      *
-     * @param defs Survey-owned question list (stable order is preferred; ReviewScreen also sorts).
+     * @param defs Survey-owned question list.
+     *   Stable order is preferred, though ReviewScreen also sorts naturally.
      * @param draftStore Chat draft storage used by ChatQuestionViewModel.
      * @param keyForQuestion A provider that maps questionId -> DraftKey.
      *
-     * @return Immutable snapshot logs suitable for ReviewScreen/Export.
+     * @return Immutable snapshot logs suitable for ReviewScreen / Export.
      */
     fun buildLogs(
         defs: List<ReviewQuestionDef>,
@@ -80,7 +86,7 @@ object ReviewAssembler {
                     prompt = pr
                 )
 
-                val hasUser = lines.any { it.kind == ReviewChatKind.USER }
+                val hasUser = lines.any { it.kind.canonical() == ReviewChatKind.USER }
 
                 val completionRaw = draft.completionPayload?.trim().orEmpty()
                 val completion = when {
@@ -90,6 +96,7 @@ object ReviewAssembler {
                         questionId = qid,
                         promptHash = key.promptHash
                     )
+
                     else -> buildMetaPayload(
                         kind = PayloadKind.SKIPPED_NO_COMPLETION,
                         questionId = qid,
@@ -118,18 +125,23 @@ object ReviewAssembler {
      * Convert chat draft messages into review transcript lines.
      *
      * Mapping policy:
-     * - USER -> ReviewChatKind.USER
-     * - ASSISTANT -> split into AI + FOLLOW_UP (+ optional MODEL_RAW if model output exists)
-     * - MODEL (streaming bubble) -> MODEL_RAW
+     * - USER -> USER
+     * - ASSISTANT role:
+     *   - assistantMessage -> ASSESSMENT
+     *   - followUpQuestion -> FOLLOW_UP
+     *   - embedded streamText -> DEBUG_RAW
+     * - MODEL role (streaming bubble) -> DEBUG_RAW
      *
      * De-dup policy:
-     * - If ANY ASSISTANT message contains an embedded model output (streamText),
-     *   then MODEL-role messages are treated as transient and are ignored.
-     * - MODEL_RAW lines are de-duplicated by SHA-256(signature) to avoid double counting.
+     * - If any ASSISTANT-role message contains an embedded model output (streamText),
+     *   MODEL-role streaming bubbles are treated as transient and ignored.
+     * - DEBUG_RAW lines are de-duplicated by SHA-256(content) to avoid double counting.
      *
      * Seed filtering:
-     * - Drop the initial "seed" message from ChatQuestionViewModel:
-     *   assistantMessage="Question: <qid>" + followUpQuestion="<prompt>" (before any USER line).
+     * - Drop the initial seed message from ChatQuestionViewModel:
+     *   assistantMessage = "Question: <qid>"
+     *   followUpQuestion = "<prompt>"
+     *   before any USER line exists.
      */
     private fun List<ChatModels.ChatMessage>.toReviewLines(
         questionId: String,
@@ -137,29 +149,33 @@ object ReviewAssembler {
     ): List<ReviewChatLine> {
         if (isEmpty()) return emptyList()
 
-        
-        /** Prefer embedded model output on ASSISTANT messages over transient MODEL bubbles. */
-        val hasEmbeddedModelOutput = any { it.role == ChatModels.ChatRole.ASSISTANT && !it.streamText.isNullOrBlank() }
+        /**
+         * Prefer embedded model output on ASSISTANT messages over transient MODEL bubbles.
+         */
+        val hasEmbeddedModelOutput =
+            any { it.role == ChatModels.ChatRole.ASSISTANT && !it.streamText.isNullOrBlank() }
 
         val out = ArrayList<ReviewChatLine>(size * 2)
 
-        
-        /** De-duplicate MODEL_RAW lines by content signature to reduce double-counting. */
-        val seenModelRaw = HashSet<String>(8)
+        /**
+         * De-duplicate DEBUG_RAW lines by content signature to reduce double counting.
+         */
+        val seenDebugRaw = HashSet<String>(8)
 
         var seenUser = false
         val promptTrimmed = prompt.trim()
 
         fun addLine(kind: ReviewChatKind, text: String) {
+            val canonicalKind = kind.canonical()
             val t = text.trim()
             if (t.isEmpty()) return
 
-            if (kind == ReviewChatKind.MODEL_RAW) {
+            if (canonicalKind == ReviewChatKind.DEBUG_RAW) {
                 val sig = sha256Hex(t)
-                if (!seenModelRaw.add(sig)) return
+                if (!seenDebugRaw.add(sig)) return
             }
 
-            out += ReviewChatLine(kind = kind, text = t)
+            out += ReviewChatLine.of(kind = canonicalKind, text = t)
         }
 
         for (m in this) {
@@ -173,25 +189,33 @@ object ReviewAssembler {
                 }
 
                 ChatModels.ChatRole.ASSISTANT -> {
-                    val a = m.assistantMessage?.trim().orEmpty()
-                    val q = normalizeFollowUp(m.followUpQuestion)
+                    val assessment = m.assistantMessage?.trim().orEmpty()
+                    val followUp = normalizeFollowUp(m.followUpQuestion)
 
-                    
-                    /** Drop the initial seed prompt bubble to avoid duplication in Review. */
+                    /**
+                     * Drop the initial seed prompt bubble to avoid duplication in Review.
+                     */
                     val isSeedPrompt =
                         !seenUser &&
-                                a == "Question: $questionId" &&
-                                (q?.trim().orEmpty() == promptTrimmed)
+                                assessment == "Question: $questionId" &&
+                                (followUp?.trim().orEmpty() == promptTrimmed)
 
                     if (isSeedPrompt) {
                         continue
                     }
 
-                    if (a.isNotEmpty()) addLine(ReviewChatKind.AI, a)
-                    if (!q.isNullOrBlank() && q.trim() != promptTrimmed) addLine(ReviewChatKind.FOLLOW_UP, q)
+                    if (assessment.isNotEmpty()) {
+                        addLine(ReviewChatKind.ASSESSMENT, assessment)
+                    }
+
+                    if (!followUp.isNullOrBlank() && followUp.trim() != promptTrimmed) {
+                        addLine(ReviewChatKind.FOLLOW_UP, followUp)
+                    }
 
                     val embedded = m.streamText?.trim().orEmpty()
-                    if (embedded.isNotEmpty()) addLine(ReviewChatKind.MODEL_RAW, embedded)
+                    if (embedded.isNotEmpty()) {
+                        addLine(ReviewChatKind.DEBUG_RAW, embedded)
+                    }
                 }
 
                 ChatModels.ChatRole.MODEL -> {
@@ -199,8 +223,11 @@ object ReviewAssembler {
                         // Skip transient streaming bubbles when an embedded result exists.
                         continue
                     }
+
                     val raw = (m.streamText?.takeIf { it.isNotBlank() } ?: m.text).trim()
-                    if (raw.isNotEmpty()) addLine(ReviewChatKind.MODEL_RAW, raw)
+                    if (raw.isNotEmpty()) {
+                        addLine(ReviewChatKind.DEBUG_RAW, raw)
+                    }
                 }
             }
         }
@@ -213,10 +240,11 @@ object ReviewAssembler {
     // ---------------------------------------------------------------------
 
     /**
-     * Normalizes a follow-up question and removes garbage values.
+     * Normalize a follow-up question and drop garbage values.
      *
      * Notes:
-     * - Avoid Locale pitfalls by using Locale.US for case normalization.
+     * - Uses Locale.US for deterministic case folding.
+     * - Removes common wrapper prefixes produced by prompting layers.
      */
     private fun normalizeFollowUp(text: String?): String? {
         val raw = text ?: return null
@@ -243,9 +271,19 @@ object ReviewAssembler {
 
         val l2 = t.lowercase(Locale.US)
         val garbage = setOf(
-            "none", "(none)", "n/a", "na", "null", "nil",
-            "no", "nope", "no follow up", "no follow-up",
-            "skip", "0", "-"
+            "none",
+            "(none)",
+            "n/a",
+            "na",
+            "null",
+            "nil",
+            "no",
+            "nope",
+            "no follow up",
+            "no follow-up",
+            "skip",
+            "0",
+            "-"
         )
         if (t.isBlank()) return null
         if (l2 in garbage) return null
@@ -268,8 +306,8 @@ object ReviewAssembler {
      * Build a non-PII payload fallback.
      *
      * Notes:
-     * - This is safe to export/log.
-     * - Do NOT include user answers.
+     * - Safe to export and log.
+     * - Must not include raw user answers.
      */
     private fun buildMetaPayload(kind: PayloadKind, questionId: String, promptHash: Int): String {
         return buildString {
@@ -299,8 +337,13 @@ object ReviewAssembler {
     // Signatures
     // ---------------------------------------------------------------------
 
-    
-    /** SHA-256 hex for content de-dup signatures (fast enough for review assembly). */
+    /**
+     * SHA-256 hex used for DEBUG_RAW content de-dup signatures.
+     *
+     * Notes:
+     * - Fast enough for review assembly.
+     * - Produces lowercase fixed-width hex.
+     */
     private fun sha256Hex(text: String): String {
         val digest = MessageDigest.getInstance("SHA-256")
         val bytes = digest.digest(text.toByteArray(Charsets.UTF_8))
