@@ -18,9 +18,10 @@ import org.json.JSONObject
 /**
  * Best-effort parsing helpers for chat bubble UI.
  *
- * IMPORTANT:
+ * Important:
  * - UI-only parsing. Never log raw user/model text here.
- * - `assistantMessage` is not supported; we only parse followUpQuestion + score/status.
+ * - Prefer structured fields from ChatMessage when available.
+ * - These parsers are fallback helpers for mixed/raw blobs.
  */
 internal object ChatBubbleParsing {
 
@@ -31,6 +32,7 @@ internal object ChatBubbleParsing {
 
     data class VerdictResult(
         val status: String?,
+        val assistantMessage: String?,
         val followUpQuestion: String?,
     )
 
@@ -75,9 +77,16 @@ internal object ChatBubbleParsing {
         return runCatching {
             val obj = JSONObject(json)
             if (!obj.has("score")) return null
-            val score = obj.optInt("score", -1)
+
+            val score = when (val raw = obj.opt("score")) {
+                is Number -> raw.toInt()
+                is String -> raw.trim().toIntOrNull() ?: return null
+                else -> return null
+            }
+
             if (score !in 0..100) return null
-            val status = obj.optString("status").takeIf { it.isNotBlank() }
+
+            val status = optNonBlank(obj, "status")
             EvalResult(status = status, score = score)
         }.getOrNull()
     }
@@ -100,12 +109,18 @@ internal object ChatBubbleParsing {
     }
 
     /**
-     * Extracts the latest JSON object that contains followUpQuestion.
+     * Extracts the latest assistant/verdict-like JSON object.
      *
      * Supported keys:
+     * - assistantMessage
+     * - assistant_message
      * - followUpQuestion
      * - followupQuestion
      * - follow_up_question
+     *
+     * Notes:
+     * - This intentionally ignores score-only eval JSON.
+     * - It returns the latest object that carries assistant-facing structured content.
      */
     fun extractLatestVerdictBestEffort(raw: String?): VerdictResult? {
         val s = raw?.takeIf { it.isNotBlank() } ?: return null
@@ -125,17 +140,23 @@ internal object ChatBubbleParsing {
         return runCatching {
             val obj = JSONObject(json)
 
+            val assistantMessage =
+                optNonBlank(obj, "assistantMessage")
+                    ?: optNonBlank(obj, "assistant_message")
+
             val followUpQuestion =
-                obj.optString("followUpQuestion").takeIf { it.isNotBlank() }
-                    ?: obj.optString("followupQuestion").takeIf { it.isNotBlank() }
-                    ?: obj.optString("follow_up_question").takeIf { it.isNotBlank() }
+                optNonBlank(obj, "followUpQuestion")
+                    ?: optNonBlank(obj, "followupQuestion")
+                    ?: optNonBlank(obj, "follow_up_question")
 
-            val status = obj.optString("status").takeIf { it.isNotBlank() }
+            val status = optNonBlank(obj, "status")
 
-            if (followUpQuestion == null) return null
+            // Ignore eval-only JSON that does not contain assistant-facing content.
+            if (assistantMessage == null && followUpQuestion == null) return null
 
             VerdictResult(
                 status = status,
+                assistantMessage = assistantMessage,
                 followUpQuestion = followUpQuestion,
             )
         }.getOrNull()
@@ -202,5 +223,14 @@ internal object ChatBubbleParsing {
         }
 
         return out
+    }
+
+    /**
+     * Reads a JSON string field and returns null when blank.
+     */
+    private fun optNonBlank(obj: JSONObject, key: String): String? {
+        if (!obj.has(key)) return null
+        val value = obj.optString(key, "").trim()
+        return value.takeIf { it.isNotBlank() }
     }
 }

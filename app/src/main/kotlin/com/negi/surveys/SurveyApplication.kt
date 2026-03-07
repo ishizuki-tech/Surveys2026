@@ -40,11 +40,11 @@ import kotlinx.coroutines.launch
  * - Install SurveyConfig as a single source of truth (process-scoped).
  * - Avoid duplicate config loads from UI/repositories.
  *
- * Warmup design (NO dependencies):
+ * Warmup design:
  * - WarmupController is created process-scoped by AppProcessServices.
  * - WarmupController receives Inputs (file + WarmupCapableRepository + options)
  *   via AppProcessServices.updateWarmupInputs().
- * - This Application performs ONLY best-effort early Inputs injection when it can do so safely.
+ * - This Application performs only best-effort early Inputs injection when it can do so safely.
  *
  * Privacy:
  * - Never log tokens, URLs, file paths, file names, or raw user/model content.
@@ -69,7 +69,7 @@ class SurveyApplication : Application() {
         runCatching {
             AppBootstrap.ensureInitialized(appContext)
         }.onFailure { t ->
-            // IMPORTANT: Do not log t.message (may contain sensitive info).
+            // Important: Do not log exception.message.
             SafeLog.e(TAG, "AppBootstrap failed (non-fatal) ${t.safeTypeAndHint()}")
         }
 
@@ -84,13 +84,13 @@ class SurveyApplication : Application() {
             return
         }
 
-        // 3) Install SurveyConfig ONCE per process (single source of truth).
+        // 3) Install SurveyConfig once per process (single source of truth).
         installSurveyConfigOnce(appContext)
 
         // 4) Warmup Inputs (best-effort):
-        // - Do NOT use reflection to guess warmup entrypoints.
+        // - Do not use reflection to guess warmup entrypoints.
         // - If a model file is already present, inject Inputs once to enable early warmup later.
-        // - Never blocks main thread.
+        // - Never blocks the main thread.
         WarmupInputsBootstrap.tryInjectOnceBestEffort(appContext)
 
         SafeLog.i(TAG, "startup: done in ${SystemClock.elapsedRealtime() - t0}ms")
@@ -138,7 +138,7 @@ class SurveyApplication : Application() {
                 }
             }
         }.onFailure { t ->
-            // IMPORTANT: Do not log t.message (may contain sensitive info).
+            // Important: Do not log exception.message.
             SafeLog.e(TAG, "Config install: failed (non-fatal) ${t.safeTypeAndHint()}")
         }
     }
@@ -152,10 +152,10 @@ class SurveyApplication : Application() {
      * Best-effort early warmup inputs injection.
      *
      * Rationale:
-     * - In some flows, the model file may already exist at cold start (previous download).
+     * - In some flows, the model file may already exist at cold start.
      * - If we can determine (file + WarmupCapableRepository), we can install Inputs early.
      *
-     * IMPORTANT:
+     * Important:
      * - Never blocks the caller.
      * - Never logs file paths/names.
      * - Never clears existing Inputs; only installs when confident.
@@ -190,12 +190,10 @@ class SurveyApplication : Application() {
                     val file = ModelFileProbe.findModelFileOrNull(appContext.applicationContext)
                     val fileReady = file != null && file.exists() && file.isFile && file.length() > 0L
                     if (!fileReady) {
-                        // Retry in case the file becomes visible shortly after startup.
                         delay(RETRY_INTERVAL_MS)
                         continue
                     }
 
-                    // Avoid heavy repo creation unless file is ready.
                     val repo =
                         runCatching {
                             AppProcessServices.repository(
@@ -206,7 +204,6 @@ class SurveyApplication : Application() {
 
                     val warmupRepo = repo as? WarmupController.WarmupCapableRepository
                     if (warmupRepo == null) {
-                        // Retry briefly: repo graph may still be stabilizing.
                         if (!loggedRepoNotCapable) {
                             loggedRepoNotCapable = true
                             SafeLog.w(
@@ -252,42 +249,75 @@ class SurveyApplication : Application() {
      * Minimal process guards for Application entry.
      *
      * Notes:
-     * - Keep this small and dependency-free.
+     * - Keep this small and dependency-light.
      * - Avoid disk IO here.
+     * - Use ApplicationInfo.processName as the declared main-process name,
+     *   so custom android:process values remain correct.
      */
     private object ProcessGuardsEntry {
 
-        @Volatile
-        private var cachedName: String? = null
+        private val cachedCurrentProcessName = AtomicReference<String?>(null)
 
         fun currentProcessNameCached(context: Context): String {
-            val cur = cachedName
+            val cur = cachedCurrentProcessName.get()
             if (!cur.isNullOrBlank()) return cur
 
-            val resolved =
-                runCatching {
-                    if (Build.VERSION.SDK_INT >= 28) {
-                        Application.getProcessName()
-                    } else {
-                        // Best effort (no disk IO): query ActivityManager by pid.
-                        val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-                        val procs = am?.runningAppProcesses
-                        val pid = Process.myPid()
-                        procs?.firstOrNull { it.pid == pid }?.processName
-                    }
-                }.getOrNull()
+            val appCtx = context.applicationContext
+            val resolved = getCurrentProcessName(appCtx)?.takeIf { it.isNotBlank() }
+            if (resolved != null) {
+                cachedCurrentProcessName.set(resolved)
+                return resolved
+            }
 
-            val name = resolved?.takeIf { it.isNotBlank() } ?: "unknown"
-            cachedName = name
-            return name
+            return "unknown"
         }
 
         fun isMainProcess(context: Context): Boolean {
-            val name = currentProcessNameCached(context)
-            val pkg = context.packageName
+            val appCtx = context.applicationContext
+            val mainProcessName = getMainProcessName(appCtx) ?: appCtx.packageName
 
-            // Fail-open: if we cannot determine, treat as main to keep behavior consistent.
-            return name.isBlank() || name == "unknown" || name == pkg
+            val current = getCurrentProcessName(appCtx)
+            if (current.isNullOrBlank()) {
+                // Fail-open for safety, but do not pretend the current name is known.
+                SafeLog.w(TAG, "process name unavailable; fail-open (treat as main)")
+                return true
+            }
+
+            cachedCurrentProcessName.set(current)
+            return current == mainProcessName
+        }
+
+        /**
+         * Returns the main process name declared by the app manifest.
+         */
+        private fun getMainProcessName(context: Context): String? {
+            return runCatching { context.applicationInfo.processName }
+                .getOrNull()
+                ?.takeIf { it.isNotBlank() }
+        }
+
+        /**
+         * Returns the current process name using in-memory/platform sources only.
+         */
+        private fun getCurrentProcessName(context: Context): String? {
+            if (Build.VERSION.SDK_INT >= 28) {
+                val name = runCatching { Application.getProcessName() }.getOrNull()
+                if (!name.isNullOrBlank()) return name
+            }
+
+            val am = runCatching {
+                context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
+            }.getOrNull()
+
+            if (am != null) {
+                val pid = Process.myPid()
+                val name = runCatching {
+                    am.runningAppProcesses?.firstOrNull { it.pid == pid }?.processName
+                }.getOrNull()
+                if (!name.isNullOrBlank()) return name
+            }
+
+            return null
         }
     }
 
@@ -304,7 +334,8 @@ class SurveyApplication : Application() {
      * - Pick the largest plausible model file by extension and minimum size threshold.
      *
      * Notes:
-     * - Keep this fast and rate-limited; Application cold-start must stay snappy.
+     * - Keep this fast and rate-limited.
+     * - Never assume the model lives only in filesDir root.
      */
     private object ModelFileProbe {
 
@@ -313,13 +344,8 @@ class SurveyApplication : Application() {
         private val lastScanAtMs = AtomicLong(0L)
         private val cachedFile = AtomicReference<File?>(null)
 
-        // Avoid scanning too often (engine/UI may also perform resolution later).
         private const val SCAN_INTERVAL_READY_MS: Long = 30_000L
-
-        // If no file is cached yet, allow quicker rescans during startup to avoid missing late visibility.
         private const val SCAN_INTERVAL_EMPTY_MS: Long = 1_000L
-
-        // Heuristic: filter out tiny files.
         private const val MIN_BYTES: Long = 128L * 1024L * 1024L
 
         private val allowedExtensions = setOf(
@@ -330,14 +356,28 @@ class SurveyApplication : Application() {
         )
 
         fun findModelFileOrNull(appContext: Context): File? {
-            // 1) Prefer config-resolved file name (single source) if available.
+            // 1) Prefer config-resolved file name if available.
             val preferred = resolvePreferredFromInstalledConfig(appContext)
             if (preferred != null) {
                 cachedFile.set(preferred)
                 return preferred
             }
 
-            // 2) Rate-limit scans.
+            // 2) Validate cached file before using it.
+            val cached = cachedFile.get()
+            if (cached != null) {
+                val cachedOk = runCatching {
+                    cached.exists() && cached.isFile && cached.length() >= MIN_BYTES
+                }.getOrDefault(false)
+
+                if (cachedOk) {
+                    return cached
+                }
+
+                cachedFile.compareAndSet(cached, null)
+            }
+
+            // 3) Rate-limit scans.
             val now = SystemClock.elapsedRealtime()
             val last = lastScanAtMs.get()
 
@@ -355,19 +395,10 @@ class SurveyApplication : Application() {
                 return cachedFile.get()
             }
 
-            val roots = listOfNotNull(
-                appContext.filesDir,
-                File(appContext.filesDir, "models"),
-                File(appContext.filesDir, "slm"),
-                File(appContext.filesDir, "litert"),
-                appContext.noBackupFilesDir,
-                appContext.cacheDir,
-            ).distinct()
-
             var best: File? = null
             var bestLen = 0L
 
-            for (dir in roots) {
+            for (dir in candidateRoots(appContext)) {
                 val list = runCatching { dir.listFiles() ?: emptyArray() }.getOrDefault(emptyArray())
                 for (f in list) {
                     if (!f.isFile) continue
@@ -397,12 +428,12 @@ class SurveyApplication : Application() {
         }
 
         /**
-         * Resolves a preferred model file using installed config without performing disk/network IO.
+         * Resolves a preferred model file using installed config without directory scans.
          *
-         * NOTE:
-         * - This does not scan directories.
+         * Notes:
          * - This does not log any file name.
-         * - Keep file-name resolution aligned with the downloader/UI path as much as possible.
+         * - It checks a small set of known app-private roots to stay aligned with the
+         *   general scan strategy.
          */
         private fun resolvePreferredFromInstalledConfig(appContext: Context): File? {
             val cfg = InstalledSurveyConfigStore.getOrNull() ?: return null
@@ -422,14 +453,30 @@ class SurveyApplication : Application() {
 
             for (raw in candidates) {
                 val safeName = sanitizeSimpleFileName(raw) ?: continue
-                val f = File(appContext.filesDir, safeName)
-                val ok = runCatching {
-                    f.exists() && f.isFile && f.length() > 0L
-                }.getOrDefault(false)
-                if (ok) return f
+                for (dir in candidateRoots(appContext)) {
+                    val f = File(dir, safeName)
+                    val ok = runCatching {
+                        f.exists() && f.isFile && f.length() > 0L
+                    }.getOrDefault(false)
+                    if (ok) return f
+                }
             }
 
             return null
+        }
+
+        /**
+         * Returns small app-private roots that may contain model files.
+         */
+        private fun candidateRoots(appContext: Context): List<File> {
+            return listOfNotNull(
+                appContext.filesDir,
+                File(appContext.filesDir, "models"),
+                File(appContext.filesDir, "slm"),
+                File(appContext.filesDir, "litert"),
+                appContext.noBackupFilesDir,
+                appContext.cacheDir,
+            ).distinct()
         }
 
         /**
@@ -450,7 +497,7 @@ class SurveyApplication : Application() {
      * Returns a safe string that never includes exception.message.
      */
     private fun Throwable.safeTypeAndHint(): String {
-        val e = this.stackTrace.firstOrNull()
+        val e = stackTrace.firstOrNull()
         val hint = if (e != null) "${e.className}.${e.methodName}:${e.lineNumber}" else "unknown"
         return "type=${this::class.java.simpleName} at=$hint"
     }

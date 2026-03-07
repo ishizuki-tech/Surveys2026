@@ -14,7 +14,6 @@
 package com.negi.surveys.chat
 
 import androidx.compose.runtime.Immutable
-import java.util.Locale
 
 /**
  * Namespace object for chat-related models.
@@ -58,6 +57,27 @@ object ChatModels {
     }
 
     /**
+     * Validation status for an answer.
+     */
+    enum class ValidationStatus {
+        /** The current answer is acceptable and the flow can proceed. */
+        ACCEPTED,
+
+        /** The current answer is insufficient and requires a follow-up question. */
+        NEED_FOLLOW_UP
+    }
+
+    /**
+     * A parsed eval metadata event for UI.
+     */
+    @Immutable
+    data class EvalMeta(
+        val status: ValidationStatus?,
+        val score: Int?,
+        val reason: String?,
+    )
+
+    /**
      * Chat message model for UI rendering.
      *
      * Backward-compatibility note:
@@ -77,14 +97,15 @@ object ChatModels {
         val streamSessionId: Long? = null,
 
         /**
-         * Step-1 Eval metadata (optional).
+         * Step-1 evaluation metadata.
          *
          * Notes:
-         * - This is intended for UI display (e.g., a score chip).
-         * - Do not log raw model output; this is safe metadata only.
+         * - These are structured fields for UI.
+         * - Keep them independent from assistant/follow-up text.
          */
         val evalStatus: ValidationStatus? = null,
-        val evalScore: Int? = null
+        val evalScore: Int? = null,
+        val evalReason: String? = null,
     ) {
         /** True when this message is authored by the end user. */
         val isFromUser: Boolean get() = role == ChatRole.USER
@@ -105,13 +126,16 @@ object ChatModels {
          *   the UI should still treat it as stream details.
          */
         val hasStreamDetails: Boolean
-            get() = (streamState == ChatStreamState.STREAMING) || !streamText.isNullOrBlank() || (streamState != ChatStreamState.NONE)
+            get() = (streamState == ChatStreamState.STREAMING) ||
+                    !streamText.isNullOrBlank() ||
+                    (streamState != ChatStreamState.NONE)
 
         /** True when this message is actively streaming. */
         val isStreaming: Boolean get() = streamState == ChatStreamState.STREAMING
 
-        /** True when this message has eval metadata. */
-        val hasEvalMeta: Boolean get() = (evalStatus != null) || (evalScore != null)
+        /** True when this message has structured step-one evaluation metadata. */
+        val hasEvalMeta: Boolean
+            get() = (evalStatus != null) || (evalScore != null) || !evalReason.isNullOrBlank()
 
         /**
          * A best-effort fallback string to render when the UI does not use structured fields.
@@ -144,7 +168,7 @@ object ChatModels {
          *
          * Notes:
          * - Applies an optional [maxChars] cap to bound memory usage.
-         * - Avoids surrogate pair splits when clipping (emoji-safe).
+         * - Avoids surrogate pair splits when clipping.
          */
         fun appendStreamChunk(chunk: String, maxChars: Int = Int.MAX_VALUE): ChatMessage {
             if (chunk.isEmpty()) return this
@@ -156,11 +180,9 @@ object ChatModels {
             val remain = cap - base.length
             if (remain <= 0) return this
 
-            var toAdd = ChatModels.clipToRemainPreserveSurrogates(chunk, remain)
+            var toAdd = clipToRemainPreserveSurrogates(chunk, remain)
             if (toAdd.isEmpty()) return this
 
-            // Boundary guard:
-            // If base ends with a high surrogate and toAdd begins with a low surrogate, drop the low surrogate.
             if (base.isNotEmpty() && toAdd.isNotEmpty()) {
                 val lastBase = base[base.lastIndex]
                 val firstAdd = toAdd[0]
@@ -170,7 +192,6 @@ object ChatModels {
                 }
             }
 
-            // Front guard (rare): avoid starting with a low surrogate if base is empty.
             if (base.isEmpty() && toAdd.isNotEmpty() && Character.isLowSurrogate(toAdd[0])) {
                 toAdd = toAdd.drop(1)
                 if (toAdd.isEmpty()) return this
@@ -180,15 +201,17 @@ object ChatModels {
         }
 
         /**
-         * Apply eval metadata and return a new instance.
-         *
-         * Notes:
-         * - This is intentionally a simple copy helper to keep UI reducers clean.
+         * Apply step-one evaluation metadata and return a new instance.
          */
-        fun withEvalMeta(status: ValidationStatus?, score: Int?): ChatMessage {
+        fun withEvalMeta(
+            status: ValidationStatus?,
+            score: Int?,
+            reason: String? = null,
+        ): ChatMessage {
             return copy(
                 evalStatus = status ?: evalStatus,
-                evalScore = score ?: evalScore
+                evalScore = score ?: evalScore,
+                evalReason = reason ?: evalReason,
             )
         }
 
@@ -196,7 +219,7 @@ object ChatModels {
         fun markStreamEnded(collapsed: Boolean = true): ChatMessage {
             return copy(
                 streamState = ChatStreamState.ENDED,
-                streamCollapsed = collapsed
+                streamCollapsed = collapsed,
             )
         }
 
@@ -204,7 +227,7 @@ object ChatModels {
         fun markStreamError(collapsed: Boolean = true): ChatMessage {
             return copy(
                 streamState = ChatStreamState.ERROR,
-                streamCollapsed = collapsed
+                streamCollapsed = collapsed,
             )
         }
 
@@ -220,10 +243,12 @@ object ChatModels {
             val aLen = assistantMessage?.length ?: 0
             val qLen = followUpQuestion?.length ?: 0
             val sLen = streamText?.length ?: 0
+            val rLen = evalReason?.length ?: 0
             val es = evalStatus?.name ?: "-"
             val sc = evalScore ?: -1
             return "ChatMessage(id=$id8 role=$role state=$streamState collapsed=$streamCollapsed " +
-                    "lens[text=$textLen a=$aLen q=$qLen stream=$sLen] eval[$es,$sc] sid=${streamSessionId ?: 0})"
+                    "lens[text=$textLen a=$aLen q=$qLen stream=$sLen evalReason=$rLen] " +
+                    "eval[$es,$sc] sid=${streamSessionId ?: 0})"
         }
 
         companion object {
@@ -233,7 +258,7 @@ object ChatModels {
                 return ChatMessage(
                     id = id,
                     role = ChatRole.USER,
-                    text = text
+                    text = text,
                 )
             }
 
@@ -241,14 +266,17 @@ object ChatModels {
              * Factory: assistant message (structured).
              *
              * Notes:
-             * - Use [assistantMessage] and [followUpQuestion] for colored/structured UI.
-             * - Keep [textFallback] for legacy rendering or searchability if needed.
+             * - Use [assistantMessage] and [followUpQuestion] for structured UI.
+             * - Keep [textFallback] for legacy rendering if needed.
              */
             fun assistant(
                 id: String,
                 assistantMessage: String,
                 followUpQuestion: String? = null,
-                textFallback: String = ""
+                textFallback: String = "",
+                evalStatus: ValidationStatus? = null,
+                evalScore: Int? = null,
+                evalReason: String? = null,
             ): ChatMessage {
                 return ChatMessage(
                     id = id,
@@ -259,7 +287,10 @@ object ChatModels {
                     streamText = null,
                     streamState = ChatStreamState.NONE,
                     streamCollapsed = true,
-                    streamSessionId = null
+                    streamSessionId = null,
+                    evalStatus = evalStatus,
+                    evalScore = evalScore,
+                    evalReason = evalReason,
                 )
             }
 
@@ -276,7 +307,8 @@ object ChatModels {
                 textFallback: String = "",
                 streamSessionId: Long? = null,
                 evalStatus: ValidationStatus? = null,
-                evalScore: Int? = null
+                evalScore: Int? = null,
+                evalReason: String? = null,
             ): ChatMessage {
                 return ChatMessage(
                     id = id,
@@ -289,7 +321,8 @@ object ChatModels {
                     streamCollapsed = streamCollapsed,
                     streamSessionId = streamSessionId,
                     evalStatus = evalStatus,
-                    evalScore = evalScore
+                    evalScore = evalScore,
+                    evalReason = evalReason,
                 )
             }
 
@@ -298,7 +331,7 @@ object ChatModels {
              */
             fun modelStreaming(
                 id: String,
-                streamSessionId: Long? = null
+                streamSessionId: Long? = null,
             ): ChatMessage {
                 return ChatMessage(
                     id = id,
@@ -309,7 +342,7 @@ object ChatModels {
                     streamText = "",
                     streamState = ChatStreamState.STREAMING,
                     streamCollapsed = false,
-                    streamSessionId = streamSessionId
+                    streamSessionId = streamSessionId,
                 )
             }
 
@@ -318,7 +351,7 @@ object ChatModels {
                 id: String,
                 output: String,
                 collapsed: Boolean = true,
-                streamSessionId: Long? = null
+                streamSessionId: Long? = null,
             ): ChatMessage {
                 return ChatMessage(
                     id = id,
@@ -329,7 +362,7 @@ object ChatModels {
                     streamText = output,
                     streamState = ChatStreamState.ENDED,
                     streamCollapsed = collapsed,
-                    streamSessionId = streamSessionId
+                    streamSessionId = streamSessionId,
                 )
             }
 
@@ -338,7 +371,7 @@ object ChatModels {
                 id: String,
                 outputOrError: String,
                 collapsed: Boolean = true,
-                streamSessionId: Long? = null
+                streamSessionId: Long? = null,
             ): ChatMessage {
                 return ChatMessage(
                     id = id,
@@ -349,90 +382,8 @@ object ChatModels {
                     streamText = outputOrError,
                     streamState = ChatStreamState.ERROR,
                     streamCollapsed = collapsed,
-                    streamSessionId = streamSessionId
+                    streamSessionId = streamSessionId,
                 )
-            }
-        }
-    }
-
-    /**
-     * Validation status for an answer.
-     */
-    enum class ValidationStatus {
-        /** The current answer is acceptable and the flow can proceed. */
-        ACCEPTED,
-
-        /** The current answer is insufficient and requires a follow-up question. */
-        NEED_FOLLOW_UP
-    }
-
-    /**
-     * A parsed eval metadata event for UI.
-     */
-    @Immutable
-    data class EvalMeta(
-        val status: ValidationStatus?,
-        val score: Int?
-    )
-
-    /**
-     * Best-effort extraction of eval metadata from a streamed chunk.
-     *
-     * Expected format (example):
-     * - "[EVAL_RESULT] status=ACCEPTED score=92"
-     *
-     * Notes:
-     * - This parser is intentionally forgiving.
-     * - It may return null if the chunk does not contain a recognizable event.
-     */
-    fun tryExtractEvalMetaFromChunk(chunk: String): EvalMeta? {
-        val idx = chunk.indexOf(EVAL_RESULT_PREFIX)
-        if (idx < 0) return null
-
-        // Parse only the tail portion to reduce false matches.
-        val tail = chunk.substring(idx + EVAL_RESULT_PREFIX.length)
-
-        val status = runCatching {
-            Regex("""\bstatus=([A-Z_?]+)\b""").find(tail)?.groupValues?.getOrNull(1)
-        }.getOrNull()
-
-        val score = runCatching {
-            Regex("""\bscore=(-?\d+)\b""").find(tail)?.groupValues?.getOrNull(1)?.toInt()
-        }.getOrNull()
-
-        val mappedStatus =
-            when (status) {
-                "ACCEPTED" -> ValidationStatus.ACCEPTED
-                "NEED_FOLLOW_UP" -> ValidationStatus.NEED_FOLLOW_UP
-                else -> null
-            }
-
-        if (mappedStatus == null && score == null) return null
-        return EvalMeta(status = mappedStatus, score = score)
-    }
-
-    /**
-     * Removes eval event lines from a chunk before appending it to streamText.
-     *
-     * Notes:
-     * - This keeps the stream bubble clean while still surfacing the score via structured fields.
-     * - Conservative: removes only the event prefix region line-by-line.
-     */
-    fun stripEvalEventsFromChunk(chunk: String): String {
-        if (!chunk.contains(EVAL_RESULT_PREFIX)) return chunk
-
-        // Remove lines that contain the eval prefix.
-        val lines = chunk.split('\n')
-        if (lines.size <= 1) {
-            // Single-line chunk: if it contains prefix, drop it entirely.
-            return if (chunk.contains(EVAL_RESULT_PREFIX)) "" else chunk
-        }
-
-        return buildString {
-            for (line in lines) {
-                if (line.contains(EVAL_RESULT_PREFIX)) continue
-                if (isNotEmpty()) append('\n')
-                append(line)
             }
         }
     }
@@ -444,7 +395,10 @@ object ChatModels {
     data class ValidationOutcome(
         val status: ValidationStatus,
         val assistantMessage: String,
-        val followUpQuestion: String? = null
+        val followUpQuestion: String? = null,
+        val evalStatus: ValidationStatus? = null,
+        val evalScore: Int? = null,
+        val evalReason: String? = null,
     ) {
         /** True if this outcome is logically consistent with the recommended contract. */
         fun isConsistent(): Boolean {
@@ -472,17 +426,85 @@ object ChatModels {
                 return ValidationOutcome(
                     status = ValidationStatus.ACCEPTED,
                     assistantMessage = assistantMessage,
-                    followUpQuestion = null
+                    followUpQuestion = null,
+                    evalStatus = ValidationStatus.ACCEPTED,
+                    evalScore = null,
+                    evalReason = null,
                 )
             }
 
             /** Factory for a follow-up outcome with a required follow-up question. */
-            fun needFollowUp(assistantMessage: String, followUpQuestion: String): ValidationOutcome {
+            fun needFollowUp(
+                assistantMessage: String,
+                followUpQuestion: String,
+            ): ValidationOutcome {
                 return ValidationOutcome(
                     status = ValidationStatus.NEED_FOLLOW_UP,
                     assistantMessage = assistantMessage,
-                    followUpQuestion = followUpQuestion
+                    followUpQuestion = followUpQuestion,
+                    evalStatus = ValidationStatus.NEED_FOLLOW_UP,
+                    evalScore = null,
+                    evalReason = null,
                 )
+            }
+        }
+    }
+
+    /**
+     * Best-effort extraction of eval metadata from a streamed chunk.
+     *
+     * Expected format:
+     * - "[EVAL_RESULT] status=ACCEPTED score=92"
+     */
+    fun tryExtractEvalMetaFromChunk(chunk: String): EvalMeta? {
+        val idx = chunk.indexOf(EVAL_RESULT_PREFIX)
+        if (idx < 0) return null
+
+        val tail = chunk.substring(idx + EVAL_RESULT_PREFIX.length)
+
+        val status = runCatching {
+            Regex("""\bstatus=([A-Z_?]+)\b""").find(tail)?.groupValues?.getOrNull(1)
+        }.getOrNull()
+
+        val score = runCatching {
+            Regex("""\bscore=(-?\d+)\b""").find(tail)?.groupValues?.getOrNull(1)?.toInt()
+        }.getOrNull()
+
+        val reason = runCatching {
+            Regex("""\breason=(.+)$""").find(tail)?.groupValues?.getOrNull(1)?.trim()
+        }.getOrNull()
+
+        val mappedStatus =
+            when (status) {
+                "ACCEPTED" -> ValidationStatus.ACCEPTED
+                "NEED_FOLLOW_UP" -> ValidationStatus.NEED_FOLLOW_UP
+                else -> null
+            }
+
+        if (mappedStatus == null && score == null && reason.isNullOrBlank()) return null
+        return EvalMeta(
+            status = mappedStatus,
+            score = score,
+            reason = reason?.takeIf { it.isNotBlank() },
+        )
+    }
+
+    /**
+     * Removes eval event lines from a chunk before appending it to streamText.
+     */
+    fun stripEvalEventsFromChunk(chunk: String): String {
+        if (!chunk.contains(EVAL_RESULT_PREFIX)) return chunk
+
+        val lines = chunk.split('\n')
+        if (lines.size <= 1) {
+            return if (chunk.contains(EVAL_RESULT_PREFIX)) "" else chunk
+        }
+
+        return buildString {
+            for (line in lines) {
+                if (line.contains(EVAL_RESULT_PREFIX)) continue
+                if (isNotEmpty()) append('\n')
+                append(line)
             }
         }
     }

@@ -98,7 +98,7 @@ object AppProcessServices {
                             val dbg =
                                 SlmRepository.DebugConfig(
                                     enabled = BuildConfig.DEBUG,
-                                    streamEvalOutputToClient = false,
+                                    streamEvalOutputToClient = true,
                                 )
 
                             SafeLog.i(
@@ -135,7 +135,7 @@ object AppProcessServices {
         toClose?.let { closeIfSupportedSafely(it) }
 
         createdNow?.let { created ->
-            SafeLog.i(TAG, "repository: (re)created mode=$mode type=${created.javaClass.simpleName}")
+            SafeLog.i(TAG, "repository: created mode=$mode type=${created.javaClass.simpleName}")
 
             // Rebind cached warmup inputs to the current repository when possible.
             if (mode == RepoMode.ON_DEVICE) {

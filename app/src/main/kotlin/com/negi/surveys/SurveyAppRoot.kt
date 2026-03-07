@@ -12,44 +12,25 @@
 package com.negi.surveys
 
 import android.os.Build
-import android.os.SystemClock
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
-import androidx.compose.foundation.layout.Arrangement
-import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.height
-import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
-import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
-import androidx.compose.material3.Surface
-import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.State
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.withFrameNanos
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.style.TextAlign
-import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation3.runtime.NavBackStack
-import androidx.navigation3.runtime.NavEntry
 import androidx.navigation3.runtime.NavKey
-import androidx.navigation3.runtime.entryProvider
 import androidx.navigation3.runtime.rememberNavBackStack
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatValidation
@@ -63,18 +44,10 @@ import com.negi.surveys.nav.Review
 import com.negi.surveys.nav.SurveyStart
 import com.negi.surveys.ui.DebugInfo
 import com.negi.surveys.ui.DebugRow
-import com.negi.surveys.ui.ExportScreen
-import com.negi.surveys.ui.HomeScreen
 import com.negi.surveys.ui.ReviewQuestionLog
-import com.negi.surveys.ui.ReviewScreen
-import com.negi.surveys.ui.SurveyStartScreen
-import com.negi.surveys.ui.chat.ChatQuestionScreen
 import com.negi.surveys.utils.ModelDownloadController
 import com.negi.surveys.warmup.WarmupController
-import java.util.Locale
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 
@@ -92,57 +65,12 @@ object SurveyAppRoot {
         Render(modifier = modifier)
     }
 
-    // ---------------------------------------------------------------------
-    // Constants
-    // ---------------------------------------------------------------------
-
     const val TAG: String = "SurveyAppRoot"
-
-    // ---------------------------------------------------------------------
-    // Models / Formatting
-    // ---------------------------------------------------------------------
-
-    private data class WarmupUiFormat(
-        val idleLabel: String,
-        val prefetchRunningPrefix: String,
-        val compileWaitingPrefix: String,
-        val compileCompilingPrefix: String,
-    )
-
-    private val WARMUP_UI_FORMAT_HOME = WarmupUiFormat(
-        idleLabel = "Idle",
-        prefetchRunningPrefix = "Prefetch",
-        compileWaitingPrefix = "WaitingForPrefetch",
-        compileCompilingPrefix = "Compiling",
-    )
-
-    private val WARMUP_UI_FORMAT_GATE = WarmupUiFormat(
-        idleLabel = "Preparing…",
-        prefetchRunningPrefix = "Prefetch",
-        compileWaitingPrefix = "Compile waiting…",
-        compileCompilingPrefix = "Compiling",
-    )
-
-    private enum class GatePolicy {
-        /** Block only on model file readiness. */
-        MODEL_ONLY,
-
-        /** Block on model + prefetch + compile busy. */
-        MODEL_PREFETCH_COMPILE,
-    }
-
-    // ---------------------------------------------------------------------
-    // Entry Point (Render)
-    // ---------------------------------------------------------------------
 
     @Composable
     fun Render(modifier: Modifier) {
         val appContext = LocalContext.current.applicationContext
         val scope = rememberCoroutineScope()
-
-        // -------------------------------------------------------------
-        // Navigation
-        // -------------------------------------------------------------
 
         val backStack: NavBackStack<NavKey> = rememberNavBackStack(Home)
         val nav = remember(backStack) { AppNavigator(backStack) }
@@ -166,10 +94,6 @@ object SurveyAppRoot {
             SafeLog.d(TAG, "Nav: current=${currentKey.javaClass.simpleName} stackSize=${backStack.size}")
         }
 
-        // -------------------------------------------------------------
-        // Session / streaming debug
-        // -------------------------------------------------------------
-
         val sessionVm: SurveySessionViewModel = viewModel()
 
         val logs: List<ReviewQuestionLog> by sessionVm.logs.collectAsStateWithLifecycle()
@@ -178,9 +102,9 @@ object SurveyAppRoot {
         /**
          * Keep updated State references so NavEntry composables do NOT re-collect flows.
          *
-         * IMPORTANT:
-         * - Do NOT map/copy lists here (avoid allocations).
-         * - Do NOT cast in destination screens.
+         * Important:
+         * - Do not map/copy lists here.
+         * - Do not cast in destination screens.
          */
         val logsState: State<List<ReviewQuestionLog>> = rememberUpdatedState(logs)
         val exportTextState: State<String> = rememberUpdatedState(exportText)
@@ -192,22 +116,14 @@ object SurveyAppRoot {
             )
         }
 
-        /**
-         * Stream bridge logger MUST NOT output raw content.
-         */
         val streamBridge: ChatStreamBridge = remember {
             ChatStreamBridge(
                 logger = { msg ->
-                    // Log only metadata to avoid leaking prompts/answers/deltas.
                     SafeLog.d("StreamBridge", "eventLen=${msg.length}")
                 },
             )
         }
         val streamStats: ChatStreamBridge.StreamStats by streamBridge.stats.collectAsStateWithLifecycle()
-
-        // -------------------------------------------------------------
-        // Startup orchestration (ViewModel-owned)
-        // -------------------------------------------------------------
 
         val startupVm: AppStartupViewModel = viewModel()
         val startupUi: AppStartupUiState by startupVm.uiState.collectAsStateWithLifecycle()
@@ -217,7 +133,6 @@ object SurveyAppRoot {
             startupVm.onFirstFrameRendered()
         }
 
-        val configState: StartupConfigState = startupUi.configState
         val repoMode: AppProcessServices.RepoMode = startupUi.repoMode
         val onDeviceEnabled: Boolean = startupUi.onDeviceEnabled
         val startupServicesReady: Boolean = startupUi.servicesReady
@@ -253,19 +168,11 @@ object SurveyAppRoot {
             )
         }
 
-        // -------------------------------------------------------------
-        // Debug: log transitions (centralized)
-        // -------------------------------------------------------------
-
         LogStateTransitions(
             modelState = rootModelState,
             prefetchState = rootPrefetchState,
             compileState = rootCompileState,
         )
-
-        // -------------------------------------------------------------
-        // Debug labels (home-level)
-        // -------------------------------------------------------------
 
         val (prefetchUiLabel, compileUiLabel) = rememberWarmupUiLabels(
             prefetchState = rootPrefetchState,
@@ -276,13 +183,8 @@ object SurveyAppRoot {
 
         val modelUiLabel: String = remember(rootModelState) { modelLabelForUi(rootModelState) }
         val buildLabel = remember { buildLabelSafe() }
-
-        val cfgLabel = remember(configState) {
-            when (val st = configState) {
-                is StartupConfigState.Loading -> "Loading"
-                is StartupConfigState.Ready -> "Ready"
-                is StartupConfigState.Failed -> "Failed (${st.safeReason})"
-            }
+        val cfgLabel = remember(startupUi.configState) {
+            startupUi.configState.toDebugLabel()
         }
 
         val repoIdLabel = remember(repo) {
@@ -347,10 +249,6 @@ object SurveyAppRoot {
 
         val debugInfoState: State<DebugInfo> = rememberUpdatedState(debugInfo)
 
-        // -------------------------------------------------------------
-        // Manual upload action (debug)
-        // -------------------------------------------------------------
-
         var uploadStatus by remember { mutableStateOf<String?>(null) }
         val uploadStatusState: State<String?> = rememberUpdatedState(uploadStatus)
 
@@ -381,180 +279,26 @@ object SurveyAppRoot {
             }
         }
 
-        // -------------------------------------------------------------
-        // Nav3 entries (stable entryProvider + NO duplicate flow collects)
-        // -------------------------------------------------------------
+        val entries = rememberSurveyNavEntries(
+            nav = nav,
+            prompts = prompts,
+            sessionVm = sessionVm,
+            logsState = logsState,
+            exportTextState = exportTextState,
+            startManualUpload = startManualUpload,
+            debugInfoState = debugInfoState,
+            warmup = warmup,
+            launchRetryAll = launchRetryAll,
+            uploadStatusState = uploadStatusState,
+            onDeviceEnabled = onDeviceEnabled,
+            rootModelStateState = rootModelStateState,
+            rootPrefetchStateState = rootPrefetchStateState,
+            rootCompileStateState = rootCompileStateState,
+        )
 
-        val entries: (NavKey) -> NavEntry<NavKey> = remember(
-            nav,
-            prompts,
-            sessionVm,
-            logsState,
-            exportTextState,
-            startManualUpload,
-            debugInfoState,
-            warmup,
-            launchRetryAll,
-            uploadStatusState,
-            onDeviceEnabled,
-            rootModelStateState,
-            rootPrefetchStateState,
-            rootCompileStateState,
-        ) {
-            entryProvider {
-                entry<Home> {
-                    HomeScreen(
-                        onStartSurvey = { nav.startSurvey() },
-                        onExport = { nav.goExport() },
-                        debugInfo = debugInfoState.value,
-                    )
-                }
-
-                entry<SurveyStart> {
-                    val readyWarmup = warmup
-                    if (readyWarmup == null) {
-                        SurveyAppShell.BlockingBody(
-                            title = "Preparing app services…",
-                            detail = "Warmup service is not ready yet.",
-                            showSpinner = true,
-                        )
-                    } else {
-                        GateOrContent(
-                            enabled = onDeviceEnabled,
-                            policy = GatePolicy.MODEL_ONLY,
-                            modelState = rootModelStateState.value,
-                            prefetchState = rootPrefetchStateState.value,
-                            compileState = rootCompileStateState.value,
-                            onBack = { nav.pop() },
-                            onRetryAll = { launchRetryAll("surveyStartGate") },
-                        ) {
-                            SurveyStartScreen(
-                                onBegin = { nav.beginQuestions("Q1") },
-                                onBack = { nav.pop() },
-                                warmupController = readyWarmup,
-                                debugInfo = debugInfoState.value,
-                            )
-                        }
-                    }
-                }
-
-                entry<Question> { key ->
-                    val prompt = prompts[key.id] ?: "Question prompt for ${key.id} (placeholder)"
-
-                    GateOrContent(
-                        enabled = onDeviceEnabled,
-                        policy = GatePolicy.MODEL_PREFETCH_COMPILE,
-                        modelState = rootModelStateState.value,
-                        prefetchState = rootPrefetchStateState.value,
-                        compileState = rootCompileStateState.value,
-                        onBack = { nav.pop() },
-                        onRetryAll = { launchRetryAll("questionGate") },
-                    ) {
-                        ChatQuestionScreen(
-                            questionId = key.id,
-                            prompt = prompt,
-                            onNext = { log ->
-                                sessionVm.upsertLog(log)
-                                when (key.id) {
-                                    "Q1" -> nav.goQuestion("Q2")
-                                    "Q2" -> nav.goReview()
-                                    else -> nav.goReview()
-                                }
-                            },
-                            onBack = { nav.pop() },
-                        )
-                    }
-                }
-
-                entry<Review> {
-                    ReviewScreen(
-                        logs = logsState.value,
-                        onExport = { nav.goExport() },
-                        onBack = { nav.pop() },
-                        onUploadLogs = { startManualUpload("review") },
-                        uploadStatusLine = uploadStatusState.value,
-                    )
-                }
-
-                entry<Export> {
-                    ExportScreen(
-                        exportText = exportTextState.value,
-                        onBack = { nav.pop() },
-                    )
-                }
-            }
+        val startupBlockingUi = remember(startupUi) {
+            startupUi.toStartupBlockingUi()
         }
-
-        // -------------------------------------------------------------
-        // Root startup/blocking state
-        // -------------------------------------------------------------
-
-        val startupBlockTitle = remember(
-            configState,
-            startupServicesReady,
-            repo,
-            warmup,
-            modelDownloader,
-            onDeviceEnabled,
-        ) {
-            when (configState) {
-                is StartupConfigState.Loading -> "Loading application configuration…"
-                is StartupConfigState.Failed -> "Startup configuration is unavailable."
-                is StartupConfigState.Ready -> {
-                    when {
-                        !startupServicesReady && onDeviceEnabled -> "Preparing on-device services…"
-                        !startupServicesReady -> "Preparing app services…"
-                        repo == null -> "Preparing app services…"
-                        onDeviceEnabled && modelDownloader == null -> "Preparing on-device services…"
-                        onDeviceEnabled && warmup == null -> "Preparing on-device services…"
-                        else -> null
-                    }
-                }
-            }
-        }
-
-        val startupBlockDetail = remember(
-            configState,
-            startupServicesReady,
-            repo,
-            warmup,
-            modelDownloader,
-            onDeviceEnabled,
-        ) {
-            when (val st = configState) {
-                is StartupConfigState.Loading ->
-                    "Waiting for the Application-installed SurveyConfig."
-
-                is StartupConfigState.Failed ->
-                    "Safe reason: ${st.safeReason}"
-
-                is StartupConfigState.Ready -> {
-                    when {
-                        !startupServicesReady ->
-                            "Process-scoped services are still starting."
-
-                        repo == null ->
-                            "Repository is not ready yet."
-
-                        onDeviceEnabled && modelDownloader == null ->
-                            "Model downloader is not ready yet."
-
-                        onDeviceEnabled && warmup == null ->
-                            "Warmup controller is not ready yet."
-
-                        else -> null
-                    }
-                }
-            }
-        }
-
-        val showStartupSpinner = remember(configState) {
-            configState !is StartupConfigState.Failed
-        }
-
-        // -------------------------------------------------------------
-        // Shell
-        // -------------------------------------------------------------
 
         SurveyAppShell(
             modifier = modifier,
@@ -565,254 +309,11 @@ object SurveyAppRoot {
             entryProvider = entries,
             streamBridge = streamBridge,
             repository = repo,
-            blockingTitle = startupBlockTitle,
-            blockingDetail = startupBlockDetail,
-            showBlockingSpinner = showStartupSpinner,
+            blockingTitle = startupBlockingUi.title,
+            blockingDetail = startupBlockingUi.detail,
+            showBlockingSpinner = startupBlockingUi.showSpinner,
         )
     }
-
-    // ---------------------------------------------------------------------
-    // Gate wrapper (dedup)
-    // ---------------------------------------------------------------------
-
-    @Composable
-    private fun GateOrContent(
-        enabled: Boolean,
-        policy: GatePolicy,
-        modelState: ModelDownloadController.ModelState,
-        prefetchState: WarmupController.PrefetchState,
-        compileState: WarmupController.CompileState,
-        onBack: () -> Unit,
-        onRetryAll: () -> Unit,
-        content: @Composable () -> Unit,
-    ) {
-        // Fake/Server mode MUST NOT block on local model readiness.
-        if (!enabled) {
-            content()
-            return
-        }
-
-        val modelBlocking = modelState !is ModelDownloadController.ModelState.Ready
-        val prefetchBusy = isPrefetchInProgress(prefetchState)
-        val compileBusy =
-            compileState is WarmupController.CompileState.WaitingForPrefetch ||
-                    compileState is WarmupController.CompileState.Compiling
-
-        val isBlocking = when (policy) {
-            GatePolicy.MODEL_ONLY -> modelBlocking
-            GatePolicy.MODEL_PREFETCH_COMPILE -> modelBlocking || prefetchBusy || compileBusy
-        }
-
-        if (isBlocking) {
-            SlmGateScreen(
-                modelState = modelState,
-                prefetchState = prefetchState,
-                compileState = compileState,
-                onBack = onBack,
-                onRetryAll = onRetryAll,
-            )
-        } else {
-            content()
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // UI Components (feature-specific)
-    // ---------------------------------------------------------------------
-
-    @Composable
-    private fun SlmGateScreen(
-        modelState: ModelDownloadController.ModelState,
-        prefetchState: WarmupController.PrefetchState,
-        compileState: WarmupController.CompileState,
-        onBack: () -> Unit,
-        onRetryAll: () -> Unit,
-    ) {
-        val prefetchInProgress = isPrefetchInProgress(prefetchState)
-        val compileInProgress =
-            compileState is WarmupController.CompileState.WaitingForPrefetch ||
-                    compileState is WarmupController.CompileState.Compiling
-        val modelInProgress =
-            modelState is ModelDownloadController.ModelState.Checking ||
-                    modelState is ModelDownloadController.ModelState.Downloading
-
-        val nowMs = rememberWarmupUiNowMs(
-            inProgress = modelInProgress || prefetchInProgress || compileInProgress,
-            tickIntervalMs = 250L,
-        )
-
-        val prefetchElapsedMs = rememberDynamicElapsedMs(
-            reportedElapsedMs = prefetchState.elapsedMs,
-            inProgress = prefetchInProgress,
-            nowMs = nowMs,
-        )
-        val compileElapsedMs = rememberDynamicElapsedMs(
-            reportedElapsedMs = compileState.elapsedMs,
-            inProgress = compileInProgress,
-            nowMs = nowMs,
-        )
-
-        val primary = remember(modelState, prefetchState, compileState, prefetchElapsedMs, compileElapsedMs) {
-            when {
-                modelState !is ModelDownloadController.ModelState.Ready -> modelLabelForUi(modelState)
-                prefetchInProgress ->
-                    prefetchLabelForUi(
-                        prefetchState,
-                        elapsedMs = prefetchElapsedMs,
-                        format = WARMUP_UI_FORMAT_GATE,
-                    )
-
-                compileState is WarmupController.CompileState.WaitingForPrefetch ->
-                    compileLabelForUi(
-                        compileState,
-                        elapsedMs = compileElapsedMs,
-                        format = WARMUP_UI_FORMAT_GATE,
-                    )
-
-                compileState is WarmupController.CompileState.Compiling ->
-                    compileLabelForUi(
-                        compileState,
-                        elapsedMs = compileElapsedMs,
-                        format = WARMUP_UI_FORMAT_GATE,
-                    )
-
-                else -> WARMUP_UI_FORMAT_GATE.idleLabel
-            }
-        }
-
-        val showRetryAll = remember(modelState, compileState) {
-            modelState is ModelDownloadController.ModelState.Failed ||
-                    modelState is ModelDownloadController.ModelState.Cancelled ||
-                    compileState is WarmupController.CompileState.Failed ||
-                    compileState is WarmupController.CompileState.Cancelled
-        }
-
-        Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.Center,
-                horizontalAlignment = Alignment.CenterHorizontally,
-            ) {
-                CircularProgressIndicator()
-                Spacer(modifier = Modifier.height(16.dp))
-
-                Text(
-                    text = "Preparing the on-device model…",
-                    style = MaterialTheme.typography.titleMedium,
-                    textAlign = TextAlign.Center,
-                )
-
-                Spacer(modifier = Modifier.height(8.dp))
-
-                Text(
-                    text = primary,
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    textAlign = TextAlign.Center,
-                )
-
-                Spacer(modifier = Modifier.height(18.dp))
-
-                val hint = remember(modelState, compileState) {
-                    when (modelState) {
-                        is ModelDownloadController.ModelState.Downloading ->
-                            "Downloading the model file. Keep the app open (first run may take a while)."
-
-                        is ModelDownloadController.ModelState.Checking ->
-                            "Checking local model file…"
-
-                        is ModelDownloadController.ModelState.NotConfigured ->
-                            "Model URL is not configured in SurveyConfig."
-
-                        is ModelDownloadController.ModelState.Failed ->
-                            "Download failed. Check connectivity / credentials / configuration."
-
-                        is ModelDownloadController.ModelState.Cancelled ->
-                            "Download cancelled."
-
-                        else -> when (compileState) {
-                            is WarmupController.CompileState.WaitingForPrefetch ->
-                                "Waiting for prefetch to complete before compilation."
-
-                            is WarmupController.CompileState.Compiling ->
-                                "Compiling/initializing the model. UI may stutter briefly."
-
-                            is WarmupController.CompileState.Failed ->
-                                "Warmup compile failed. Try retry."
-
-                            is WarmupController.CompileState.Cancelled ->
-                                "Warmup compile cancelled. Try retry."
-
-                            else -> ""
-                        }
-                    }
-                }
-
-                if (hint.isNotBlank()) {
-                    Text(
-                        text = hint,
-                        style = MaterialTheme.typography.bodyMedium,
-                        textAlign = TextAlign.Center,
-                    )
-                    Spacer(modifier = Modifier.height(18.dp))
-                }
-
-                if (showRetryAll) {
-                    OutlinedButton(onClick = onRetryAll) {
-                        Text("Retry (model + warmup)")
-                    }
-                    Spacer(modifier = Modifier.height(10.dp))
-                }
-
-                Button(onClick = onBack) {
-                    Text("Back")
-                }
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Debug helpers
-    // ---------------------------------------------------------------------
-
-    @Composable
-    private fun LogStateTransitions(
-        modelState: ModelDownloadController.ModelState,
-        prefetchState: WarmupController.PrefetchState,
-        compileState: WarmupController.CompileState,
-    ) {
-        var prevModel by remember { mutableStateOf<String?>(null) }
-        var prevPrefetch by remember { mutableStateOf<String?>(null) }
-        var prevCompile by remember { mutableStateOf<String?>(null) }
-
-        LaunchedEffect(modelState) {
-            val now = modelState.javaClass.simpleName
-            if (prevModel != now) {
-                SafeLog.d(TAG, "State: model=$now")
-                prevModel = now
-            }
-        }
-        LaunchedEffect(prefetchState) {
-            val now = prefetchState.javaClass.simpleName
-            if (prevPrefetch != now) {
-                SafeLog.d(TAG, "State: prefetch=$now elapsedMs=${prefetchState.elapsedMs}")
-                prevPrefetch = now
-            }
-        }
-        LaunchedEffect(compileState) {
-            val now = compileState.javaClass.simpleName
-            if (prevCompile != now) {
-                SafeLog.d(TAG, "State: compile=$now elapsedMs=${compileState.elapsedMs}")
-                prevCompile = now
-            }
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // String helpers
-    // ---------------------------------------------------------------------
 
     private fun titleFor(key: NavKey): String {
         return when (key) {
@@ -833,178 +334,5 @@ object SurveyAppRoot {
             val dbg = BuildConfig.DEBUG
             "v$name ($code) $type dbg=$dbg"
         }.getOrElse { "debug" }
-    }
-
-    // ---------------------------------------------------------------------
-    // Warmup/model label helpers
-    // ---------------------------------------------------------------------
-
-    private fun isPrefetchInProgress(state: WarmupController.PrefetchState): Boolean {
-        return state is WarmupController.PrefetchState.Running
-    }
-
-    private fun modelLabelForUi(state: ModelDownloadController.ModelState): String {
-        return when (state) {
-            is ModelDownloadController.ModelState.NotConfigured -> "Model not configured"
-            is ModelDownloadController.ModelState.Idle -> "Idle"
-            is ModelDownloadController.ModelState.Checking -> "Checking… ${formatElapsed(state.elapsedMs)}"
-            is ModelDownloadController.ModelState.Downloading -> {
-                val total = state.total
-                if (total != null && total > 0L) {
-                    val pct = ((state.downloaded.toDouble() / total.toDouble()) * 100.0)
-                        .toInt()
-                        .coerceIn(0, 100)
-                    "Downloading ${pct}% ${formatElapsed(state.elapsedMs)}"
-                } else {
-                    "Downloading ${formatElapsed(state.elapsedMs)}"
-                }
-            }
-
-            is ModelDownloadController.ModelState.Ready -> "Ready"
-            is ModelDownloadController.ModelState.Failed -> "Failed"
-            is ModelDownloadController.ModelState.Cancelled -> "Cancelled"
-        }
-    }
-
-    private fun prefetchLabelForUi(
-        state: WarmupController.PrefetchState,
-        elapsedMs: Long,
-        format: WarmupUiFormat,
-    ): String {
-        val name = state.javaClass.simpleName
-        val elapsed = formatElapsed(elapsedMs)
-        return when {
-            isPrefetchInProgress(state) -> "${format.prefetchRunningPrefix} ($name) $elapsed"
-            name.equals("Idle", ignoreCase = true) -> format.idleLabel
-            else -> "$name $elapsed"
-        }
-    }
-
-    private fun compileLabelForUi(
-        state: WarmupController.CompileState,
-        elapsedMs: Long,
-        format: WarmupUiFormat,
-    ): String {
-        val elapsed = formatElapsed(elapsedMs)
-        return when (state) {
-            is WarmupController.CompileState.WaitingForPrefetch -> "${format.compileWaitingPrefix} $elapsed"
-            is WarmupController.CompileState.Compiling -> "${format.compileCompilingPrefix} $elapsed"
-            is WarmupController.CompileState.Idle -> format.idleLabel
-            else -> "${state.javaClass.simpleName} $elapsed"
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Shared "Ticking" Composables
-    // ---------------------------------------------------------------------
-
-    @Composable
-    private fun rememberWarmupUiNowMs(
-        inProgress: Boolean,
-        tickIntervalMs: Long,
-    ): Long {
-        var uiNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-
-        LaunchedEffect(inProgress, tickIntervalMs) {
-            if (!inProgress) return@LaunchedEffect
-            while (isActive) {
-                uiNowMs = SystemClock.elapsedRealtime()
-                delay(tickIntervalMs)
-            }
-        }
-        return uiNowMs
-    }
-
-    /**
-     * Produces a smoothly increasing elapsedMs for UI even if the underlying state updates are sparse.
-     *
-     * Notes:
-     * - Treat reportedElapsedMs as a baseline at the moment we last observed it.
-     * - While inProgress, add (nowMs - baselineNowMs).
-     */
-    @Composable
-    private fun rememberDynamicElapsedMs(
-        reportedElapsedMs: Long,
-        inProgress: Boolean,
-        nowMs: Long,
-    ): Long {
-        var baseElapsedMs by remember { mutableLongStateOf(reportedElapsedMs) }
-        var baseNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-
-        LaunchedEffect(reportedElapsedMs, inProgress) {
-            baseElapsedMs = reportedElapsedMs
-            baseNowMs = SystemClock.elapsedRealtime()
-        }
-
-        return if (!inProgress) {
-            reportedElapsedMs
-        } else {
-            val live = baseElapsedMs + (nowMs - baseNowMs)
-            if (live < 0L) 0L else live
-        }
-    }
-
-    @Composable
-    private fun rememberWarmupUiLabels(
-        prefetchState: WarmupController.PrefetchState,
-        compileState: WarmupController.CompileState,
-        tickIntervalMs: Long,
-        format: WarmupUiFormat,
-    ): Pair<String, String> {
-        val prefetchInProgress = isPrefetchInProgress(prefetchState)
-        val compileInProgress =
-            compileState is WarmupController.CompileState.WaitingForPrefetch ||
-                    compileState is WarmupController.CompileState.Compiling
-
-        val inProgress = prefetchInProgress || compileInProgress
-        val nowMs = rememberWarmupUiNowMs(inProgress = inProgress, tickIntervalMs = tickIntervalMs)
-
-        val prefetchElapsedMs = rememberDynamicElapsedMs(
-            reportedElapsedMs = prefetchState.elapsedMs,
-            inProgress = prefetchInProgress,
-            nowMs = nowMs,
-        )
-        val compileElapsedMs = rememberDynamicElapsedMs(
-            reportedElapsedMs = compileState.elapsedMs,
-            inProgress = compileInProgress,
-            nowMs = nowMs,
-        )
-
-        val prefetchLabel = remember(prefetchState, prefetchElapsedMs, format) {
-            prefetchLabelForUi(prefetchState, elapsedMs = prefetchElapsedMs, format = format)
-        }
-        val compileLabel = remember(compileState, compileElapsedMs, format) {
-            compileLabelForUi(compileState, elapsedMs = compileElapsedMs, format = format)
-        }
-        return prefetchLabel to compileLabel
-    }
-
-    private fun formatElapsed(ms: Long): String {
-        if (ms < 1_000L) return "${ms}ms"
-        val sec = ms / 1_000.0
-        if (sec < 60.0) return String.format(Locale.US, "%.1fs", sec)
-        val m = ms / 60_000L
-        val s = (ms / 1_000L) % 60
-        return String.format(Locale.US, "%dm %02ds", m, s)
-    }
-
-    /**
-     * Sanitizes a short label for logs/metrics.
-     *
-     * Notes:
-     * - Avoids leaking arbitrary user-derived strings into logs.
-     */
-    private fun sanitizeLabel(raw: String): String {
-        val trimmed = raw.trim()
-        if (trimmed.isEmpty()) return "unknown"
-        val safe = buildString {
-            for (c in trimmed) {
-                if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') {
-                    append(c)
-                }
-                if (length >= 32) break
-            }
-        }
-        return if (safe.isNotBlank()) safe else "unknown"
     }
 }
