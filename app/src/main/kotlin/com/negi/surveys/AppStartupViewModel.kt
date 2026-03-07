@@ -437,16 +437,10 @@ class AppStartupViewModel(
     }
 
     /**
-     * Computes repo mode.
-     *
-     * This keeps the current branch behavior but moves the decision out of Compose.
+     * Computes repo mode from the centralized process-wide selector.
      */
     private fun computeRepoMode(): AppProcessServices.RepoMode {
-        return if (FORCE_FAKE_REPO) {
-            AppProcessServices.RepoMode.FAKE
-        } else {
-            AppProcessServices.RepoMode.ON_DEVICE
-        }
+        return AppProcessServices.configuredRepoMode()
     }
 
     /**
@@ -498,14 +492,6 @@ class AppStartupViewModel(
 
     companion object {
         private const val TAG = "AppStartupViewModel"
-
-        /**
-         * Hard guard for switching repository mode.
-         *
-         * TODO:
-         * - Replace with BuildConfig / SurveyConfig / dev menu toggle if needed.
-         */
-        private const val FORCE_FAKE_REPO: Boolean = false
 
         private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
         private const val INSTALLED_CONFIG_POLL_MS: Long = 25L

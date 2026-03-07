@@ -50,17 +50,12 @@ import com.negi.surveys.chat.ChatModels
 import com.negi.surveys.ui.chat.ChatReviewLogBuilders.normalizeFollowUp
 
 /**
- * Chat bubble UI for user/assistant/model messages.
+ * Chat bubble UI for user / assistant / model messages.
  *
- * Design goals:
- * - Clear role hierarchy.
- * - Model stream details can be expanded/collapsed.
- * - Step 1 and Step 2 should be visually separated for assistant messages.
- * - Long model outputs should become scrollable with a max height.
- *
- * Important:
- * - Do not log raw user/model text here.
- * - UI-only parsing is allowed, but structured fields should win over raw parsing.
+ * Design:
+ * - Assistant bubbles render step 1 and step 2 as separate sections.
+ * - Raw details for both phases are inspectable via expandable details.
+ * - MODEL bubbles remain ephemeral streaming views.
  */
 @Composable
 internal fun ChatBubbleStructured(
@@ -72,54 +67,6 @@ internal fun ChatBubbleStructured(
     val isUser = msg.role == ChatModels.ChatRole.USER
     val isModel = msg.role == ChatModels.ChatRole.MODEL
     val isAssistant = msg.role == ChatModels.ChatRole.ASSISTANT
-
-    val parsedEval = remember(msg.id, msg.streamText, msg.text) {
-        ChatBubbleParsing.extractEvalResultBestEffort(
-            text = msg.streamText?.takeIf { it.isNotBlank() } ?: msg.text,
-        )
-    }
-
-    val evalStatusForUi: String? = remember(msg.id, msg.evalStatus, parsedEval) {
-        when {
-            msg.evalStatus != null -> msg.evalStatus.name
-            parsedEval?.status != null -> parsedEval.status
-            else -> null
-        }
-    }
-
-    val evalScoreForUi: Int? = remember(msg.id, msg.evalScore, parsedEval) {
-        msg.evalScore ?: parsedEval?.score
-    }
-
-    val evalReasonForUi: String? = remember(msg.id, msg.evalReason) {
-        msg.evalReason?.trim()?.takeIf { it.isNotBlank() }
-    }
-
-    val hasEvalChip = evalScoreForUi != null
-    val hasStepOneSection = hasEvalChip || !evalReasonForUi.isNullOrBlank()
-
-    val verdictSource = remember(msg.id, msg.streamText, msg.text) {
-        msg.streamText?.takeIf { it.isNotBlank() } ?: msg.text.takeIf { it.isNotBlank() }
-    }
-
-    val verdict = remember(msg.id, verdictSource) {
-        ChatBubbleParsing.extractLatestVerdictBestEffort(verdictSource)
-    }
-
-    val streamRawOriginal = msg.streamText.orEmpty()
-    val streamRawForDisplay = remember(msg.id, msg.streamText) {
-        if (streamRawOriginal.isNotBlank()) {
-            ChatBubbleParsing.stripEvalResultLines(streamRawOriginal)
-        } else {
-            ""
-        }
-    }
-
-    val hasStreamDetails =
-        streamRawForDisplay.isNotBlank() || (msg.streamState != ChatModels.ChatStreamState.NONE)
-
-    val isStreamingModelBubble =
-        isModel && (msg.streamState == ChatModels.ChatStreamState.STREAMING)
 
     val rowAlign = if (isUser) Arrangement.End else Arrangement.Start
 
@@ -153,28 +100,28 @@ internal fun ChatBubbleStructured(
 
     val outline = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.55f)
 
+    val hasAssistantDetails =
+        !msg.step1Raw.isNullOrBlank() || !msg.step2Raw.isNullOrBlank()
+
     val expanded = when {
-        isStreamingModelBubble -> true
-        hasStreamDetails -> (detailsExpanded || !msg.streamCollapsed)
+        isModel && msg.streamState == ChatModels.ChatStreamState.STREAMING -> true
+        hasAssistantDetails -> detailsExpanded
         else -> false
     }
 
-    val isCompactPill =
-        (hasStreamDetails && !expanded) ||
-                (isModel && !isStreamingModelBubble && !expanded && streamRawForDisplay.isNotBlank())
+    val isCompactPill = hasAssistantDetails && !expanded && isAssistant
 
     val maxWidth = when {
         isCompactPill -> 360.dp
-        isModel && !isStreamingModelBubble -> 460.dp
+        isModel && msg.streamState != ChatModels.ChatStreamState.STREAMING -> 460.dp
         else -> 520.dp
     }
 
     val clickEnabled = when {
         isUser -> false
-        isStreamingModelBubble -> false
-        isCompactPill -> true
-        isModel -> msg.text.isNotBlank() || streamRawForDisplay.isNotBlank()
-        isAssistant -> hasStreamDetails
+        isModel && msg.streamState == ChatModels.ChatStreamState.STREAMING -> false
+        isAssistant && hasAssistantDetails -> true
+        isModel -> !msg.streamText.isNullOrBlank() || msg.text.isNotBlank()
         else -> false
     }
 
@@ -205,7 +152,7 @@ internal fun ChatBubbleStructured(
                         ) { onToggleDetailsExpand(!expanded) }
                     } else {
                         Modifier
-                    },
+                    }
                 ),
         ) {
             val basePaddingH = if (isCompactPill) 10.dp else 12.dp
@@ -231,11 +178,11 @@ internal fun ChatBubbleStructured(
                             MaterialTheme.colorScheme.onSurfaceVariant,
                             MaterialTheme.colorScheme.secondary,
                         )
-                        else -> ChatBubbleUi.Quad(
-                            "",
+                        ChatModels.ChatRole.USER -> ChatBubbleUi.Quad(
+                            "USER",
                             Color.Transparent,
                             textColor,
-                            Color.Transparent,
+                            Color.Transparent
                         )
                     }
 
@@ -245,9 +192,9 @@ internal fun ChatBubbleStructured(
                         fg = chipFg,
                         dot = dotColor,
                         trailing = when {
-                            isStreamingModelBubble -> "Streaming"
-                            hasStreamDetails && expanded -> "Details"
-                            hasStreamDetails && !expanded -> "Collapsed"
+                            isModel && msg.streamState == ChatModels.ChatStreamState.STREAMING -> "Streaming"
+                            hasAssistantDetails && expanded -> "Details"
+                            hasAssistantDetails && !expanded -> "Collapsed"
                             else -> null
                         },
                     )
@@ -265,41 +212,28 @@ internal fun ChatBubbleStructured(
                     }
 
                     isAssistant -> {
-                        val aFromMsg = msg.assistantMessage?.trim().orEmpty()
-                        val qFromMsg = msg.followUpQuestion
-                        val qFromVerdict = verdict?.followUpQuestion
+                        val evalStatusForUi = msg.evalStatus?.name
+                        val evalScoreForUi = msg.evalScore
+                        val evalReasonForUi = msg.evalReason?.trim()?.takeIf { it.isNotBlank() }
 
-                        val assistantText = aFromMsg
+                        val assistantText =
+                            msg.assistantMessage
+                                ?.trim()
+                                ?.takeIf { it.isNotBlank() }
 
-                        val followUpFromVerdict = !qFromVerdict.isNullOrBlank()
-                        val followUpCandidate = when {
-                            followUpFromVerdict -> qFromVerdict
-                            !qFromMsg.isNullOrBlank() -> qFromMsg
-                            else -> null
-                        }
-
-                        val q: String? = when {
+                        val followUpText = when {
                             !allowFollowUp -> null
-                            followUpCandidate.isNullOrBlank() -> null
-                            followUpFromVerdict -> followUpCandidate.trim().takeIf { it.isNotBlank() }
-                            else -> normalizeFollowUp(followUpCandidate)
+                            msg.followUpQuestion.isNullOrBlank() -> null
+                            else -> normalizeFollowUp(msg.followUpQuestion)
                         }
 
-                        val fallbackBody = msg.text.trim()
-                        val bodyText: String? = when {
-                            assistantText.isNotEmpty() -> assistantText
-                            fallbackBody.isBlank() -> null
-                            q != null && fallbackBody == q.trim() -> null
-                            !evalReasonForUi.isNullOrBlank() && fallbackBody == evalReasonForUi -> null
-                            else -> fallbackBody
-                        }
-
-                        val hasStepTwoSection = bodyText != null || q != null
+                        val hasStepOneSection = evalScoreForUi != null || !evalReasonForUi.isNullOrBlank()
+                        val hasStepTwoSection = assistantText != null || followUpText != null
 
                         if (hasStepOneSection) {
                             SectionLabel("Step 1 · Evaluation")
 
-                            if (hasEvalChip && evalScoreForUi != null) {
+                            if (evalScoreForUi != null) {
                                 ChatBubbleUi.EvalScoreChip(
                                     status = evalStatusForUi,
                                     score = evalScoreForUi,
@@ -307,9 +241,7 @@ internal fun ChatBubbleStructured(
                             }
 
                             if (!evalReasonForUi.isNullOrBlank()) {
-                                if (hasEvalChip) {
-                                    Spacer(Modifier.height(8.dp))
-                                }
+                                Spacer(Modifier.height(8.dp))
                                 Text(
                                     text = evalReasonForUi,
                                     style = MaterialTheme.typography.bodyMedium,
@@ -324,107 +256,79 @@ internal fun ChatBubbleStructured(
                             }
 
                             SectionLabel("Step 2 · Follow-up")
+                            Spacer(Modifier.height(6.dp))
 
-                            if (bodyText != null) {
-                                Spacer(Modifier.height(6.dp))
+                            if (assistantText != null) {
                                 Text(
-                                    text = bodyText,
+                                    text = assistantText,
                                     style = MaterialTheme.typography.bodyMedium,
                                     color = textColor,
                                 )
                             }
 
                             AnimatedVisibility(
-                                visible = (q != null),
+                                visible = (followUpText != null),
                                 enter = fadeIn(tween(140)) + scaleIn(tween(140), initialScale = 0.98f),
                                 exit = fadeOut(tween(90)) + scaleOut(tween(90), targetScale = 0.99f),
                                 label = "followUpCard",
                             ) {
-                                if (q != null) {
-                                    if (bodyText != null) {
+                                if (followUpText != null) {
+                                    if (assistantText != null) {
                                         Spacer(Modifier.height(10.dp))
-                                    } else {
-                                        Spacer(Modifier.height(6.dp))
                                     }
-                                    ChatBubbleUi.FollowUpCard(question = q)
+                                    ChatBubbleUi.FollowUpCard(question = followUpText)
                                 }
                             }
                         }
 
-                        if (hasStreamDetails) {
+                        if (hasAssistantDetails) {
                             Spacer(Modifier.height(10.dp))
-                            StreamDetailsAnimated(
+                            AssistantStepDetailsAnimated(
                                 expanded = expanded,
-                                raw = streamRawForDisplay,
+                                step1Raw = msg.step1Raw.orEmpty(),
+                                step2Raw = msg.step2Raw.orEmpty(),
                                 outline = outline,
                                 maxBlockHeight = 260.dp,
-                                modifier = Modifier,
                             )
                         }
                     }
 
                     isModel -> {
-                        val ttftActive = isStreamingModelBubble && streamRawOriginal.isBlank()
-
-                        val rawBase = if (streamRawOriginal.isNotBlank()) streamRawOriginal else msg.text
-                        val raw = if (rawBase.isNotBlank()) {
-                            ChatBubbleParsing.stripEvalResultLines(rawBase)
-                        } else {
-                            rawBase
+                        val phaseLabel = remember(msg.text) {
+                            when {
+                                msg.text.startsWith("[Step 1]") -> "Step 1 · Evaluating"
+                                msg.text.startsWith("[Step 2]") -> "Step 2 · Generating"
+                                else -> "Streaming"
+                            }
                         }
 
-                        if (isCompactPill && !isStreamingModelBubble) {
-                            ChatBubbleUi.CompactDetailsPill(
-                                title = "Model output",
-                                meta = "(${raw.length} chars)",
-                                action = "Expand",
+                        val raw = msg.streamText?.ifBlank { msg.text } ?: msg.text
+
+                        Column(modifier = Modifier.fillMaxWidth()) {
+                            SectionLabel(phaseLabel)
+                            Spacer(Modifier.height(6.dp))
+
+                            ChatBubbleUi.CodeLikeScrollableBlock(
+                                shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                                outline = outline,
+                                text = raw.ifBlank { "Validating…" },
+                                maxHeight = 300.dp,
                             )
-                        } else {
-                            Column(modifier = Modifier.fillMaxWidth()) {
-                                val blockShape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp)
 
-                                if (isStreamingModelBubble) {
-                                    FancyStreamingModelBlock(
-                                        shape = blockShape,
-                                        msg = msg.copy(streamText = raw),
-                                        onOutline = outline,
-                                    )
-                                } else {
-                                    ChatBubbleUi.CodeLikeScrollableBlock(
-                                        shape = blockShape,
-                                        outline = outline,
-                                        text = raw.ifBlank { "Validating…" },
-                                        maxHeight = 300.dp,
-                                    )
-                                }
+                            Spacer(Modifier.height(6.dp))
 
-                                val modelFollowUp: String? =
-                                    if (!allowFollowUp) {
-                                        null
-                                    } else {
-                                        verdict?.followUpQuestion?.trim()?.takeIf { it.isNotBlank() }
-                                    }
-
-                                if (!modelFollowUp.isNullOrBlank()) {
-                                    Spacer(Modifier.height(10.dp))
-                                    ChatBubbleUi.FollowUpCard(question = modelFollowUp)
-                                }
-
-                                Spacer(Modifier.height(6.dp))
-
-                                val hint = when {
-                                    ttftActive -> "Warming up…"
-                                    isStreamingModelBubble -> "Streaming…"
-                                    expanded -> "Tap to collapse"
-                                    else -> "Tap to expand"
-                                }
-
-                                Text(
-                                    text = hint,
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f),
-                                )
+                            val hint = when (msg.streamState) {
+                                ChatModels.ChatStreamState.STREAMING -> "Streaming…"
+                                ChatModels.ChatStreamState.ENDED -> "Done"
+                                ChatModels.ChatStreamState.ERROR -> "Stopped"
+                                ChatModels.ChatStreamState.NONE -> "Idle"
                             }
+
+                            Text(
+                                text = hint,
+                                style = MaterialTheme.typography.labelSmall,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.9f),
+                            )
                         }
                     }
                 }
@@ -433,9 +337,6 @@ internal fun ChatBubbleStructured(
     }
 }
 
-/**
- * Small section label used to separate step blocks.
- */
 @Composable
 private fun SectionLabel(text: String) {
     Text(
@@ -446,48 +347,57 @@ private fun SectionLabel(text: String) {
 }
 
 /**
- * Animated expand/collapse container for stream details.
+ * Expand/collapse details for the final assistant bubble.
  */
 @Composable
-internal fun StreamDetailsAnimated(
+private fun AssistantStepDetailsAnimated(
     expanded: Boolean,
-    raw: String,
+    step1Raw: String,
+    step2Raw: String,
     outline: Color,
     maxBlockHeight: Dp,
-    modifier: Modifier = Modifier,
 ) {
     AnimatedContent(
         targetState = expanded,
         transitionSpec = {
-            fadeIn(
-                animationSpec = tween(
-                    durationMillis = 120,
-                    easing = FastOutSlowInEasing,
-                ),
-            ) togetherWith
-                    fadeOut(
-                        animationSpec = tween(
-                            durationMillis = 90,
-                            easing = LinearEasing,
-                        ),
-                    )
+            fadeIn(animationSpec = tween(durationMillis = 120, easing = FastOutSlowInEasing)) togetherWith
+                    fadeOut(animationSpec = tween(durationMillis = 90, easing = LinearEasing))
         },
-        label = "streamDetails",
+        label = "assistantStepDetails",
     ) { isExpanded ->
         if (!isExpanded) {
+            val totalLen = step1Raw.length + step2Raw.length
             ChatBubbleUi.CompactDetailsPill(
-                title = "Model output",
-                meta = "(${raw.length} chars)",
+                title = "Model details",
+                meta = "(${totalLen} chars)",
                 action = "Expand",
             )
         } else {
-            Column(modifier = modifier.fillMaxWidth()) {
-                ChatBubbleUi.CodeLikeScrollableBlock(
-                    shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
-                    outline = outline,
-                    text = raw,
-                    maxHeight = maxBlockHeight,
-                )
+            Column(modifier = Modifier.fillMaxWidth()) {
+                if (step1Raw.isNotBlank()) {
+                    SectionLabel("Step 1 raw")
+                    Spacer(Modifier.height(6.dp))
+                    ChatBubbleUi.CodeLikeScrollableBlock(
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                        outline = outline,
+                        text = step1Raw,
+                        maxHeight = maxBlockHeight,
+                    )
+                }
+
+                if (step2Raw.isNotBlank()) {
+                    if (step1Raw.isNotBlank()) {
+                        Spacer(Modifier.height(10.dp))
+                    }
+                    SectionLabel("Step 2 raw")
+                    Spacer(Modifier.height(6.dp))
+                    ChatBubbleUi.CodeLikeScrollableBlock(
+                        shape = androidx.compose.foundation.shape.RoundedCornerShape(14.dp),
+                        outline = outline,
+                        text = step2Raw,
+                        maxHeight = maxBlockHeight,
+                    )
+                }
 
                 Spacer(Modifier.height(6.dp))
 

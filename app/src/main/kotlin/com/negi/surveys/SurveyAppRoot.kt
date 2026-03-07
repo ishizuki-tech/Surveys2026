@@ -265,7 +265,7 @@ object SurveyAppRoot {
                             null
                         }
                     }.onFailure { t ->
-                        SafeLog.e(TAG, "manual upload failed (non-fatal) type=${t::class.java.simpleName}", t)
+                        SafeLog.e(TAG, "manual upload failed (non-fatal) type=${t.javaClass.simpleName}")
                     }.getOrNull()
 
                     val summary = "gh=" + (gh ?: "fail")

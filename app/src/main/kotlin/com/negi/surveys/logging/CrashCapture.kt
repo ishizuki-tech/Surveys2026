@@ -1,6 +1,6 @@
 /*
  * =====================================================================
- *  IshizukiTech LLC — Survey App (Nav3 Frame)
+ *  IshizukiTech LLC — Survey App (Crash Capture)
  *  ---------------------------------------------------------------------
  *  File: CrashCapture.kt
  *  Author: Shu Ishizuki
@@ -34,7 +34,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * Why:
  * - If the process dies, Logcat is not guaranteed to be available to field users.
- * - A persisted crash report enables "upload on next launch".
+ * - A persisted crash report enables upload on the next launch.
  *
  * Notes:
  * - Intentionally minimal; never attempts network work on crash.
@@ -73,20 +73,20 @@ object CrashCapture {
     // Redaction regexes (compiled once)
     // ----------------------------
 
-    /** "Authorization: Bearer <token>" style header. */
+    /** Authorization header in the form of Bearer token. */
     private val reAuthBearerHeader = Regex("(?i)\\bauthorization\\b\\s*:\\s*bearer\\s+[^\\s]+")
 
-    /** JSON-ish: "authorization": "Bearer <token>" */
+    /** JSON-ish authorization field. */
     private val reAuthBearerJson = Regex("(?i)\"authorization\"\\s*:\\s*\"\\s*bearer\\s+[^\"]+\"")
 
-    /** key[:=]value patterns (keeps separator). */
+    /** key[:=]value patterns for sensitive fields. */
     private val reKeyValue = Regex(
-        "(?i)\\b(token|secret|apikey|api_key|password|access_token|refresh_token|session|cookie)\\b\\s*([:=])\\s*([^\\s\"']+)"
+        "(?i)\\b(token|secret|apikey|api_key|password|access_token|refresh_token|session|cookie)\\b\\s*([:=])\\s*([^\\s\"']+)",
     )
 
-    /** JSON-ish: "key": "value" for sensitive keys. */
+    /** JSON-ish key/value patterns for sensitive fields. */
     private val reKeyValueJson = Regex(
-        "(?i)\"\\s*(token|secret|apikey|api_key|password|access_token|refresh_token|session|cookie)\\s*\"\\s*:\\s*\"\\s*[^\"]+\\s*\""
+        "(?i)\"\\s*(token|secret|apikey|api_key|password|access_token|refresh_token|session|cookie)\\s*\"\\s*:\\s*\"\\s*[^\"]+\\s*\"",
     )
 
     /** GitHub tokens. */
@@ -129,10 +129,18 @@ object CrashCapture {
             }
 
             try {
-                // IMPORTANT: On crash path, avoid AppLog/SafeLog to prevent extra IO/locks.
+                /**
+                 * Keep Logcat breadcrumb-only.
+                 *
+                 * Why:
+                 * - Throwable.toString() can include exception.message.
+                 * - Sensitive content may appear in messages.
+                 * - The full stack trace is persisted separately through the sanitized crash file.
+                 */
                 runCatching {
                     val tid = safeThreadId(thread)
-                    Log.e(TAG, "uncaught: thread=${thread.name} tid=$tid pid=${Process.myPid()}", throwable)
+                    val type = throwable.javaClass.simpleName.ifBlank { "Throwable" }
+                    Log.e(TAG, "uncaught: thread=${thread.name} tid=$tid pid=${Process.myPid()} type=$type")
                 }
 
                 runCatching {
@@ -146,7 +154,6 @@ object CrashCapture {
             }
         }
 
-        // Normal path log is fine; SafeLog is okay here.
         SafeLog.i(TAG, "installed")
     }
 
@@ -162,7 +169,7 @@ object CrashCapture {
         val dir = LogFiles.crashPendingDir(appContext)
         if (!dir.exists()) runCatching { dir.mkdirs() }
 
-        // Prevent unbounded growth (including tmp leftovers).
+        // Prevent unbounded growth before write, including tmp leftovers.
         pruneOldPendingCrashes(dir)
 
         val utcCompact = LogFiles.utcCompactNow()
@@ -185,7 +192,6 @@ object CrashCapture {
         val fingerprintHash = sha256Hex(Build.FINGERPRINT).take(16).ifBlank { "unknown" }
         val abis = runCatching { (Build.SUPPORTED_ABIS ?: emptyArray()).joinToString(",") }.getOrDefault("")
 
-        // Best-effort: write to tmp then rename into place.
         val wroteTmp = runCatching {
             FileOutputStream(tmp, false).use { fos ->
                 writeReport(
@@ -208,7 +214,6 @@ object CrashCapture {
                     throwable = t,
                 )
 
-                // Best-effort fsync (helps on sudden process death).
                 runCatching { fos.fd.sync() }
             }
             true
@@ -219,10 +224,9 @@ object CrashCapture {
             return
         }
 
-        // If rename fails (rare), fallback to direct write.
-        if (!tmp.renameTo(file)) {
+        val finalized = if (!tmp.renameTo(file)) {
             runCatching { file.delete() }
-            runCatching {
+            val wroteDirect = runCatching {
                 FileOutputStream(file, false).use { fos ->
                     writeReport(
                         out = fos,
@@ -245,10 +249,19 @@ object CrashCapture {
                     )
                     runCatching { fos.fd.sync() }
                 }
-            }
+                true
+            }.getOrDefault(false)
+
             runCatching { tmp.delete() }
+            wroteDirect
         } else {
             runCatching { tmp.delete() }
+            true
+        }
+
+        if (finalized) {
+            // Enforce the upper bound after the new file becomes visible.
+            pruneOldPendingCrashes(dir)
         }
     }
 
@@ -302,11 +315,11 @@ object CrashCapture {
     }
 
     /**
-     * Best-effort redaction for secrets/PII-like values.
+     * Best-effort redaction for secrets and PII-like values.
      *
      * Notes:
-     * - Conservative; it won't catch everything.
-     * - The primary protection is still: "do not log sensitive data at call sites".
+     * - Conservative; it will not catch everything.
+     * - The primary protection is still: do not log sensitive data at call sites.
      */
     private fun sanitizeLine(input: String): String {
         var s = input
@@ -337,7 +350,7 @@ object CrashCapture {
     private fun pruneOldPendingCrashes(dir: File) {
         val now = System.currentTimeMillis()
 
-        // 1) Remove stale tmp leftovers.
+        // Remove stale tmp leftovers.
         dir.listFiles()
             ?.filter { it.isFile && it.name.startsWith("crash-") && it.name.endsWith(".tmp") }
             ?.forEach { f ->
@@ -347,7 +360,7 @@ object CrashCapture {
                 }
             }
 
-        // 2) Keep only the newest N crash reports.
+        // Keep only the newest N crash reports.
         val files = dir.listFiles()
             ?.filter { it.isFile && it.name.startsWith("crash-") && it.name.endsWith(".txt") }
             ?.sortedWith(compareByDescending<File> { it.lastModified() }.thenByDescending { it.name })
@@ -384,7 +397,9 @@ object CrashCapture {
                 @Suppress("DEPRECATION")
                 pm.getPackageInfo(pkg, 0)
             }
-            if (Build.VERSION.SDK_INT >= 28) pi.longVersionCode else {
+            if (Build.VERSION.SDK_INT >= 28) {
+                pi.longVersionCode
+            } else {
                 @Suppress("DEPRECATION")
                 pi.versionCode.toLong()
             }
@@ -395,7 +410,7 @@ object CrashCapture {
      * Returns a stable thread identifier without relying on newer APIs.
      *
      * Notes:
-     * - thread.id exists widely (though it may be deprecated); it is safe in crash paths.
+     * - thread.id exists widely and is safe to read in crash paths.
      */
     private fun safeThreadId(thread: Thread): Long {
         return runCatching { thread.id }.getOrDefault(-1L)
@@ -405,12 +420,12 @@ object CrashCapture {
      * OutputStream wrapper that stops writing after reaching a size limit.
      *
      * Notes:
-     * - Does NOT close the underlying stream on close(); caller manages lifecycle.
+     * - Does not close the underlying stream on close(); caller manages lifecycle.
      * - Once the limit is hit, it writes a truncation marker (best-effort) and ignores further writes.
      */
     private class LimitedOutputStream(
         private val base: OutputStream,
-        private val limitBytes: Long
+        private val limitBytes: Long,
     ) : OutputStream() {
 
         private var written: Long = 0L
@@ -453,7 +468,6 @@ object CrashCapture {
         }
 
         override fun close() {
-            // Intentionally do not close base.
             flush()
         }
 
@@ -482,7 +496,7 @@ object CrashCapture {
      */
     private class SanitizingLineWriter(
         private val base: Writer,
-        private val sanitizer: (String) -> String
+        private val sanitizer: (String) -> String,
     ) : Writer() {
 
         private val buf = StringBuilder()
@@ -523,7 +537,7 @@ object CrashCapture {
 
     private val HEX = "0123456789abcdef".toCharArray()
 
-    /** SHA-256 hex (lowercase). */
+    /** SHA-256 hex in lowercase. */
     private fun sha256Hex(s: String): String {
         val md = MessageDigest.getInstance("SHA-256")
         val digest = md.digest(s.toByteArray(Charsets.UTF_8))
