@@ -64,17 +64,17 @@ class AppStartupViewModel(
     private val lastWarmupReadyFingerprint = AtomicReference<ModelReadyFingerprint?>(null)
 
     private var serviceCollectorsJob: Job? = null
+    private var startupPipelineJob: Job? = null
 
     private val _uiState = MutableStateFlow(AppStartupUiState())
     val uiState: StateFlow<AppStartupUiState> = _uiState.asStateFlow()
 
     init {
-        viewModelScope.launch(Dispatchers.Default) {
-            awaitInstalledConfigAndBuildServices()
-        }
+        startStartupPipeline(reason = "init")
     }
 
     override fun onCleared() {
+        startupPipelineJob?.cancel()
         serviceCollectorsJob?.cancel()
         super.onCleared()
     }
@@ -88,7 +88,6 @@ class AppStartupViewModel(
      */
     fun onFirstFrameRendered() {
         if (!firstFrameSeen.compareAndSet(false, true)) return
-
         viewModelScope.launch(Dispatchers.Default) {
             delay(STARTUP_AFTER_FIRST_FRAME_DELAY_MS)
             tryStartStartup(reason = "firstFrame")
@@ -96,43 +95,77 @@ class AppStartupViewModel(
     }
 
     /**
-     * Runs the unified retry pipeline for model + warmup.
+     * Runs the unified retry pipeline for model + warmup + startup config.
+     *
+     * Behavior:
+     * - If startup is currently failed or services are not ready, restart the whole startup pipeline.
+     * - Otherwise retry downloader / warmup in-place.
      */
     fun retryAll(fromRaw: String) {
         val from = sanitizeLabel(fromRaw)
+        val snapshot = _uiState.value
+        val needsPipelineRestart =
+            snapshot.configState is StartupConfigState.Failed ||
+                    snapshot.repository == null ||
+                    !snapshot.servicesReady
+
+        if (needsPipelineRestart) {
+            SafeLog.w(TAG, "RetryAll: restart startup pipeline from=$from")
+            startStartupPipeline(reason = "retry:$from")
+            return
+        }
 
         viewModelScope.launch(Dispatchers.IO) {
-            val snapshot = _uiState.value
-            val downloader = snapshot.modelDownloader
-            val warmup = snapshot.warmup
-            val key = snapshot.modelSpecKey
-            val onDeviceEnabled = snapshot.onDeviceEnabled
+            val current = _uiState.value
+            val downloader = current.modelDownloader
+            val warmup = current.warmup
+            val key = current.modelSpecKey
+            val onDeviceEnabled = current.onDeviceEnabled
 
             SafeLog.w(
                 TAG,
-                "RetryAll requested from=$from " +
-                        "onDevice=$onDeviceEnabled keyPresent=${key != null}",
+                "RetryAll requested from=$from onDevice=$onDeviceEnabled keyPresent=${key != null}",
             )
 
             /**
              * Allow the same local file to re-trigger warmup wiring after retry.
              *
              * Why:
-             * - retryAll may hit the same file path / same bytes again.
+             * - retryAll may hit the same local file path / same bytes again.
              * - Without clearing this fingerprint, onModelReady() can be skipped.
              */
             lastWarmupReadyFingerprint.set(null)
 
-            if (onDeviceEnabled && downloader != null) {
-                runCatching {
-                    downloader.resetForRetry(reason = "uiRetry")
-                }.onFailure { t ->
-                    SafeLog.e(
-                        TAG,
-                        "RetryAll: model resetForRetry failed (non-fatal) " +
-                                "type=${t::class.java.simpleName}",
+            if (onDeviceEnabled && key == null) {
+                val localFile = resolveExistingLocalModelFileOrNull(current.modelSpec)
+                if (localFile != null && warmup != null) {
+                    _uiState.update {
+                        it.copy(
+                            modelState = localReadyModelState(localFile),
+                            servicesReady = true,
+                        )
+                    }
+                    onModelReady(
+                        repoMode = current.repoMode,
+                        warmup = warmup,
+                        file = localFile,
                     )
+                    return@launch
                 }
+
+                SafeLog.w(TAG, "RetryAll: local-only retry could not resolve a model file")
+                startStartupPipeline(reason = "retry:$from")
+                return@launch
+            }
+
+            if (onDeviceEnabled && downloader != null) {
+                runCatching { downloader.resetForRetry(reason = "uiRetry") }
+                    .onFailure { t ->
+                        SafeLog.e(
+                            TAG,
+                            "RetryAll: model resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
+                        )
+                    }
 
                 if (key != null) {
                     runCatching {
@@ -144,25 +177,20 @@ class AppStartupViewModel(
                     }.onFailure { t ->
                         SafeLog.e(
                             TAG,
-                            "RetryAll: model ensure failed (non-fatal) " +
-                                    "type=${t::class.java.simpleName}",
+                            "RetryAll: model ensure failed (non-fatal) type=${t::class.java.simpleName}",
                         )
                     }
-                } else {
-                    SafeLog.w(TAG, "RetryAll: skip model ensure (modelSpecKey missing)")
                 }
             }
 
             if (warmup != null) {
-                runCatching {
-                    warmup.resetForRetry(reason = "uiRetry")
-                }.onFailure { t ->
-                    SafeLog.e(
-                        TAG,
-                        "RetryAll: warmup resetForRetry failed (non-fatal) " +
-                                "type=${t::class.java.simpleName}",
-                    )
-                }
+                runCatching { warmup.resetForRetry(reason = "uiRetry") }
+                    .onFailure { t ->
+                        SafeLog.e(
+                            TAG,
+                            "RetryAll: warmup resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
+                        )
+                    }
 
                 if (onDeviceEnabled && key != null) {
                     runCatching {
@@ -170,17 +198,41 @@ class AppStartupViewModel(
                     }.onFailure { t ->
                         SafeLog.e(
                             TAG,
-                            "RetryAll: warmup requestCompileAfterPrefetch failed (non-fatal) " +
-                                    "type=${t::class.java.simpleName}",
+                            "RetryAll: warmup requestCompileAfterPrefetch failed (non-fatal) type=${t::class.java.simpleName}",
                         )
                     }
-                } else if (onDeviceEnabled) {
-                    SafeLog.w(
-                        TAG,
-                        "RetryAll: skip warmup compile request (modelSpecKey missing)",
-                    )
                 }
             }
+        }
+    }
+
+    /**
+     * Starts the startup pipeline from a clean root-level orchestration state.
+     */
+    private fun startStartupPipeline(reason: String) {
+        val safeReason = sanitizeLabel(reason)
+
+        startupPipelineJob?.cancel()
+        serviceCollectorsJob?.cancel()
+        startupRequested.set(false)
+        lastWarmupReadyFingerprint.set(null)
+
+        _uiState.update {
+            it.copy(
+                configState = StartupConfigState.Loading,
+                servicesReady = false,
+                repository = null,
+                warmup = null,
+                modelDownloader = null,
+                modelState = ModelDownloadController.ModelState.Idle(elapsedMs = 0L),
+                prefetchState = WarmupController.PrefetchState.Idle,
+                compileState = WarmupController.CompileState.Idle,
+            )
+        }
+
+        startupPipelineJob = viewModelScope.launch(Dispatchers.Default) {
+            SafeLog.i(TAG, "Startup pipeline: begin reason=$safeReason")
+            awaitInstalledConfigAndBuildServices()
         }
     }
 
@@ -220,14 +272,21 @@ class AppStartupViewModel(
         val repoMode = computeRepoMode()
         val onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE
 
-        if (onDeviceEnabled && modelSpecKey == null) {
+        val initialLocalModelFile =
+            if (onDeviceEnabled && modelSpecKey == null) {
+                resolveExistingLocalModelFileOrNull(modelSpec)
+            } else {
+                null
+            }
+
+        if (onDeviceEnabled && modelSpecKey == null && initialLocalModelFile == null) {
             SafeLog.e(
                 TAG,
-                "Config: model download spec missing/invalid for ON_DEVICE mode",
+                "Config: on-device model unavailable (no download URL and no local file)",
             )
             _uiState.update {
                 it.copy(
-                    configState = StartupConfigState.Failed("ModelDownloadSpecMissing"),
+                    configState = StartupConfigState.Failed("ModelUnavailable"),
                     modelSpec = modelSpec,
                     modelSpecKey = null,
                     repoMode = repoMode,
@@ -236,6 +295,9 @@ class AppStartupViewModel(
                     repository = null,
                     warmup = null,
                     modelDownloader = null,
+                    modelState = ModelDownloadController.ModelState.Idle(elapsedMs = 0L),
+                    prefetchState = WarmupController.PrefetchState.Idle,
+                    compileState = WarmupController.CompileState.Idle,
                 )
             }
             return
@@ -255,6 +317,7 @@ class AppStartupViewModel(
             repoMode = repoMode,
             modelSpec = modelSpec,
             modelSpecKey = modelSpecKey,
+            initialLocalModelFile = initialLocalModelFile,
         )
     }
 
@@ -269,6 +332,7 @@ class AppStartupViewModel(
         repoMode: AppProcessServices.RepoMode,
         modelSpec: ModelDownloadSpec?,
         modelSpecKey: ModelSpecKey?,
+        initialLocalModelFile: File?,
     ) {
         startupRequested.set(false)
         lastWarmupReadyFingerprint.set(null)
@@ -283,11 +347,12 @@ class AppStartupViewModel(
          * - Creating no downloader here avoids stale-spec resurrection.
          */
         val downloader =
-            if (repoMode == AppProcessServices.RepoMode.ON_DEVICE && modelSpec != null && modelSpecKey != null) {
-                AppProcessServices.modelDownloader(
-                    app,
-                    spec = modelSpec,
-                )
+            if (
+                repoMode == AppProcessServices.RepoMode.ON_DEVICE &&
+                modelSpec != null &&
+                modelSpecKey != null
+            ) {
+                AppProcessServices.modelDownloader(app, spec = modelSpec)
             } else {
                 null
             }
@@ -296,17 +361,23 @@ class AppStartupViewModel(
             TAG,
             "Services: obtained mode=$repoMode onDevice=${repoMode == AppProcessServices.RepoMode.ON_DEVICE} " +
                     "keyPresent=${modelSpecKey != null} specPresent=${modelSpec != null} " +
-                    "downloaderPresent=${downloader != null}",
+                    "downloaderPresent=${downloader != null} localModelPresent=${initialLocalModelFile != null}",
         )
+
+        val initialModelState =
+            when {
+                downloader != null -> downloader.state.value
+                initialLocalModelFile != null -> localReadyModelState(initialLocalModelFile)
+                else -> ModelDownloadController.ModelState.Idle(elapsedMs = 0L)
+            }
 
         _uiState.update {
             it.copy(
                 repository = repo,
                 warmup = warmup,
                 modelDownloader = downloader,
-                servicesReady = !it.onDeviceEnabled || downloader != null,
-                modelState = downloader?.state?.value
-                    ?: ModelDownloadController.ModelState.Idle(elapsedMs = 0L),
+                servicesReady = !it.onDeviceEnabled || downloader != null || initialLocalModelFile != null,
+                modelState = initialModelState,
                 prefetchState = warmup.prefetchState.value,
                 compileState = warmup.compileState.value,
             )
@@ -317,6 +388,14 @@ class AppStartupViewModel(
             warmup = warmup,
             downloader = downloader,
         )
+
+        if (initialLocalModelFile != null) {
+            onModelReady(
+                repoMode = repoMode,
+                warmup = warmup,
+                file = initialLocalModelFile,
+            )
+        }
 
         tryStartStartup(reason = "servicesReady")
     }
@@ -330,41 +409,42 @@ class AppStartupViewModel(
         downloader: ModelDownloadController?,
     ) {
         serviceCollectorsJob?.cancel()
-
-        serviceCollectorsJob =
-            viewModelScope.launch(Dispatchers.Default) {
-                if (downloader != null) {
-                    launch {
-                        downloader.state.collect { modelState ->
-                            _uiState.update { it.copy(modelState = modelState) }
-
-                            if (modelState is ModelDownloadController.ModelState.Ready) {
-                                onModelReady(
-                                    repoMode = repoMode,
-                                    warmup = warmup,
-                                    file = modelState.file,
-                                )
-                            }
+        serviceCollectorsJob = viewModelScope.launch(Dispatchers.Default) {
+            if (downloader != null) {
+                launch {
+                    downloader.state.collect { modelState ->
+                        _uiState.update { it.copy(modelState = modelState) }
+                        if (modelState is ModelDownloadController.ModelState.Ready) {
+                            onModelReady(
+                                repoMode = repoMode,
+                                warmup = warmup,
+                                file = modelState.file,
+                            )
                         }
                     }
                 }
+            }
 
-                launch {
-                    warmup.prefetchState.collect { prefetchState ->
-                        _uiState.update { it.copy(prefetchState = prefetchState) }
-                    }
-                }
-
-                launch {
-                    warmup.compileState.collect { compileState ->
-                        _uiState.update { it.copy(compileState = compileState) }
-                    }
+            launch {
+                warmup.prefetchState.collect { prefetchState ->
+                    _uiState.update { it.copy(prefetchState = prefetchState) }
                 }
             }
+
+            launch {
+                warmup.compileState.collect { compileState ->
+                    _uiState.update { it.copy(compileState = compileState) }
+                }
+            }
+        }
     }
 
     /**
      * Starts model download startup once the first frame and services are ready.
+     *
+     * Notes:
+     * - Local-only startup is supported by warmup input injection and local file probing.
+     * - Remote downloader startup only runs when a valid remote model spec key exists.
      */
     private suspend fun tryStartStartup(reason: String) {
         if (!firstFrameSeen.get()) return
@@ -375,14 +455,9 @@ class AppStartupViewModel(
         val key = snapshot.modelSpecKey ?: return
         val downloader = snapshot.modelDownloader ?: return
 
-        if (!startupRequested.compareAndSet(false, true)) {
-            return
-        }
+        if (!startupRequested.compareAndSet(false, true)) return
 
-        SafeLog.i(
-            TAG,
-            "Startup: begin reason=${sanitizeLabel(reason)} keyPresent=true",
-        )
+        SafeLog.i(TAG, "Startup: begin reason=${sanitizeLabel(reason)} keyPresent=true")
 
         runCatching {
             downloader.ensureModelOnce(
@@ -416,6 +491,7 @@ class AppStartupViewModel(
         val fingerprint = ModelReadyFingerprint.from(file)
         val previous = lastWarmupReadyFingerprint.get()
         if (previous == fingerprint) return
+
         lastWarmupReadyFingerprint.set(fingerprint)
 
         AppProcessServices.updateWarmupInputsBestEffort(
@@ -430,8 +506,7 @@ class AppStartupViewModel(
         }.onFailure { t ->
             SafeLog.e(
                 TAG,
-                "Warmup: requestCompileAfterPrefetch failed (non-fatal) " +
-                        "type=${t::class.java.simpleName}",
+                "Warmup: requestCompileAfterPrefetch failed (non-fatal) type=${t::class.java.simpleName}",
             )
         }
     }
@@ -445,15 +520,16 @@ class AppStartupViewModel(
 
     /**
      * Builds the stable downloader recreation key.
+     *
+     * Notes:
+     * - This key is only for remote-download capable startup.
+     * - Local-only startup should not fail just because this key is absent.
      */
-    private fun buildModelSpecKey(
-        modelSpec: ModelDownloadSpec?,
-    ): ModelSpecKey? {
+    private fun buildModelSpecKey(modelSpec: ModelDownloadSpec?): ModelSpecKey? {
         val s = modelSpec ?: return null
         val url = s.modelUrl?.trim().orEmpty()
         val name = s.fileName.trim().orEmpty()
         if (url.isBlank() || name.isBlank()) return null
-
         return ModelSpecKey(
             url = url,
             fileName = name,
@@ -465,37 +541,126 @@ class AppStartupViewModel(
     }
 
     /**
+     * Best-effort local model resolution aligned with Application bootstrap.
+     *
+     * Strategy:
+     * - Prefer the configured file name under known app-private roots.
+     * - Fallback to a bounded scan for the largest plausible model file.
+     * - Never logs file paths or file names.
+     */
+    private fun resolveExistingLocalModelFileOrNull(modelSpec: ModelDownloadSpec?): File? {
+        val spec = modelSpec ?: return null
+
+        val preferred =
+            sanitizeSimpleFileName(spec.fileName)?.let { safeName ->
+                candidateRoots()
+                    .asSequence()
+                    .map { File(it, safeName) }
+                    .firstOrNull { candidate ->
+                        runCatching {
+                            candidate.exists() && candidate.isFile && candidate.length() > 0L
+                        }.getOrDefault(false)
+                    }
+            }
+
+        if (preferred != null) return preferred
+
+        var best: File? = null
+        var bestLen = 0L
+
+        for (dir in candidateRoots()) {
+            val list = runCatching { dir.listFiles() ?: emptyArray() }.getOrDefault(emptyArray())
+            for (file in list) {
+                if (!file.isFile) continue
+
+                val name = file.name.lowercase()
+                if (ALLOWED_MODEL_EXTENSIONS.none { name.endsWith(it) }) continue
+
+                val len = runCatching { file.length() }.getOrDefault(0L)
+                if (len < MIN_LOCAL_MODEL_BYTES) continue
+
+                if (len > bestLen) {
+                    best = file
+                    bestLen = len
+                }
+            }
+        }
+
+        return best
+    }
+
+    /**
+     * Returns small app-private roots that may contain model files.
+     */
+    private fun candidateRoots(): List<File> {
+        return listOfNotNull(
+            app.filesDir,
+            File(app.filesDir, "models"),
+            File(app.filesDir, "slm"),
+            File(app.filesDir, "litert"),
+            app.noBackupFilesDir,
+            app.cacheDir,
+        ).distinct()
+    }
+
+    /**
+     * Sanitizes a simple file name to avoid traversal-like inputs.
+     */
+    private fun sanitizeSimpleFileName(name: String): String? {
+        val n = name.trim()
+        if (n.isBlank()) return null
+        if (n.contains('/')) return null
+        if (n.contains('\\')) return null
+        if (n.contains("..")) return null
+        if (n.length > 200) return null
+        return n
+    }
+
+    /**
+     * Builds a synthetic ready state for local-only startup.
+     */
+    private fun localReadyModelState(file: File): ModelDownloadController.ModelState.Ready {
+        val size = runCatching { file.length() }.getOrDefault(0L)
+        return ModelDownloadController.ModelState.Ready(
+            file = file,
+            sizeBytes = size,
+            startedAtMs = 0L,
+            elapsedMs = 0L,
+        )
+    }
+
+    /**
      * Sanitizes a small label for logs.
      */
     private fun sanitizeLabel(raw: String): String {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return "unknown"
 
-        val safe =
-            buildString {
-                for (c in trimmed) {
-                    if (
-                        c.isLetterOrDigit() ||
-                        c == '_' ||
-                        c == '-' ||
-                        c == ':' ||
-                        c == '.'
-                    ) {
-                        append(c)
-                    }
-                    if (length >= 32) break
+        val safe = buildString {
+            for (c in trimmed) {
+                if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') {
+                    append(c)
                 }
+                if (length >= 32) break
             }
+        }
 
         return safe.ifBlank { "unknown" }
     }
 
     companion object {
         private const val TAG = "AppStartupViewModel"
-
         private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
         private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
         private const val STARTUP_AFTER_FIRST_FRAME_DELAY_MS: Long = 150L
+
+        private const val MIN_LOCAL_MODEL_BYTES: Long = 128L * 1024L * 1024L
+        private val ALLOWED_MODEL_EXTENSIONS = setOf(
+            ".litertlm",
+            ".bin",
+            ".task",
+            ".gguf",
+        )
     }
 }
 
@@ -581,8 +746,6 @@ data class AppStartupUiState(
     val modelDownloader: ModelDownloadController? = null,
     val modelState: ModelDownloadController.ModelState =
         ModelDownloadController.ModelState.Idle(elapsedMs = 0L),
-    val prefetchState: WarmupController.PrefetchState =
-        WarmupController.PrefetchState.Idle,
-    val compileState: WarmupController.CompileState =
-        WarmupController.CompileState.Idle,
+    val prefetchState: WarmupController.PrefetchState = WarmupController.PrefetchState.Idle,
+    val compileState: WarmupController.CompileState = WarmupController.CompileState.Idle,
 )
