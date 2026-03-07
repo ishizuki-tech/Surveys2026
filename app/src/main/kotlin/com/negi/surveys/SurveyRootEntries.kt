@@ -17,6 +17,10 @@ import androidx.compose.runtime.remember
 import androidx.navigation3.runtime.NavEntry
 import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.entryProvider
+import com.negi.surveys.config.NodeDTO
+import com.negi.surveys.config.NodeType
+import com.negi.surveys.config.SurveyConfig
+import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.nav.AppNavigator
 import com.negi.surveys.nav.Export
 import com.negi.surveys.nav.Home
@@ -39,7 +43,7 @@ import com.negi.surveys.warmup.WarmupController
 @Composable
 internal fun rememberSurveyNavEntries(
     nav: AppNavigator,
-    prompts: Map<String, String>,
+    surveyConfig: SurveyConfig?,
     sessionVm: SurveySessionViewModel,
     logsState: State<List<ReviewQuestionLog>>,
     exportTextState: State<String>,
@@ -53,9 +57,13 @@ internal fun rememberSurveyNavEntries(
     rootPrefetchStateState: State<WarmupController.PrefetchState>,
     rootCompileStateState: State<WarmupController.CompileState>,
 ): (NavKey) -> NavEntry<NavKey> {
+    val surveyFlow = remember(surveyConfig) {
+        SurveyFlowPlan.from(surveyConfig)
+    }
+
     return remember(
         nav,
-        prompts,
+        surveyFlow,
         sessionVm,
         logsState,
         exportTextState,
@@ -79,35 +87,69 @@ internal fun rememberSurveyNavEntries(
             }
 
             entry<SurveyStart> {
-                val readyWarmup = warmup
-                if (readyWarmup == null) {
-                    SurveyAppShell.BlockingBody(
-                        title = "Preparing app services…",
-                        detail = "Warmup service is not ready yet.",
-                        showSpinner = true,
+                val hasQuestionFlow = surveyFlow.questionCount > 0
+
+                if (!hasQuestionFlow) {
+                    SurveyStartScreen(
+                        onBegin = {
+                            SafeLog.i(
+                                TAG,
+                                "beginSurvey: no question nodes in graph -> review",
+                            )
+                            nav.goReview()
+                        },
+                        onBack = { nav.pop() },
+                        warmupController = null,
+                        requireWarmup = false,
+                        debugInfo = debugInfoState.value,
+                        descriptionText = "This survey graph has no question nodes. Continuing will open the Review screen.",
+                        beginLabel = "Open Review",
                     )
                 } else {
-                    GateOrContent(
-                        enabled = onDeviceEnabled,
-                        policy = GatePolicy.MODEL_ONLY,
-                        modelState = rootModelStateState.value,
-                        prefetchState = rootPrefetchStateState.value,
-                        compileState = rootCompileStateState.value,
-                        onBack = { nav.pop() },
-                        onRetryAll = { launchRetryAll("surveyStartGate") },
-                    ) {
-                        SurveyStartScreen(
-                            onBegin = { nav.beginQuestions("Q1") },
-                            onBack = { nav.pop() },
-                            warmupController = readyWarmup,
-                            debugInfo = debugInfoState.value,
+                    val readyWarmup = warmup
+                    if (readyWarmup == null) {
+                        SurveyAppShell.BlockingBody(
+                            title = "Preparing app services…",
+                            detail = "Warmup service is not ready yet.",
+                            showSpinner = true,
                         )
+                    } else {
+                        GateOrContent(
+                            enabled = onDeviceEnabled,
+                            policy = GatePolicy.MODEL_ONLY,
+                            modelState = rootModelStateState.value,
+                            prefetchState = rootPrefetchStateState.value,
+                            compileState = rootCompileStateState.value,
+                            onBack = { nav.pop() },
+                            onRetryAll = { launchRetryAll("surveyStartGate") },
+                        ) {
+                            SurveyStartScreen(
+                                onBegin = {
+                                    val firstQuestionId = surveyFlow.startQuestionId
+                                    if (firstQuestionId != null) {
+                                        nav.beginQuestions(firstQuestionId)
+                                    } else {
+                                        SafeLog.w(
+                                            TAG,
+                                            "beginSurvey: question flow expected but unresolved -> review",
+                                        )
+                                        nav.goReview()
+                                    }
+                                },
+                                onBack = { nav.pop() },
+                                warmupController = readyWarmup,
+                                requireWarmup = true,
+                                debugInfo = debugInfoState.value,
+                                descriptionText = "This step prepares the survey session before opening the first question.",
+                                beginLabel = "Begin Survey",
+                            )
+                        }
                     }
                 }
             }
 
             entry<Question> { key ->
-                val prompt = prompts[key.id] ?: "Question prompt for ${key.id} (placeholder)"
+                val prompt = surveyFlow.promptFor(key.id)
 
                 GateOrLatchedContent(
                     enabled = onDeviceEnabled,
@@ -124,10 +166,11 @@ internal fun rememberSurveyNavEntries(
                         prompt = prompt,
                         onNext = { log ->
                             sessionVm.upsertLog(log)
-                            when (key.id) {
-                                "Q1" -> nav.goQuestion("Q2")
-                                "Q2" -> nav.goReview()
-                                else -> nav.goReview()
+                            val nextQuestionId = surveyFlow.nextQuestionAfter(key.id)
+                            if (nextQuestionId != null) {
+                                nav.goQuestion(nextQuestionId)
+                            } else {
+                                nav.goReview()
                             }
                         },
                         onBack = { nav.pop() },
@@ -154,3 +197,134 @@ internal fun rememberSurveyNavEntries(
         }
     }
 }
+
+private data class SurveyFlowPlan(
+    val startQuestionId: String?,
+    val questionCount: Int,
+    private val nodeById: Map<String, NodeDTO>,
+    private val nextQuestionIdByQuestionId: Map<String, String?>,
+) {
+    fun promptFor(questionIdRaw: String): String {
+        val questionId = questionIdRaw.trim()
+        val node = nodeById[questionId]
+        return if (node != null) {
+            buildQuestionPrompt(node)
+        } else {
+            "Question: $questionId"
+        }
+    }
+
+    fun nextQuestionAfter(questionIdRaw: String): String? {
+        val questionId = questionIdRaw.trim()
+        val cached = nextQuestionIdByQuestionId[questionId]
+        if (questionId in nextQuestionIdByQuestionId) return cached
+
+        val nextId = nodeById[questionId]?.nextId
+        return resolveFirstQuestionId(nextId, nodeById)
+    }
+
+    companion object {
+        private const val MAX_GRAPH_HOPS: Int = 256
+
+        fun from(surveyConfig: SurveyConfig?): SurveyFlowPlan {
+            if (surveyConfig == null) {
+                return SurveyFlowPlan(
+                    startQuestionId = null,
+                    questionCount = 0,
+                    nodeById = emptyMap(),
+                    nextQuestionIdByQuestionId = emptyMap(),
+                )
+            }
+
+            val nodes = LinkedHashMap<String, NodeDTO>()
+            surveyConfig.graph.nodes.forEach { node ->
+                val nodeId = node.id.trim()
+                if (nodeId.isNotBlank() && !nodes.containsKey(nodeId)) {
+                    nodes[nodeId] = node
+                }
+            }
+
+            val resolvedStartId = surveyConfig.graph.startId
+                .trim()
+                .takeIf { it.isNotBlank() }
+                ?: nodes.values.firstOrNull { it.nodeType() == NodeType.START }?.id?.trim()
+
+            val questionIds = nodes
+                .filterValues { it.isQuestionNode() }
+                .keys
+
+            val nextQuestionIdByQuestionId = LinkedHashMap<String, String?>()
+            nodes.forEach { (nodeId, node) ->
+                if (node.isQuestionNode()) {
+                    nextQuestionIdByQuestionId[nodeId] = resolveFirstQuestionId(node.nextId, nodes)
+                }
+            }
+
+            val startQuestionId = resolveFirstQuestionId(resolvedStartId, nodes)
+            SafeLog.i(
+                TAG,
+                "surveyFlow: nodes=${nodes.size} questions=${questionIds.size} startQuestionId=${startQuestionId ?: "none"}",
+            )
+
+            return SurveyFlowPlan(
+                startQuestionId = startQuestionId,
+                questionCount = questionIds.size,
+                nodeById = nodes,
+                nextQuestionIdByQuestionId = nextQuestionIdByQuestionId,
+            )
+        }
+
+        private fun resolveFirstQuestionId(
+            startIdRaw: String?,
+            nodeById: Map<String, NodeDTO>,
+        ): String? {
+            var cursor = startIdRaw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+            val visited = LinkedHashSet<String>()
+            var hops = 0
+
+            while (hops < MAX_GRAPH_HOPS && visited.add(cursor)) {
+                val node = nodeById[cursor] ?: return null
+                if (node.isQuestionNode()) {
+                    return cursor
+                }
+                cursor = node.nextId?.trim()?.takeIf { it.isNotBlank() } ?: return null
+                hops += 1
+            }
+
+            return null
+        }
+    }
+}
+
+private fun NodeDTO.isQuestionNode(): Boolean {
+    return when (nodeType()) {
+        NodeType.START,
+        NodeType.REVIEW,
+        NodeType.DONE,
+        NodeType.UNKNOWN -> false
+
+        NodeType.TEXT,
+        NodeType.SINGLE_CHOICE,
+        NodeType.MULTI_CHOICE,
+        NodeType.AI -> true
+    }
+}
+
+private fun buildQuestionPrompt(node: NodeDTO): String {
+    val body = node.question.trim()
+        .ifBlank { node.title.trim() }
+        .ifBlank { "Question: ${node.id.trim()}" }
+
+    val options = node.options
+        .mapNotNull { option -> option.trim().takeIf { it.isNotBlank() } }
+
+    if (options.isEmpty()) return body
+
+    val renderedOptions = options
+        .mapIndexed { index, option -> "${index + 1}. $option" }
+        .joinToString(separator = "\n")
+
+    return "$body\n$renderedOptions"
+}
+
+private const val TAG: String = "SurveyRootEntries"

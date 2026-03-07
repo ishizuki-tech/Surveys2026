@@ -34,6 +34,7 @@ import androidx.navigation3.runtime.NavKey
 import androidx.navigation3.runtime.rememberNavBackStack
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatValidation
+import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.logging.GitHubLogUploadManager
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.nav.AppNavigator
@@ -109,13 +110,6 @@ object SurveyAppRoot {
         val logsState: State<List<ReviewQuestionLog>> = rememberUpdatedState(logs)
         val exportTextState: State<String> = rememberUpdatedState(exportText)
 
-        val prompts: Map<String, String> = remember {
-            linkedMapOf(
-                "Q1" to "Question prompt for Q1 (placeholder)",
-                "Q2" to "Question prompt for Q2 (placeholder)",
-            )
-        }
-
         val streamBridge: ChatStreamBridge = remember {
             ChatStreamBridge(
                 logger = { msg ->
@@ -131,6 +125,10 @@ object SurveyAppRoot {
         LaunchedEffect(Unit) {
             withFrameNanos { /* Wait until the first frame is rendered. */ }
             startupVm.onFirstFrameRendered()
+        }
+
+        val surveyConfig: SurveyConfig? = remember(startupUi.configState) {
+            (startupUi.configState as? StartupConfigState.Ready)?.cfg
         }
 
         val repoMode: AppProcessServices.RepoMode = startupUi.repoMode
@@ -258,6 +256,7 @@ object SurveyAppRoot {
 
                 scope.launch(Dispatchers.IO) {
                     val reason = "manual"
+
                     val gh = runCatching {
                         if (GitHubLogUploadManager.isConfigured()) {
                             GitHubLogUploadManager.uploadRegularBlocking(appContext, reason).getOrNull()
@@ -281,7 +280,7 @@ object SurveyAppRoot {
 
         val entries = rememberSurveyNavEntries(
             nav = nav,
-            prompts = prompts,
+            surveyConfig = surveyConfig,
             sessionVm = sessionVm,
             logsState = logsState,
             exportTextState = exportTextState,

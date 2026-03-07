@@ -22,6 +22,7 @@ import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.chat.DefaultSlmPromptBuilder
 import com.negi.surveys.chat.SlmPromptBuilderI
 import com.negi.surveys.config.InstalledSurveyConfigStore
+import com.negi.surveys.config.NodeType
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.logging.AppLog
@@ -29,6 +30,7 @@ import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.warmup.WarmupController
 import java.io.File
 import java.security.MessageDigest
+import java.util.Locale
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
@@ -48,8 +50,8 @@ import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import org.json.JSONArray
 import org.json.JSONObject
-import java.util.Locale
 
 /**
  * Repository that orchestrates LiteRT-LM inference for:
@@ -58,13 +60,7 @@ import java.util.Locale
  *
  * Two-step contract:
  * 1) Step 1: Assessment JSON
- *    - status
- *    - score
- *    - reason
- *    - optional missing[]
  * 2) Step 2: Follow-up JSON
- *    - assistantMessage (optional)
- *    - followUpQuestion (required when follow-up is needed)
  *
  * Important:
  * - Final accept / follow-up decision is derived by code from Step-1 score.
@@ -150,6 +146,20 @@ class SlmRepository(
         }
     }
 
+    private data class NodePromptContext(
+        val questionId: String,
+        val nodeType: NodeType,
+        val questionText: String,
+        val options: List<String>,
+        val evalTaskPrompt: String?,
+        val followUpTaskPrompt: String?,
+    )
+
+    private enum class ValidationPayloadKind {
+        STEP1_EVAL,
+        STEP2_FOLLOW_UP,
+    }
+
     private val dbg: DebugConfig = debug.normalized()
     private val appContext: Context = context.applicationContext
 
@@ -195,7 +205,7 @@ class SlmRepository(
      *
      * Important:
      * - Validation prompts may already be strict JSON-only prompts.
-     * - We do not inject extra phase markers into prompt text here.
+     * - This path respects phase-specific system prompts when available.
      */
     override fun buildPrompt(
         userPrompt: String,
@@ -204,8 +214,17 @@ class SlmRepository(
         val u = userPrompt.trim()
         if (u.isBlank()) return ""
 
-        val sys = getSystemPromptFromCacheOnly()
-        return promptBuilder.buildAnswerLikePrompt(systemPrompt = sys, userPrompt = u)
+        val cfg = InstalledSurveyConfigStore.getOrNull() ?: cachedConfig.get()
+
+        val baseSystem = resolveBaseSystemPromptForPhase(
+            cfg = cfg,
+            phase = phase,
+        )
+
+        return promptBuilder.buildAnswerLikePrompt(
+            systemPrompt = baseSystem?.trim()?.takeIf { it.isNotBlank() },
+            userPrompt = u,
+        )
     }
 
     override suspend fun request(prompt: String): Flow<String> {
@@ -247,11 +266,13 @@ class SlmRepository(
      * Structured two-step assessment entry point used by the validator.
      *
      * Design:
-     * - Build the legacy-compatible validation user prompt internally.
-     * - Run Step 1 and parse strict JSON.
-     * - Final status is derived by code from score threshold.
+     * - Resolve node-specific survey context from installed config.
+     * - Build DATA payloads only (question/options/answers/history).
+     * - Merge node-specific eval/follow-up prompt into phase-specific system prompt.
+     * - Run Step 1 and parse flexible JSON.
+     * - Canonicalize Step-1 JSON before feeding Step 2.
      * - Step 2 is executed only when follow-up is needed.
-     * - Raw JSON for both steps is returned for UI details.
+     * - Repeated follow-up questions are suppressed in code.
      */
     override suspend fun runTwoStepAssessment(
         request: ChatValidation.TwoStepAssessmentRequest,
@@ -278,13 +299,15 @@ class SlmRepository(
             "AUTO-${UUID.randomUUID().toString().take(8)}"
         }
 
-        val validationUserPrompt = buildValidationUserPrompt(
-            phase = if (request.followUpAnswerPayload.isNullOrBlank()) {
-                ChatValidation.PromptPhase.VALIDATE_MAIN
-            } else {
-                ChatValidation.PromptPhase.VALIDATE_FOLLOW_UP
-            },
+        val promptContext = resolveNodePromptContext(
+            cfg = cfg,
             questionId = questionId,
+        )
+        dbgLogNodePromptContext(promptContext)
+
+        val step1Payload = buildValidationDataPayload(
+            payloadKind = ValidationPayloadKind.STEP1_EVAL,
+            promptContext = promptContext,
             mainAnswer = request.mainAnswer,
             followUpAnswerPayload = request.followUpAnswerPayload,
         )
@@ -293,11 +316,24 @@ class SlmRepository(
             resetConversationBestEffort(model, reason = "step1")
         }
 
-        val step1Prompt = promptBuilder.buildEvalScorePrompt(
+        val step1Body = promptBuilder.buildEvalScorePrompt(
             questionId = questionId,
-            userPrompt = validationUserPrompt,
+            userPrompt = step1Payload,
             acceptScoreThreshold = acceptScoreThreshold,
             userPromptMaxChars = ASSESSMENT_USER_PROMPT_MAX_CHARS,
+        )
+
+        val step1System = composeStructuredSystemPrompt(
+            baseSystemPrompt = resolveBaseSystemPromptForPhase(
+                cfg = cfg,
+                phaseName = "VALIDATE_MAIN",
+            ),
+            nodeTaskPrompt = promptContext.evalTaskPrompt,
+        )
+
+        val step1Prompt = composeSdkInput(
+            systemPrompt = step1System,
+            promptBody = step1Body,
         )
 
         val step1Collected = collectStructuredJsonForPhase(
@@ -312,7 +348,7 @@ class SlmRepository(
         val rawEvalJson = extractFirstCompleteJsonObjectBestEffort(step1Collected.text)
             ?: step1Collected.text.trim()
 
-        val parsedStep1 = parseStep1EvalStrict(
+        val parsedStep1 = parseStep1EvalFlexible(
             raw = rawEvalJson,
             fallbackReason = fallbackStep1Reason(
                 collectedReason = step1Collected.reason,
@@ -327,6 +363,7 @@ class SlmRepository(
         }
 
         val finalStep1 = parsedStep1.copy(status = finalStatus)
+        val canonicalEvalJson = buildCanonicalStep1EvalJson(finalStep1)
 
         dbgLogStructuredStep1(
             questionId = questionId,
@@ -347,13 +384,33 @@ class SlmRepository(
             resetConversationBestEffort(model, reason = "step2")
         }
 
-        val step2Prompt = promptBuilder.buildFollowUpPrompt(
+        val step2Payload = buildValidationDataPayload(
+            payloadKind = ValidationPayloadKind.STEP2_FOLLOW_UP,
+            promptContext = promptContext,
+            mainAnswer = request.mainAnswer,
+            followUpAnswerPayload = request.followUpAnswerPayload,
+        )
+
+        val step2Body = promptBuilder.buildFollowUpPrompt(
             questionId = questionId,
-            userPrompt = validationUserPrompt,
-            evalJson = rawEvalJson,
+            userPrompt = step2Payload,
+            evalJson = canonicalEvalJson,
             acceptScoreThreshold = acceptScoreThreshold,
             userPromptMaxChars = FOLLOWUP_USER_PROMPT_MAX_CHARS,
             evalJsonMaxChars = FOLLOWUP_ASSESSMENT_JSON_MAX_CHARS,
+        )
+
+        val step2System = composeStructuredSystemPrompt(
+            baseSystemPrompt = resolveBaseSystemPromptForPhase(
+                cfg = cfg,
+                phaseName = "VALIDATE_FOLLOW_UP",
+            ),
+            nodeTaskPrompt = promptContext.followUpTaskPrompt,
+        )
+
+        val step2Prompt = composeSdkInput(
+            systemPrompt = step2System,
+            promptBody = step2Body,
         )
 
         val step2Collected = collectStructuredJsonForPhase(
@@ -368,20 +425,43 @@ class SlmRepository(
         val rawFollowUpJson = extractFirstCompleteJsonObjectBestEffort(step2Collected.text)
             ?: step2Collected.text.trim()
 
-        val parsedStep2 = parseStep2FollowUpStrict(
+        val parsedStep2 = parseStep2FollowUpFlexible(
             raw = rawFollowUpJson,
             fallbackFollowUp = request.fallbackFollowUp,
+        )
+
+        val previousTurn = request.followUpAnswerPayload
+            ?.takeIf { it.isNotBlank() && looksLikeFollowUpHistory(it) }
+            ?.let { extractLatestFollowUpTurn(it) }
+
+        val finalFollowUpQuestion = resolveFinalFollowUpQuestion(
+            questionId = questionId,
+            parsedQuestion = parsedStep2.followUpQuestion,
+            previousQuestion = previousTurn?.question,
+            defaultFallback = request.fallbackFollowUp,
+            followUpAnswerPayload = request.followUpAnswerPayload,
+        )
+
+        val finalStep2 = parsedStep2.copy(
+            followUpQuestion = finalFollowUpQuestion.safeTrimAndClip(MAX_FOLLOW_UP_QUESTION_CHARS),
         )
 
         dbgLogStructuredStep2(
             questionId = questionId,
             rawFollowUpJson = rawFollowUpJson,
-            parsed = parsedStep2,
+            parsed = finalStep2,
+        )
+
+        dbgLogFollowUpResolution(
+            questionId = questionId,
+            previousQuestion = previousTurn?.question,
+            modelQuestion = parsedStep2.followUpQuestion,
+            finalQuestion = finalStep2.followUpQuestion,
         )
 
         return ChatValidation.TwoStepAssessmentResult(
             step1 = finalStep1,
-            step2 = parsedStep2.copy(status = ChatModels.ValidationStatus.NEED_FOLLOW_UP),
+            step2 = finalStep2.copy(status = ChatModels.ValidationStatus.NEED_FOLLOW_UP),
             rawEvalJson = rawEvalJson,
             rawFollowUpJson = rawFollowUpJson,
         )
@@ -434,6 +514,7 @@ class SlmRepository(
      * - This path is kept for compatibility.
      * - Unlike the structured validator path, it emits text chunks directly.
      * - It now respects the Step-1 score threshold and skips Step-2 when accepted.
+     * - Phase-specific system prompts are applied when config is available.
      */
     private fun requestAssessmentThenFollowUp(model: Model, userPrompt: String): Flow<String> {
         val u = userPrompt.trim()
@@ -443,16 +524,29 @@ class SlmRepository(
             val traceId = UUID.randomUUID().toString().take(8)
             val streamAssessmentToClient = dbg.streamAssessmentOutputToClient
             val questionId = extractQuestionId(u) ?: "AUTO-${UUID.randomUUID().toString().take(8)}"
+            val cfg = InstalledSurveyConfigStore.getOrNull() ?: cachedConfig.get()
+            val promptContext = resolveNodePromptContext(cfg, questionId)
 
             if (resetConversationEachRequest) {
                 resetConversationBestEffort(model, reason = "assessment")
             }
 
-            val assessmentPrompt = promptBuilder.buildEvalScorePrompt(
+            val assessmentBody = promptBuilder.buildEvalScorePrompt(
                 questionId = questionId,
                 userPrompt = u,
                 acceptScoreThreshold = acceptScoreThreshold,
                 userPromptMaxChars = ASSESSMENT_USER_PROMPT_MAX_CHARS,
+            )
+
+            val assessmentPrompt = composeSdkInput(
+                systemPrompt = composeStructuredSystemPrompt(
+                    baseSystemPrompt = resolveBaseSystemPromptForPhase(
+                        cfg = cfg,
+                        phaseName = "VALIDATE_MAIN",
+                    ),
+                    nodeTaskPrompt = promptContext.evalTaskPrompt,
+                ),
+                promptBody = assessmentBody,
             )
 
             dbgLogPrompt(
@@ -490,7 +584,7 @@ class SlmRepository(
             )
 
             val assessmentJsonRaw = extractFirstCompleteJsonObjectBestEffort(assessmentResult.text)
-            val assessmentParsed = parseStep1EvalStrict(
+            val assessmentParsed = parseStep1EvalFlexible(
                 raw = assessmentJsonRaw ?: assessmentResult.text,
                 fallbackReason = fallbackStep1Reason(
                     collectedReason = assessmentResult.reason,
@@ -498,19 +592,27 @@ class SlmRepository(
                 ),
             )
 
+            val accepted = assessmentParsed.score >= acceptScoreThreshold
+            val finalAssessment = assessmentParsed.copy(
+                status = if (accepted) {
+                    ChatModels.ValidationStatus.ACCEPTED
+                } else {
+                    ChatModels.ValidationStatus.NEED_FOLLOW_UP
+                },
+            )
+
             AppLog.d(
                 TAG,
-                "assessment done: trace=$traceId qid=$questionId score=${assessmentParsed.score} " +
-                        "status=${assessmentParsed.status} reason=${assessmentResult.reason} earlyStop=${assessmentResult.isEarlyStop}",
+                "assessment done: trace=$traceId qid=$questionId score=${finalAssessment.score} " +
+                        "status=${finalAssessment.status} reason=${assessmentResult.reason} earlyStop=${assessmentResult.isEarlyStop}",
             )
 
             if (streamAssessmentToClient) {
                 emit(
-                    "\n$STREAM_ASSESSMENT_RESULT_PREFIX status=${assessmentParsed.status.name} score=${assessmentParsed.score}\n",
+                    "\n$STREAM_ASSESSMENT_RESULT_PREFIX status=${finalAssessment.status.name} score=${finalAssessment.score}\n",
                 )
             }
 
-            val accepted = assessmentParsed.score >= acceptScoreThreshold
             if (accepted) {
                 closeOk()
                 return@streamingFlow
@@ -528,13 +630,26 @@ class SlmRepository(
                 resetConversationBestEffort(model, reason = "followUp")
             }
 
-            val followUpPrompt = promptBuilder.buildFollowUpPrompt(
+            val canonicalEvalJson = buildCanonicalStep1EvalJson(finalAssessment)
+
+            val followUpBody = promptBuilder.buildFollowUpPrompt(
                 questionId = questionId,
                 userPrompt = u,
-                evalJson = assessmentJsonRaw ?: assessmentResult.text,
+                evalJson = canonicalEvalJson,
                 acceptScoreThreshold = acceptScoreThreshold,
                 userPromptMaxChars = FOLLOWUP_USER_PROMPT_MAX_CHARS,
                 evalJsonMaxChars = FOLLOWUP_ASSESSMENT_JSON_MAX_CHARS,
+            )
+
+            val followUpPrompt = composeSdkInput(
+                systemPrompt = composeStructuredSystemPrompt(
+                    baseSystemPrompt = resolveBaseSystemPromptForPhase(
+                        cfg = cfg,
+                        phaseName = "VALIDATE_FOLLOW_UP",
+                    ),
+                    nodeTaskPrompt = promptContext.followUpTaskPrompt,
+                ),
+                promptBody = followUpBody,
             )
 
             dbgLogPrompt(
@@ -709,19 +824,204 @@ class SlmRepository(
     // ---------------------------------------------------------------------
 
     /**
-     * Build a legacy-compatible validation user prompt.
+     * Resolve node-specific question/options/prompts from the installed survey config.
+     *
+     * Fallbacks:
+     * - questionText: node.question -> node.title -> questionId
+     * - task prompts: split/inline two-step prompt -> legacy one-step prompt -> null
+     */
+    private fun resolveNodePromptContext(
+        cfg: SurveyConfig?,
+        questionId: String,
+    ): NodePromptContext {
+        val qid = questionId.trim()
+
+        val node = cfg?.graph?.nodes?.firstOrNull { it.id.trim() == qid }
+
+        val questionText = node?.question
+            ?.trim()
+            .orEmpty()
+            .ifBlank { node?.title?.trim().orEmpty() }
+            .ifBlank { qid }
+
+        val options = node?.options
+            ?.mapNotNull { it.trim().takeIf { v -> v.isNotBlank() } }
+            .orEmpty()
+
+        val oneStepPrompt = cfg
+            ?.resolveOneStepPrompt(qid)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+
+        val evalTaskPrompt = cfg
+            ?.resolveEvalPrompt(qid)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: oneStepPrompt
+
+        val followUpTaskPrompt = cfg
+            ?.resolveFollowupPrompt(qid)
+            ?.trim()
+            ?.takeIf { it.isNotBlank() }
+            ?: oneStepPrompt
+
+        return NodePromptContext(
+            questionId = qid,
+            nodeType = node?.nodeType() ?: NodeType.UNKNOWN,
+            questionText = questionText,
+            options = options,
+            evalTaskPrompt = evalTaskPrompt,
+            followUpTaskPrompt = followUpTaskPrompt,
+        )
+    }
+
+    /**
+     * Resolve the phase-specific base system prompt.
+     */
+    private fun resolveBaseSystemPromptForPhase(
+        cfg: SurveyConfig?,
+        phase: ChatValidation.PromptPhase,
+    ): String? {
+        return resolveBaseSystemPromptForPhase(cfg = cfg, phaseName = phase.name)
+    }
+
+    /**
+     * Resolve the phase-specific base system prompt by phase name.
      *
      * Notes:
-     * - This preserves the previous pipeline shape where repository step builders wrap a user prompt body.
-     * - Follow-up payload may be either a direct answer or a history-like blob.
+     * - String-based handling keeps this tolerant to enum changes outside this file.
+     * - Step-1 sanitation strips accidental follow-up-only JSON instructions.
      */
-    private fun buildValidationUserPrompt(
-        phase: ChatValidation.PromptPhase,
-        questionId: String,
+    private fun resolveBaseSystemPromptForPhase(
+        cfg: SurveyConfig?,
+        phaseName: String,
+    ): String? {
+        val raw = when (phaseName) {
+            "VALIDATE_MAIN" -> runCatching { cfg?.composeSystemPromptEval() }.getOrNull()
+            "VALIDATE_FOLLOW_UP" -> runCatching { cfg?.composeSystemPromptFollowup() }.getOrNull()
+            else -> runCatching { cfg?.composeSystemPrompt() }.getOrNull()
+        }?.trim()?.takeIf { it.isNotBlank() }
+
+        return sanitizeBaseSystemPromptForPhase(
+            systemPrompt = raw,
+            phaseName = phaseName,
+        )
+    }
+
+    /**
+     * Sanitize phase-specific base system prompt text.
+     *
+     * Notes:
+     * - Older config composition may accidentally inject follow-up JSON examples into Step-1.
+     * - This method removes those lines for VALIDATE_MAIN only.
+     */
+    private fun sanitizeBaseSystemPromptForPhase(
+        systemPrompt: String?,
+        phaseName: String,
+    ): String? {
+        val raw = systemPrompt?.trim().orEmpty()
+        if (raw.isBlank()) return null
+        if (phaseName != "VALIDATE_MAIN") return raw
+
+        val lines = raw
+            .replace("\r\n", "\n")
+            .replace("\r", "\n")
+            .split('\n')
+
+        val out = ArrayList<String>(lines.size)
+        var skipNextJsonLine = false
+
+        for (line in lines) {
+            val trimmed = line.trim()
+
+            if (skipNextJsonLine) {
+                skipNextJsonLine = false
+                if (
+                    trimmed.contains("followUpQuestion") ||
+                    trimmed.contains("followup_question")
+                ) {
+                    continue
+                }
+            }
+
+            if (trimmed.equals("If no follow-up is needed, return:", ignoreCase = true)) {
+                skipNextJsonLine = true
+                continue
+            }
+
+            if (
+                trimmed.contains("followUpQuestion") ||
+                trimmed.contains("followup_question")
+            ) {
+                continue
+            }
+
+            out += line
+        }
+
+        return out.joinToString("\n").trim().takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Compose the actual system prompt used for a structured phase.
+     *
+     * Notes:
+     * - Base system prompt comes from SurveyConfig slm metadata.
+     * - Node-specific eval/follow-up prompt is appended as additional system guidance.
+     */
+    private fun composeStructuredSystemPrompt(
+        baseSystemPrompt: String?,
+        nodeTaskPrompt: String?,
+    ): String? {
+        val parts = buildList {
+            baseSystemPrompt?.trim()?.takeIf { it.isNotBlank() }?.let { add(it) }
+            nodeTaskPrompt?.trim()?.takeIf { it.isNotBlank() }?.let { add(it) }
+        }
+        if (parts.isEmpty()) return null
+        return parts.joinToString("\n\n")
+    }
+
+    /**
+     * Compose the actual SDK input string.
+     *
+     * Important:
+     * - For structured two-step prompts, [promptBody] already contains the inner
+     *   USER/DATA scaffold from the shared prompt builder.
+     * - Do not wrap it again with USER_PROMPT_BEGIN/END here.
+     */
+    private fun composeSdkInput(
+        systemPrompt: String?,
+        promptBody: String,
+    ): String {
+        val body = promptBody.trim()
+        if (body.isBlank()) return ""
+
+        val sys = systemPrompt.orEmpty().trim()
+        if (sys.isBlank()) return body
+
+        return buildString(sys.length + body.length + 64) {
+            append("SYSTEM_PROMPT_BEGIN\n")
+            append(sys)
+            append('\n')
+            append("SYSTEM_PROMPT_END\n\n")
+            append(body)
+        }
+    }
+
+    /**
+     * Build a structured DATA payload.
+     *
+     * Important:
+     * - This function must not generate another instruction scaffold.
+     * - It only prepares survey data that will be wrapped by the shared prompt builder.
+     */
+    private fun buildValidationDataPayload(
+        payloadKind: ValidationPayloadKind,
+        promptContext: NodePromptContext,
         mainAnswer: String,
         followUpAnswerPayload: String?,
     ): String {
-        val qid = questionId.trim()
+        val qid = promptContext.questionId
         val main = mainAnswer.trim()
 
         val fuRaw = followUpAnswerPayload?.trim().orEmpty()
@@ -750,13 +1050,20 @@ class SlmRepository(
         if (hasFollowUp) {
             val sha8 = sha256Hex(followUpAnswerText).take(8)
             dbgLogCompatFollowUpPayload(
-                phase = phase,
+                payloadKind = payloadKind,
                 latestQuestionLength = followUpQuestionText.length,
                 latestAnswerLength = followUpAnswerText.length,
                 latestAnswerSha8 = sha8,
                 treatAsHistory = treatAsHistory,
             )
         }
+
+        val clippedQuestion = promptContext.questionText.safeTrimAndClip(MAX_QUESTION_TEXT_CHARS)
+        val clippedMain = main.safeTrimAndClip(MAX_MAIN_ANSWER_CHARS)
+        val clippedOptions = promptContext.options
+            .take(MAX_OPTION_COUNT)
+            .map { it.safeTrimAndClip(MAX_OPTION_CHARS) }
+            .filter { it.isNotBlank() }
 
         val followUpSection = if (!hasFollowUp) {
             ""
@@ -775,8 +1082,9 @@ class SlmRepository(
                 appendLine("FOLLOW_UP_ANSWER_END")
                 appendLine()
 
-                appendLine("FOLLOW_UP_QUESTION:")
+                appendLine("FOLLOW_UP_QUESTION_BEGIN")
                 if (clippedQ.isNotBlank()) appendLine(clippedQ)
+                appendLine("FOLLOW_UP_QUESTION_END")
                 appendLine()
 
                 if (treatAsHistory) {
@@ -788,32 +1096,34 @@ class SlmRepository(
             }
         }
 
-        return """
-Return exactly ONE JSON object and nothing else.
-- No markdown, no code fences, no backticks.
-- Output must start with "{" and end with "}".
-- Do not repeat the user's full answer.
+        return buildString(2_048) {
+            appendLine("SURVEY_NODE_ID: $qid")
+            appendLine("NODE_TYPE: ${promptContext.nodeType.name}")
+            appendLine()
 
-Valid shapes:
-1) {"status":"ACCEPTED","assistantMessage":"..."}
-2) {"status":"NEED_FOLLOW_UP","assistantMessage":"...","followUpQuestion":"..."}
+            appendLine("QUESTION_TEXT_BEGIN")
+            appendLine(clippedQuestion)
+            appendLine("QUESTION_TEXT_END")
+            appendLine()
 
-Rules:
-- Evaluate sufficiency using the COMBINED information:
-  MAIN_ANSWER plus FOLLOW_UP_ANSWER (and FOLLOW_UP_HISTORY if present).
-- If the combined information is sufficient: ACCEPTED.
-- Else: NEED_FOLLOW_UP and ask exactly ONE concise follow-up question.
-- If FOLLOW_UP_ANSWER is non-empty, do NOT repeat the same follow-up question again.
-  Either ACCEPTED, or ask a DIFFERENT and more specific follow-up question.
+            if (clippedOptions.isNotEmpty()) {
+                appendLine("QUESTION_OPTIONS_BEGIN")
+                clippedOptions.forEachIndexed { index, option ->
+                    append(index + 1)
+                    append(". ")
+                    appendLine(option)
+                }
+                appendLine("QUESTION_OPTIONS_END")
+                appendLine()
+            }
 
-QUESTION_ID: $qid
+            appendLine("MAIN_ANSWER_BEGIN")
+            appendLine(clippedMain)
+            appendLine("MAIN_ANSWER_END")
+            appendLine()
 
-MAIN_ANSWER_BEGIN
-$main
-MAIN_ANSWER_END
-
-$followUpSection
-""".trimIndent()
+            append(followUpSection)
+        }.trimEnd()
     }
 
     /**
@@ -847,6 +1157,7 @@ $followUpSection
                     result.reason.startsWith("COMPLETED") -> {
                         streamBridge.end(sessionId)
                     }
+
                     result.reason.startsWith("CANCELLED") -> {
                         streamBridge.error(
                             sessionId = sessionId,
@@ -854,6 +1165,7 @@ $followUpSection
                             code = ChatStreamEvent.Codes.CANCELLED,
                         )
                     }
+
                     result.reason.startsWith("TIMEOUT") -> {
                         streamBridge.error(
                             sessionId = sessionId,
@@ -861,6 +1173,7 @@ $followUpSection
                             code = ChatStreamEvent.Codes.TIMEOUT,
                         )
                     }
+
                     result.reason.startsWith("MAX_CHARS") -> {
                         streamBridge.error(
                             sessionId = sessionId,
@@ -868,6 +1181,7 @@ $followUpSection
                             code = ChatStreamEvent.Codes.ERROR,
                         )
                     }
+
                     else -> {
                         streamBridge.error(
                             sessionId = sessionId,
@@ -904,7 +1218,14 @@ $followUpSection
         }
     }
 
-    private fun parseStep1EvalStrict(
+    /**
+     * Parse Step-1 output flexibly.
+     *
+     * Supported shapes:
+     * 1) {"status":"ACCEPTED|NEED_FOLLOW_UP","score":0..100,"reason":"...","missing":[...]}
+     * 2) {"accepted":true|false,"reason":"...","followup_needed":true|false}
+     */
+    private fun parseStep1EvalFlexible(
         raw: String,
         fallbackReason: String,
     ): ChatValidation.Step1EvalResult {
@@ -921,14 +1242,32 @@ $followUpSection
         return runCatching {
             val obj = JSONObject(json)
 
-            val rawStatus = obj.optString("status", "").trim()
-            val status = when (rawStatus) {
-                "ACCEPTED" -> ChatModels.ValidationStatus.ACCEPTED
-                "NEED_FOLLOW_UP" -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
-                else -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
+            val explicitStatus = parseStatusToken(obj.optString("status", ""))
+            val accepted = optBooleanMaybe(obj, "accepted")
+            val followupNeeded = optBooleanMaybe(obj, "followup_needed")
+                ?: optBooleanMaybe(obj, "followUpNeeded")
+
+            val status = explicitStatus
+                ?: when {
+                    followupNeeded != null -> {
+                        if (followupNeeded) ChatModels.ValidationStatus.NEED_FOLLOW_UP
+                        else ChatModels.ValidationStatus.ACCEPTED
+                    }
+
+                    accepted != null -> {
+                        if (accepted) ChatModels.ValidationStatus.ACCEPTED
+                        else ChatModels.ValidationStatus.NEED_FOLLOW_UP
+                    }
+
+                    else -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
+                }
+
+            val explicitScore = optIntMaybe(obj, "score")?.coerceIn(0, 100)
+            val score = explicitScore ?: when (status) {
+                ChatModels.ValidationStatus.ACCEPTED -> 100
+                ChatModels.ValidationStatus.NEED_FOLLOW_UP -> 0
             }
 
-            val score = obj.optInt("score", 0).coerceIn(0, 100)
             val reason = obj.optString("reason", "").trim().ifBlank { fallbackReason }
 
             val missing = buildList {
@@ -955,16 +1294,29 @@ $followUpSection
         }
     }
 
-    private fun parseStep2FollowUpStrict(
+    /**
+     * Parse Step-2 output flexibly.
+     *
+     * Supported keys:
+     * - followUpQuestion
+     * - followup_question
+     * - assistantMessage
+     * - assistant_message
+     *
+     * Robustness:
+     * - If JSON parsing fails, a plain-text question is accepted as a best-effort follow-up.
+     */
+    private fun parseStep2FollowUpFlexible(
         raw: String,
         fallbackFollowUp: String,
     ): ChatValidation.Step2FollowUpResult {
         val json = extractFirstCompleteJsonObjectBestEffort(raw)
         if (json == null) {
+            val plainTextFollowUp = normalizeFollowUpQuestion(raw)
             return ChatValidation.Step2FollowUpResult(
                 status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
                 assistantMessage = "",
-                followUpQuestion = fallbackFollowUp,
+                followUpQuestion = plainTextFollowUp ?: fallbackFollowUp,
             )
         }
 
@@ -972,12 +1324,15 @@ $followUpSection
             val obj = JSONObject(json)
 
             val assistantMessage = obj.optString("assistantMessage", "")
+                .ifBlank { obj.optString("assistant_message", "") }
                 .replace("\u0000", "")
                 .trim()
                 .ifBlank { "" }
 
             val followUpQuestion = normalizeFollowUpQuestion(
                 obj.optString("followUpQuestion", ""),
+            ) ?: normalizeFollowUpQuestion(
+                obj.optString("followup_question", ""),
             ) ?: fallbackFollowUp
 
             ChatValidation.Step2FollowUpResult(
@@ -994,6 +1349,69 @@ $followUpSection
         }
     }
 
+    /**
+     * Build the canonical Step-1 JSON used by the Step-2 builder.
+     *
+     * This ensures Step-2 always sees a stable schema with:
+     * - status
+     * - score
+     * - reason
+     * - optional missing
+     */
+    private fun buildCanonicalStep1EvalJson(
+        step1: ChatValidation.Step1EvalResult,
+    ): String {
+        val obj = JSONObject()
+        obj.put("status", step1.status.name)
+        obj.put("score", step1.score.coerceIn(0, 100))
+        obj.put("reason", step1.reason.trim())
+
+        if (step1.missing.isNotEmpty()) {
+            val arr = JSONArray()
+            step1.missing.forEach { item ->
+                val t = item.trim()
+                if (t.isNotBlank()) arr.put(t)
+            }
+            if (arr.length() > 0) {
+                obj.put("missing", arr)
+            }
+        }
+
+        return obj.toString()
+    }
+
+    private fun parseStatusToken(rawStatus: String): ChatModels.ValidationStatus? {
+        return when (rawStatus.trim()) {
+            "ACCEPTED" -> ChatModels.ValidationStatus.ACCEPTED
+            "NEED_FOLLOW_UP" -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
+            else -> null
+        }
+    }
+
+    private fun optBooleanMaybe(obj: JSONObject, key: String): Boolean? {
+        if (!obj.has(key)) return null
+        return when (val v = obj.opt(key)) {
+            is Boolean -> v
+            is Number -> v.toInt() != 0
+            is String -> when (v.trim().lowercase(Locale.US)) {
+                "true", "1", "yes", "y" -> true
+                "false", "0", "no", "n" -> false
+                else -> null
+            }
+
+            else -> null
+        }
+    }
+
+    private fun optIntMaybe(obj: JSONObject, key: String): Int? {
+        if (!obj.has(key)) return null
+        return when (val v = obj.opt(key)) {
+            is Number -> v.toInt()
+            is String -> v.trim().toIntOrNull()
+            else -> null
+        }
+    }
+
     private fun fallbackStep1Reason(
         collectedReason: String,
         errorToken: String?,
@@ -1001,17 +1419,189 @@ $followUpSection
         return when {
             collectedReason.startsWith("TIMEOUT") ->
                 "Validation timed out before a reliable score was produced."
+
             collectedReason.startsWith("MAX_CHARS") ->
                 "Validation output was clipped before a reliable score was produced."
+
             collectedReason.startsWith("ERROR") ->
                 when (errorToken) {
                     "ModelNotReadyException" -> "Model is still warming up."
                     else -> "Validation failed before a reliable score was produced."
                 }
+
             collectedReason.startsWith("CANCELLED") ->
                 "Validation was cancelled."
+
             else ->
                 "Validation result could not be parsed."
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // Follow-up duplicate suppression
+    // ---------------------------------------------------------------------
+
+    /**
+     * Normalize follow-up text for duplicate detection.
+     *
+     * Notes:
+     * - Lowercase
+     * - Remove punctuation and symbol noise
+     * - Collapse whitespace
+     */
+    private fun normalizeQuestionForComparison(text: String?): String {
+        if (text.isNullOrBlank()) return ""
+
+        val cleaned = buildString(text.length) {
+            text.forEach { ch ->
+                when {
+                    ch.isLetterOrDigit() || ch.isWhitespace() -> append(ch.lowercaseChar())
+                    else -> append(' ')
+                }
+            }
+        }
+
+        return cleaned
+            .trim()
+            .replace(Regex("\\s+"), " ")
+    }
+
+    /**
+     * Returns true when two follow-up questions are effectively the same.
+     */
+    private fun isSameFollowUpQuestion(
+        a: String?,
+        b: String?,
+    ): Boolean {
+        val na = normalizeQuestionForComparison(a)
+        val nb = normalizeQuestionForComparison(b)
+        if (na.isBlank() || nb.isBlank()) return false
+        return na == nb
+    }
+
+    /**
+     * Count follow-up turns from a history-like payload.
+     */
+    private fun countFollowUpTurns(payload: String?): Int {
+        val raw = payload?.trim().orEmpty()
+        if (raw.isBlank()) return 0
+        return TURN_Q_RE.findAll(raw).count().coerceAtLeast(0)
+    }
+
+    /**
+     * Node-specific fallback follow-up questions.
+     *
+     * Notes:
+     * - Ordered from broader to narrower.
+     * - Used when the model output is blank, invalid, or repeated.
+     */
+    private fun fallbackFollowUpCandidates(questionId: String): List<String> {
+        return when (questionId.trim()) {
+            "ai_input_use" -> listOf(
+                "Which input caused the biggest problem: fertilizer, seed, pesticide, or something else?",
+                "What exactly was the problem with that input?",
+                "How did that input problem affect your farming this season?",
+            )
+
+            "ai_yield_risk" -> listOf(
+                "What specific risk was biggest for your maize this season?",
+                "When does that risk usually happen?",
+                "How does that risk affect your maize crop?",
+            )
+
+            "ai_support_needed" -> listOf(
+                "What specific support would help you most next season?",
+                "Who should provide that support?",
+                "How would that support improve maize production?",
+            )
+
+            else -> listOf(
+                "Could you give one specific detail?",
+                "What exactly do you mean?",
+                "How did it affect your situation?",
+            )
+        }
+    }
+
+    /**
+     * Pick a distinct fallback that is different from the previous/model question.
+     */
+    private fun selectDistinctFallbackFollowUp(
+        questionId: String,
+        previousQuestion: String?,
+        modelQuestion: String?,
+        defaultFallback: String,
+        followUpTurnCount: Int,
+    ): String {
+        val blocked = setOf(
+            normalizeQuestionForComparison(previousQuestion),
+            normalizeQuestionForComparison(modelQuestion),
+            normalizeQuestionForComparison(defaultFallback),
+        ).filter { it.isNotBlank() }.toSet()
+
+        val candidates = buildList {
+            addAll(fallbackFollowUpCandidates(questionId))
+            if (defaultFallback.isNotBlank()) {
+                add(defaultFallback)
+            }
+        }
+
+        if (candidates.isEmpty()) {
+            return "Could you provide one specific detail?"
+        }
+
+        val startIndex = followUpTurnCount.coerceAtLeast(0) % candidates.size
+
+        for (offset in candidates.indices) {
+            val idx = (startIndex + offset) % candidates.size
+            val candidate = candidates[idx].trim()
+            if (candidate.isBlank()) continue
+
+            val norm = normalizeQuestionForComparison(candidate)
+            if (norm !in blocked) {
+                return candidate
+            }
+        }
+
+        return defaultFallback.trim().ifBlank { "Could you provide one specific detail?" }
+    }
+
+    /**
+     * Resolve final follow-up question with duplicate suppression.
+     */
+    private fun resolveFinalFollowUpQuestion(
+        questionId: String,
+        parsedQuestion: String?,
+        previousQuestion: String?,
+        defaultFallback: String,
+        followUpAnswerPayload: String?,
+    ): String {
+        val parsed = parsedQuestion?.trim().orEmpty()
+        val previous = previousQuestion?.trim().orEmpty()
+        val turnCount = countFollowUpTurns(followUpAnswerPayload)
+
+        return when {
+            parsed.isBlank() -> {
+                selectDistinctFallbackFollowUp(
+                    questionId = questionId,
+                    previousQuestion = previous,
+                    modelQuestion = null,
+                    defaultFallback = defaultFallback,
+                    followUpTurnCount = turnCount,
+                )
+            }
+
+            isSameFollowUpQuestion(parsed, previous) -> {
+                selectDistinctFallbackFollowUp(
+                    questionId = questionId,
+                    previousQuestion = previous,
+                    modelQuestion = parsed,
+                    defaultFallback = defaultFallback,
+                    followUpTurnCount = turnCount,
+                )
+            }
+
+            else -> parsed
         }
     }
 
@@ -1466,7 +2056,7 @@ $followUpSection
     }
 
     private fun dbgLogCompatFollowUpPayload(
-        phase: ChatValidation.PromptPhase,
+        payloadKind: ValidationPayloadKind,
         latestQuestionLength: Int,
         latestAnswerLength: Int,
         latestAnswerSha8: String,
@@ -1475,8 +2065,45 @@ $followUpSection
         if (!dbg.enabled) return
         AppLog.d(
             TAG,
-            "followUpDetected: phase=${phase.name} treatAsHistory=$treatAsHistory " +
+            "followUpDetected: payloadKind=${payloadKind.name} treatAsHistory=$treatAsHistory " +
                     "latestQlen=$latestQuestionLength latestAlen=$latestAnswerLength latestAsha8=$latestAnswerSha8",
+        )
+    }
+
+    private fun dbgLogNodePromptContext(context: NodePromptContext) {
+        if (!dbg.enabled) return
+        AppLog.d(
+            TAG,
+            "nodePromptContext: qid=${context.questionId} " +
+                    "nodeType=${context.nodeType.name} " +
+                    "questionLen=${context.questionText.length} " +
+                    "options=${context.options.size} " +
+                    "evalTaskLen=${context.evalTaskPrompt?.length ?: 0} " +
+                    "followTaskLen=${context.followUpTaskPrompt?.length ?: 0}",
+        )
+    }
+
+    private fun dbgLogFollowUpResolution(
+        questionId: String,
+        previousQuestion: String?,
+        modelQuestion: String?,
+        finalQuestion: String?,
+    ) {
+        if (!dbg.enabled) return
+
+        val previous = previousQuestion.orEmpty()
+        val model = modelQuestion.orEmpty()
+        val final = finalQuestion.orEmpty()
+
+        AppLog.d(
+            TAG,
+            "followUpResolution: qid=$questionId " +
+                    "prevLen=${previous.length} modelLen=${model.length} finalLen=${final.length} " +
+                    "prevSha8=${sha256Hex(previous).take(8)} " +
+                    "modelSha8=${sha256Hex(model).take(8)} " +
+                    "finalSha8=${sha256Hex(final).take(8)} " +
+                    "repeated=${isSameFollowUpQuestion(previous, model)} " +
+                    "replaced=${normalizeQuestionForComparison(model) != normalizeQuestionForComparison(final)}",
         )
     }
 
@@ -1756,7 +2383,7 @@ $followUpSection
         if (t.length <= n) return t
 
         var end = n
-        if (end > 0) {
+        if (end > 0 && end < t.length) {
             val last = t[end - 1]
             val next = t[end]
             if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
@@ -1783,6 +2410,12 @@ $followUpSection
         private const val FOLLOWUP_MAX_CHARS: Int = 8_192
         private const val FOLLOWUP_USER_PROMPT_MAX_CHARS: Int = 4_000
         private const val FOLLOWUP_ASSESSMENT_JSON_MAX_CHARS: Int = 2_000
+
+        // Validation payload guards
+        private const val MAX_QUESTION_TEXT_CHARS = 2_000
+        private const val MAX_MAIN_ANSWER_CHARS = 8_000
+        private const val MAX_OPTION_COUNT = 32
+        private const val MAX_OPTION_CHARS = 512
 
         // Follow-up payload guards
         private const val MAX_FOLLOW_UP_ANSWER_CHARS = 8_000

@@ -33,7 +33,7 @@ import com.negi.surveys.logging.AppLog
 class AppNavigator(
     private val backStack: NavBackStack<NavKey>,
     private val logger: Logger = Logger.Default,
-    private val enforceAppKeys: Boolean = false
+    private val enforceAppKeys: Boolean = false,
 ) {
 
     /**
@@ -120,25 +120,17 @@ class AppNavigator(
         maybeAssertAppKeys("resetToHome")
     }
 
-    // ---------------------------------------------------------------------
-    // App-specific intents (thin wrappers around push/reset)
-    // ---------------------------------------------------------------------
-
     fun goHome() = resetToHome()
 
     fun startSurvey() = push(SurveyStart)
 
-    fun beginQuestions(firstId: String = QuestionIds.Q1) = push(Question(firstId))
+    fun beginQuestions(firstId: String) = push(Question(firstId))
 
     fun goQuestion(id: String) = push(Question(id))
 
     fun goReview() = push(Review)
 
     fun goExport() = push(Export)
-
-    // ---------------------------------------------------------------------
-    // Invariant enforcement
-    // ---------------------------------------------------------------------
 
     /**
      * Ensures the back stack is never empty.
@@ -166,10 +158,6 @@ class AppNavigator(
         if (!enforceAppKeys) return
         backStack.assertAllAppKeys(context = "AppNavigator:$context")
     }
-
-    // ---------------------------------------------------------------------
-    // Logger abstraction (easy to disable or redirect)
-    // ---------------------------------------------------------------------
 
     /**
      * Simple logging interface to avoid hard dependency on any specific logging framework.

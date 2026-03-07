@@ -3,9 +3,194 @@ graph:
   nodes:
     - id: start
       type: START
+      title: Survey Start
+      nextId: ai_input_use
+
+    - id: ai_input_use
+      type: AI
+      title: Input Use Challenge
+      question: "What was the biggest challenge you faced in using fertilizer, seed, or other farm inputs this season?"
+      nextId: ai_yield_risk
+
+    - id: ai_yield_risk
+      type: AI
+      title: Yield Risk Check
+      question: "Describe the biggest risk to your maize harvest this season."
+      nextId: ai_support_needed
+
+    - id: ai_support_needed
+      type: AI
+      title: Support Needed
+      question: "What kind of support would help you improve maize production next season?"
       nextId: done
+
     - id: done
       type: DONE
+      title: Survey Complete
+
+prompts_eval:
+  - nodeId: ai_input_use
+    prompt: |
+      Evaluate whether the respondent answer clearly identifies a concrete challenge related to fertilizer, seed, pesticide, labor, machinery, transport, finance, or availability of farm inputs.
+
+      Return compact JSON only.
+
+      Required output meaning:
+      - "status" must be "ACCEPTED" when the answer names at least one specific challenge.
+      - "status" must be "NEED_FOLLOW_UP" when the answer is vague, empty, unrelated, or too short to identify a real constraint.
+      - "score" must be an integer from 0 to 100.
+      - "reason" must be brief and factual.
+      - Optional "missing" may list missing details such as the input type, the specific problem, or the effect on farming.
+
+      Scoring intent:
+      - 90-100: names a clear and concrete farm-input challenge.
+      - 70-89: mostly clear, but slightly incomplete.
+      - 40-69: some signal exists, but clarification is needed.
+      - 0-39: unclear, empty, or unrelated.
+
+  - nodeId: ai_yield_risk
+    prompt: |
+      Evaluate whether the respondent answer clearly identifies a concrete maize-yield risk.
+
+      Return compact JSON only.
+
+      Required output meaning:
+      - "status" must be "ACCEPTED" when the answer names a specific risk such as drought, pests, disease, flood, poor soil, lack of fertilizer, or theft.
+      - "status" must be "NEED_FOLLOW_UP" when the answer is vague, empty, unrelated, or too short to identify a real risk.
+      - "score" must be an integer from 0 to 100.
+      - "reason" must be brief and factual.
+      - Optional "missing" may list missing details such as the type of risk, timing, or effect on the crop.
+
+      Scoring intent:
+      - 90-100: names a clear and concrete maize-yield risk.
+      - 70-89: mostly clear, but slightly incomplete.
+      - 40-69: some signal exists, but clarification is needed.
+      - 0-39: unclear, empty, or unrelated.
+
+  - nodeId: ai_support_needed
+    prompt: |
+      Evaluate whether the respondent answer clearly identifies a concrete form of support that would help improve maize production next season.
+
+      Return compact JSON only.
+
+      Required output meaning:
+      - "status" must be "ACCEPTED" when the answer names specific support such as training, improved seed, fertilizer access, irrigation, credit, machinery, market access, or extension support.
+      - "status" must be "NEED_FOLLOW_UP" when the answer is vague, empty, unrelated, or too short to identify a useful support need.
+      - "score" must be an integer from 0 to 100.
+      - "reason" must be brief and factual.
+      - Optional "missing" may list missing details such as the type of support, provider, or expected benefit.
+
+      Scoring intent:
+      - 90-100: names a clear and concrete support need.
+      - 70-89: mostly clear, but slightly incomplete.
+      - 40-69: some signal exists, but clarification is needed.
+      - 0-39: unclear, empty, or unrelated.
+
+prompts_followup:
+  - nodeId: ai_input_use
+    prompt: |
+      Generate a short follow-up question only when the original answer is too vague to identify one concrete farm-input challenge.
+
+      Return compact JSON only.
+
+      Required output meaning:
+      - If no follow-up is needed, return:
+        {"status":"ACCEPTED","followUpQuestion":""}
+      - If clarification is needed, return:
+        {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
+
+      The follow-up should ask for one missing detail, such as:
+      - which input
+      - what problem occurred
+      - how it affected farming
+
+  - nodeId: ai_yield_risk
+    prompt: |
+      Generate a short follow-up question only when the original answer is too vague to identify a concrete maize-yield risk.
+
+      Return compact JSON only.
+
+      Required output meaning:
+      - If no follow-up is needed, return:
+        {"status":"ACCEPTED","followUpQuestion":""}
+      - If clarification is needed, return:
+        {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
+
+      The follow-up should ask for one missing detail, such as:
+      - what specific risk
+      - when it happens
+      - how it affects the crop
+
+  - nodeId: ai_support_needed
+    prompt: |
+      Generate a short follow-up question only when the original answer is too vague to identify one concrete support need for next season.
+
+      Return compact JSON only.
+
+      Required output meaning:
+      - If no follow-up is needed, return:
+        {"status":"ACCEPTED","followUpQuestion":""}
+      - If clarification is needed, return:
+        {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
+
+      The follow-up should ask for one missing detail, such as:
+      - what support is needed
+      - who should provide it
+      - how it would help production
+
+slm:
+  accelerator: GPU
+  max_tokens: 4096
+  top_k: 64
+  top_p: 0.95
+  temperature: 0.5
+
+  preamble: |
+    You are an on-device survey assistant.
+    Follow the output contract exactly.
+    Do not add markdown, explanations, or extra keys.
+
+  key_contract_eval: |
+    Return exactly one compact JSON object with these keys:
+    {"status":"ACCEPTED|NEED_FOLLOW_UP","score":0,"reason":"..."}
+    Optional key:
+    {"missing":["..."]}
+
+  key_contract_followup: |
+    Return exactly one compact JSON object in one of these shapes:
+    {"status":"ACCEPTED","followUpQuestion":""}
+    {"status":"NEED_FOLLOW_UP","followUpQuestion":"..."}
+
+  length_budget_eval: |
+    Keep the JSON short.
+    reason must be one short sentence.
+    score must be an integer from 0 to 100.
+
+  length_budget_followup: |
+    Keep the follow-up question under 18 words.
+
+  strict_output_eval: |
+    Output raw compact JSON only.
+    No markdown.
+    No code fences.
+    No extra text.
+
+  strict_output_followup: |
+    Output raw compact JSON only.
+    No markdown.
+    No code fences.
+    No extra text.
+
+  followup_output_mode: JSON
+
+  empty_json_instruction: |
+    If no follow-up is needed, return:
+    {"status":"ACCEPTED","followUpQuestion":""}
+
+  scoring_rule: |
+    Use status="ACCEPTED" when score >= 70.
+    Use status="NEED_FOLLOW_UP" when score < 70.
+    Prefer acceptance when the answer already contains one concrete agricultural detail.
 
 model_defaults:
   default_model_url: "https://huggingface.co/google/gemma-3n-E4B-it-litert-lm/resolve/main/gemma-3n-E4B-it-int4.litertlm"
