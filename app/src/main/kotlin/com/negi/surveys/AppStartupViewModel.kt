@@ -21,6 +21,7 @@ import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.config.SurveyConfig
+import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.utils.ModelDownloadController
@@ -28,6 +29,7 @@ import com.negi.surveys.warmup.WarmupController
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
@@ -43,6 +45,7 @@ import kotlinx.coroutines.launch
  *
  * Responsibilities:
  * - Wait for the Application-installed SurveyConfig.
+ * - Recover installed config best-effort when bootstrap did not install it.
  * - Resolve model download spec and repo mode.
  * - Obtain process-scoped repository / warmup / downloader instances.
  * - Collect downloader + warmup states once and expose a single UI state.
@@ -211,6 +214,7 @@ class AppStartupViewModel(
      */
     private fun startStartupPipeline(reason: String) {
         val safeReason = sanitizeLabel(reason)
+        val repoMode = computeRepoMode()
 
         startupPipelineJob?.cancel()
         serviceCollectorsJob?.cancel()
@@ -220,6 +224,10 @@ class AppStartupViewModel(
         _uiState.update {
             it.copy(
                 configState = StartupConfigState.Loading,
+                modelSpec = null,
+                modelSpecKey = null,
+                repoMode = repoMode,
+                onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE,
                 servicesReady = false,
                 repository = null,
                 warmup = null,
@@ -243,24 +251,20 @@ class AppStartupViewModel(
         val t0 = SystemClock.elapsedRealtime()
         SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
 
-        val deadline = t0 + INSTALLED_CONFIG_WAIT_MS
-        var installed: SurveyConfig? = null
-
-        while (SystemClock.elapsedRealtime() < deadline && installed == null) {
-            installed = InstalledSurveyConfigStore.getOrNull()
-            if (installed != null) break
-            delay(INSTALLED_CONFIG_POLL_MS)
+        var installed = waitForInstalledConfigOrNull(deadlineAt = t0 + INSTALLED_CONFIG_WAIT_MS)
+        if (installed == null) {
+            installed = recoverInstalledConfigBestEffort()
         }
 
         if (installed == null) {
             val dt = SystemClock.elapsedRealtime() - t0
             SafeLog.e(TAG, "Config: missing (installed config not found) after ${dt}ms")
-            _uiState.update {
-                it.copy(
-                    configState = StartupConfigState.Failed("InstalledConfigMissing"),
-                    servicesReady = false,
-                )
-            }
+            failStartup(
+                safeReason = "InstalledConfigMissing",
+                repoMode = computeRepoMode(),
+                modelSpec = null,
+                modelSpecKey = null,
+            )
             return
         }
 
@@ -284,22 +288,12 @@ class AppStartupViewModel(
                 TAG,
                 "Config: on-device model unavailable (no download URL and no local file)",
             )
-            _uiState.update {
-                it.copy(
-                    configState = StartupConfigState.Failed("ModelUnavailable"),
-                    modelSpec = modelSpec,
-                    modelSpecKey = null,
-                    repoMode = repoMode,
-                    onDeviceEnabled = true,
-                    servicesReady = false,
-                    repository = null,
-                    warmup = null,
-                    modelDownloader = null,
-                    modelState = ModelDownloadController.ModelState.Idle(elapsedMs = 0L),
-                    prefetchState = WarmupController.PrefetchState.Idle,
-                    compileState = WarmupController.CompileState.Idle,
-                )
-            }
+            failStartup(
+                safeReason = "ModelUnavailable",
+                repoMode = repoMode,
+                modelSpec = modelSpec,
+                modelSpecKey = null,
+            )
             return
         }
 
@@ -322,6 +316,67 @@ class AppStartupViewModel(
     }
 
     /**
+     * Polls the installed-config store until a deadline is reached.
+     */
+    private suspend fun waitForInstalledConfigOrNull(
+        deadlineAt: Long,
+    ): SurveyConfig? {
+        var installed: SurveyConfig? = null
+
+        while (SystemClock.elapsedRealtime() < deadlineAt && installed == null) {
+            installed = InstalledSurveyConfigStore.getOrNull()
+            if (installed != null) break
+            delay(INSTALLED_CONFIG_POLL_MS)
+        }
+
+        return installed
+    }
+
+    /**
+     * Performs a best-effort fallback install when bootstrap did not populate the store.
+     *
+     * Design:
+     * - Application remains the primary owner of initial config installation.
+     * - This path exists only so retry can genuinely recover within the same process.
+     * - The loaded config is validated before being installed into the process store.
+     *
+     * Privacy:
+     * - Never logs exception.message.
+     */
+    private fun recoverInstalledConfigBestEffort(): SurveyConfig? {
+        SafeLog.w(TAG, "Config: fallback install attempt")
+
+        val loaded =
+            runCatching {
+                SurveyConfigLoader.fromAssetsValidated(
+                    context = app,
+                    fileName = CONFIG_ASSET_NAME,
+                )
+            }.onFailure { t ->
+                SafeLog.e(
+                    TAG,
+                    "Config: fallback load failed type=${t::class.java.simpleName}",
+                )
+            }.getOrNull()
+
+        if (loaded == null) {
+            return InstalledSurveyConfigStore.getOrNull()
+        }
+
+        return when (InstalledSurveyConfigStore.installOnce(loaded)) {
+            InstalledSurveyConfigStore.InstallResult.INSTALLED -> {
+                SafeLog.i(TAG, "Config: fallback install succeeded")
+                loaded
+            }
+
+            InstalledSurveyConfigStore.InstallResult.ALREADY_INSTALLED -> {
+                SafeLog.w(TAG, "Config: fallback install reused existing store value")
+                InstalledSurveyConfigStore.getOrNull()
+            }
+        }
+    }
+
+    /**
      * Obtains process-scoped services and starts centralized state collection.
      *
      * Notes:
@@ -337,62 +392,86 @@ class AppStartupViewModel(
         startupRequested.set(false)
         lastWarmupReadyFingerprint.set(null)
 
-        val repo = AppProcessServices.repository(app, repoMode)
-        val warmup = AppProcessServices.warmupController(app, repoMode)
+        val services =
+            runCatching {
+                val repo = AppProcessServices.repository(app, repoMode)
+                val warmup = AppProcessServices.warmupController(app, repoMode)
 
-        /**
-         * Important:
-         * - Do not pass null to AppProcessServices.modelDownloader() as a way to mean "disabled".
-         * - That API intentionally reuses the last non-null spec when spec == null.
-         * - Creating no downloader here avoids stale-spec resurrection.
-         */
-        val downloader =
-            if (
-                repoMode == AppProcessServices.RepoMode.ON_DEVICE &&
-                modelSpec != null &&
-                modelSpecKey != null
-            ) {
-                AppProcessServices.modelDownloader(app, spec = modelSpec)
-            } else {
-                null
-            }
+                /**
+                 * Important:
+                 * - Do not pass null to AppProcessServices.modelDownloader() as a way to mean "disabled".
+                 * - That API intentionally reuses the last non-null spec when spec == null.
+                 * - Creating no downloader here avoids stale-spec resurrection.
+                 */
+                val downloader =
+                    if (
+                        repoMode == AppProcessServices.RepoMode.ON_DEVICE &&
+                        modelSpec != null &&
+                        modelSpecKey != null
+                    ) {
+                        AppProcessServices.modelDownloader(app, spec = modelSpec)
+                    } else {
+                        null
+                    }
+
+                BuiltServices(
+                    repository = repo,
+                    warmup = warmup,
+                    downloader = downloader,
+                )
+            }.onFailure { t ->
+                SafeLog.e(
+                    TAG,
+                    "Services: build failed type=${t::class.java.simpleName}",
+                )
+            }.getOrNull()
+
+        if (services == null) {
+            failStartup(
+                safeReason = "ServiceInitFailed",
+                repoMode = repoMode,
+                modelSpec = modelSpec,
+                modelSpecKey = modelSpecKey,
+            )
+            return
+        }
 
         SafeLog.i(
             TAG,
             "Services: obtained mode=$repoMode onDevice=${repoMode == AppProcessServices.RepoMode.ON_DEVICE} " +
                     "keyPresent=${modelSpecKey != null} specPresent=${modelSpec != null} " +
-                    "downloaderPresent=${downloader != null} localModelPresent=${initialLocalModelFile != null}",
+                    "downloaderPresent=${services.downloader != null} localModelPresent=${initialLocalModelFile != null}",
         )
 
         val initialModelState =
             when {
-                downloader != null -> downloader.state.value
+                services.downloader != null -> services.downloader.state.value
                 initialLocalModelFile != null -> localReadyModelState(initialLocalModelFile)
                 else -> ModelDownloadController.ModelState.Idle(elapsedMs = 0L)
             }
 
         _uiState.update {
             it.copy(
-                repository = repo,
-                warmup = warmup,
-                modelDownloader = downloader,
-                servicesReady = !it.onDeviceEnabled || downloader != null || initialLocalModelFile != null,
+                repository = services.repository,
+                warmup = services.warmup,
+                modelDownloader = services.downloader,
+                servicesReady = !it.onDeviceEnabled || services.downloader != null || initialLocalModelFile != null,
                 modelState = initialModelState,
-                prefetchState = warmup.prefetchState.value,
-                compileState = warmup.compileState.value,
+                prefetchState = services.warmup.prefetchState.value,
+                compileState = services.warmup.compileState.value,
             )
         }
 
         startCollectingServiceStates(
             repoMode = repoMode,
-            warmup = warmup,
-            downloader = downloader,
+            warmup = services.warmup,
+            downloader = services.downloader,
         )
 
         if (initialLocalModelFile != null) {
             onModelReady(
                 repoMode = repoMode,
-                warmup = warmup,
+                warmup = services.warmup,
                 file = initialLocalModelFile,
             )
         }
@@ -412,28 +491,55 @@ class AppStartupViewModel(
         serviceCollectorsJob = viewModelScope.launch(Dispatchers.Default) {
             if (downloader != null) {
                 launch {
-                    downloader.state.collect { modelState ->
-                        _uiState.update { it.copy(modelState = modelState) }
-                        if (modelState is ModelDownloadController.ModelState.Ready) {
-                            onModelReady(
-                                repoMode = repoMode,
-                                warmup = warmup,
-                                file = modelState.file,
-                            )
+                    try {
+                        downloader.state.collect { modelState ->
+                            _uiState.update { it.copy(modelState = modelState) }
+                            if (modelState is ModelDownloadController.ModelState.Ready) {
+                                onModelReady(
+                                    repoMode = repoMode,
+                                    warmup = warmup,
+                                    file = modelState.file,
+                                )
+                            }
                         }
+                    } catch (t: Throwable) {
+                        if (t is CancellationException) throw t
+                        handleServiceCollectorFailure(
+                            safeReason = "ModelStateCollectorFailed",
+                            repoMode = repoMode,
+                            t = t,
+                        )
                     }
                 }
             }
 
             launch {
-                warmup.prefetchState.collect { prefetchState ->
-                    _uiState.update { it.copy(prefetchState = prefetchState) }
+                try {
+                    warmup.prefetchState.collect { prefetchState ->
+                        _uiState.update { it.copy(prefetchState = prefetchState) }
+                    }
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                    handleServiceCollectorFailure(
+                        safeReason = "PrefetchStateCollectorFailed",
+                        repoMode = repoMode,
+                        t = t,
+                    )
                 }
             }
 
             launch {
-                warmup.compileState.collect { compileState ->
-                    _uiState.update { it.copy(compileState = compileState) }
+                try {
+                    warmup.compileState.collect { compileState ->
+                        _uiState.update { it.copy(compileState = compileState) }
+                    }
+                } catch (t: Throwable) {
+                    if (t is CancellationException) throw t
+                    handleServiceCollectorFailure(
+                        safeReason = "CompileStateCollectorFailed",
+                        repoMode = repoMode,
+                        t = t,
+                    )
                 }
             }
         }
@@ -480,6 +586,7 @@ class AppStartupViewModel(
      * Notes:
      * - This is intentionally idempotent.
      * - The in-memory fingerprint never stores or logs file paths.
+     * - Fingerprint is committed only after warmup wiring succeeds.
      */
     private fun onModelReady(
         repoMode: AppProcessServices.RepoMode,
@@ -492,22 +599,35 @@ class AppStartupViewModel(
         val previous = lastWarmupReadyFingerprint.get()
         if (previous == fingerprint) return
 
-        lastWarmupReadyFingerprint.set(fingerprint)
+        val inputsUpdated =
+            runCatching {
+                AppProcessServices.updateWarmupInputsBestEffort(
+                    context = app,
+                    mode = repoMode,
+                    modelFile = file,
+                    options = WarmupController.Options(),
+                )
+            }.onFailure { t ->
+                SafeLog.e(
+                    TAG,
+                    "Warmup: update inputs failed (non-fatal) type=${t::class.java.simpleName}",
+                )
+            }.isSuccess
 
-        AppProcessServices.updateWarmupInputsBestEffort(
-            context = app,
-            mode = repoMode,
-            modelFile = file,
-            options = WarmupController.Options(),
-        )
+        if (!inputsUpdated) return
 
-        runCatching {
-            warmup.requestCompileAfterPrefetch(reason = "startupAfterModelReady")
-        }.onFailure { t ->
-            SafeLog.e(
-                TAG,
-                "Warmup: requestCompileAfterPrefetch failed (non-fatal) type=${t::class.java.simpleName}",
-            )
+        val compileRequested =
+            runCatching {
+                warmup.requestCompileAfterPrefetch(reason = "startupAfterModelReady")
+            }.onFailure { t ->
+                SafeLog.e(
+                    TAG,
+                    "Warmup: requestCompileAfterPrefetch failed (non-fatal) type=${t::class.java.simpleName}",
+                )
+            }.isSuccess
+
+        if (compileRequested) {
+            lastWarmupReadyFingerprint.set(fingerprint)
         }
     }
 
@@ -630,6 +750,62 @@ class AppStartupViewModel(
     }
 
     /**
+     * Handles a collector failure as a safe startup failure.
+     */
+    private fun handleServiceCollectorFailure(
+        safeReason: String,
+        repoMode: AppProcessServices.RepoMode,
+        t: Throwable,
+    ) {
+        SafeLog.e(
+            TAG,
+            "Services: collector failed reason=${sanitizeLabel(safeReason)} type=${t::class.java.simpleName}",
+        )
+        failStartup(
+            safeReason = safeReason,
+            repoMode = repoMode,
+            modelSpec = _uiState.value.modelSpec,
+            modelSpecKey = _uiState.value.modelSpecKey,
+        )
+    }
+
+    /**
+     * Resets UI-visible startup state into a safe failure mode.
+     *
+     * Notes:
+     * - The reason must never contain exception.message.
+     * - Existing process-scoped singletons are left intact; only root orchestration state is reset.
+     */
+    private fun failStartup(
+        safeReason: String,
+        repoMode: AppProcessServices.RepoMode,
+        modelSpec: ModelDownloadSpec?,
+        modelSpecKey: ModelSpecKey?,
+    ) {
+        startupRequested.set(false)
+        lastWarmupReadyFingerprint.set(null)
+
+        _uiState.update {
+            it.copy(
+                configState = StartupConfigState.Failed(safeReason),
+                modelSpec = modelSpec,
+                modelSpecKey = modelSpecKey,
+                repoMode = repoMode,
+                onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE,
+                servicesReady = false,
+                repository = null,
+                warmup = null,
+                modelDownloader = null,
+                modelState = ModelDownloadController.ModelState.Idle(elapsedMs = 0L),
+                prefetchState = WarmupController.PrefetchState.Idle,
+                compileState = WarmupController.CompileState.Idle,
+            )
+        }
+
+        serviceCollectorsJob?.cancel()
+    }
+
+    /**
      * Sanitizes a small label for logs.
      */
     private fun sanitizeLabel(raw: String): String {
@@ -648,8 +824,15 @@ class AppStartupViewModel(
         return safe.ifBlank { "unknown" }
     }
 
+    private data class BuiltServices(
+        val repository: ChatValidation.RepositoryI,
+        val warmup: WarmupController,
+        val downloader: ModelDownloadController?,
+    )
+
     companion object {
         private const val TAG = "AppStartupViewModel"
+        private const val CONFIG_ASSET_NAME = "survey.yaml"
         private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
         private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
         private const val STARTUP_AFTER_FIRST_FRAME_DELAY_MS: Long = 150L

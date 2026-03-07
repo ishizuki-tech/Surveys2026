@@ -86,6 +86,7 @@ object SurveyAppShell {
                 blockingTitle = blockingTitle,
                 blockingDetail = blockingDetail,
                 showBlockingSpinner = showBlockingSpinner,
+                retryAvailable = onBlockingRetry != null,
             )
 
         Scaffold(
@@ -184,7 +185,7 @@ object SurveyAppShell {
                     title = blockingSpec.title,
                     detail = blockingSpec.detail,
                     showSpinner = blockingSpec.showSpinner,
-                    onRetry = if (blockingSpec.visible && !blockingSpec.showSpinner) onBlockingRetry else null,
+                    onRetry = if (blockingSpec.showRetry) onBlockingRetry else null,
                 )
             } else {
                 ReadyNavHost(
@@ -262,6 +263,11 @@ object SurveyAppShell {
 
     /**
      * Resolves whether the shell should show a blocking placeholder.
+     *
+     * Design:
+     * - Explicit blocking state from the caller wins.
+     * - A missing repository without explicit blocking state is treated as a safe fallback state.
+     * - Retry is shown only when it is meaningful for the current blocking mode.
      */
     @Composable
     private fun rememberShellBlockingSpec(
@@ -269,12 +275,14 @@ object SurveyAppShell {
         blockingTitle: String?,
         blockingDetail: String?,
         showBlockingSpinner: Boolean,
+        retryAvailable: Boolean,
     ): ShellBlockingSpec {
         return remember(
             repository,
             blockingTitle,
             blockingDetail,
             showBlockingSpinner,
+            retryAvailable,
         ) {
             val explicitBlock =
                 !blockingTitle.isNullOrBlank() ||
@@ -283,11 +291,19 @@ object SurveyAppShell {
 
             when {
                 explicitBlock -> {
+                    val resolvedTitle =
+                        when {
+                            !blockingTitle.isNullOrBlank() -> blockingTitle
+                            showBlockingSpinner -> "Preparing app services…"
+                            else -> "Startup needs attention"
+                        }
+
                     ShellBlockingSpec(
                         visible = true,
-                        title = blockingTitle ?: "Preparing app services…",
+                        title = resolvedTitle,
                         detail = blockingDetail.orEmpty(),
                         showSpinner = showBlockingSpinner,
+                        showRetry = retryAvailable && !showBlockingSpinner,
                     )
                 }
 
@@ -295,8 +311,14 @@ object SurveyAppShell {
                     ShellBlockingSpec(
                         visible = true,
                         title = "Preparing app services…",
-                        detail = "Repository is not ready yet.",
+                        detail =
+                            if (retryAvailable) {
+                                "Startup is taking longer than expected. If this screen does not clear, retry startup."
+                            } else {
+                                "Repository is not ready yet."
+                            },
                         showSpinner = true,
+                        showRetry = retryAvailable,
                     )
                 }
 
@@ -306,6 +328,7 @@ object SurveyAppShell {
                         title = "",
                         detail = "",
                         showSpinner = false,
+                        showRetry = false,
                     )
                 }
             }
@@ -321,4 +344,5 @@ private data class ShellBlockingSpec(
     val title: String,
     val detail: String,
     val showSpinner: Boolean,
+    val showRetry: Boolean,
 )

@@ -22,14 +22,26 @@ internal data class StartupBlockingUi(
 
 /**
  * Converts the startup orchestration state into a shell-level blocking model.
+ *
+ * Design:
+ * - Blocking must be derived from actual blocking reasons.
+ * - A spinner alone must not keep the shell blocked after startup is ready.
+ * - Failed states remain blocking, but they must not show a spinner.
+ * - A ready state with services marked ready but repository still null is treated
+ *   as a service-hole anomaly, not as normal loading.
  */
 internal fun AppStartupUiState.toStartupBlockingUi(): StartupBlockingUi {
+    val repositoryMissingAfterReady = configState is StartupConfigState.Ready && servicesReady && repository == null
+
     val title =
         when (configState) {
             is StartupConfigState.Loading -> "Loading application configuration…"
+
             is StartupConfigState.Failed -> "Startup could not continue."
+
             is StartupConfigState.Ready -> {
                 when {
+                    repositoryMissingAfterReady -> "App services need attention."
                     !servicesReady && onDeviceEnabled -> "Preparing on-device services…"
                     !servicesReady -> "Preparing app services…"
                     repository == null -> "Preparing app services…"
@@ -53,6 +65,11 @@ internal fun AppStartupUiState.toStartupBlockingUi(): StartupBlockingUi {
 
             is StartupConfigState.Ready -> {
                 when {
+                    repositoryMissingAfterReady -> {
+                        "Startup reported services as ready, but the repository is still unavailable. " +
+                                "Retry startup to rebuild the root service graph."
+                    }
+
                     !servicesReady && onDeviceEnabled -> {
                         "Process-scoped on-device services are still starting."
                     }
@@ -78,7 +95,14 @@ internal fun AppStartupUiState.toStartupBlockingUi(): StartupBlockingUi {
             }
         }
 
-    val showSpinner = configState !is StartupConfigState.Failed
+    val isBlocking = !title.isNullOrBlank() || !detail.isNullOrBlank()
+    val showSpinner =
+        when {
+            !isBlocking -> false
+            configState is StartupConfigState.Failed -> false
+            repositoryMissingAfterReady -> false
+            else -> true
+        }
 
     return StartupBlockingUi(
         title = title,
@@ -112,6 +136,26 @@ private fun failedDetailForSafeReason(reason: String): String {
             "No usable on-device model is available. " +
                     "A local model file was not found, and no download URL is configured. " +
                     "Add the model or update the config, then retry startup."
+        }
+
+        "ServiceInitFailed" -> {
+            "Startup could not build the process-scoped service graph. " +
+                    "Retry startup to recreate repository, warmup, and model services."
+        }
+
+        "ModelStateCollectorFailed" -> {
+            "Startup lost the model-state observer while services were running. " +
+                    "Retry startup to rebuild the root observers."
+        }
+
+        "PrefetchStateCollectorFailed" -> {
+            "Startup lost the prefetch-state observer while services were running. " +
+                    "Retry startup to rebuild the root observers."
+        }
+
+        "CompileStateCollectorFailed" -> {
+            "Startup lost the compile-state observer while services were running. " +
+                    "Retry startup to rebuild the root observers."
         }
 
         else -> {
