@@ -41,7 +41,7 @@ object SurveyStart : AppNavKey
  * A question destination.
  *
  * IMPORTANT:
- * - Keep `id` stable and short (e.g., "Q1", "Q2", "ELIG_01").
+ * - Keep `id` stable and short (e.g., "ELIG_01", "PLOT_SIZE", "AI_SUMMARY").
  * - Do NOT embed large question text or answers here; use ViewModels/state holders.
  */
 @Serializable
@@ -58,22 +58,6 @@ object Review : AppNavKey
 /** Export screen (JSON preview / save / share). */
 @Serializable
 object Export : AppNavKey
-
-// ---------------------------------------------------------------------
-// Optional: Common IDs / helpers to reduce "stringly-typed" code.
-// ---------------------------------------------------------------------
-
-/**
- * Canonical question IDs used by the current prototype flow.
- *
- * Notes:
- * - This is intentionally minimal. Expand only when you formalize the survey graph.
- * - Having constants avoids typos ("Q1" vs "Ql") and makes refactors safer.
- */
-object QuestionIds {
-    const val Q1: String = "Q1"
-    const val Q2: String = "Q2"
-}
 
 /**
  * Returns an app-bar friendly title for each destination.
@@ -95,7 +79,7 @@ fun AppNavKey.appBarTitle(): String = when (this) {
  *
  * Example:
  * - "Home"
- * - "Question(id=Q1)"
+ * - "Question(id=ELIG_01)"
  */
 fun AppNavKey.debugName(): String = when (this) {
     Home -> "Home"

@@ -61,6 +61,8 @@ import kotlinx.coroutines.withContext
  * - Keep the "stream window" open for the whole validation attempt.
  * - Ignore late results using [activeAttemptId].
  * - Snapshot draft persistence on Main to avoid ConcurrentModificationException.
+ * - Roll back transcript/state mutations when validation throws before producing
+ *   a stable assistant outcome.
  */
 class ChatQuestionViewModel(
     private val questionId: String,
@@ -94,6 +96,14 @@ class ChatQuestionViewModel(
 
         override fun hashCode(): Int = version.hashCode()
     }
+
+    private data class SubmitRollbackSnapshot(
+        val stage: ChatDrafts.ChatStage,
+        val mainAnswer: String,
+        val currentFollowUpQuestion: String,
+        val followUps: List<ChatDrafts.FollowUpTurn>,
+        val completionPayload: String?,
+    )
 
     private fun rebuildMessageIndex() {
         messageIndexById.clear()
@@ -162,7 +172,9 @@ class ChatQuestionViewModel(
         val old = messagesBacking[idx]
         val updated = transform(old)
 
-        // Guard: message id must remain stable for index consistency.
+        /**
+         * Guard: message id must remain stable for index consistency.
+         */
         if (updated.id != old.id) {
             AppLog.w(
                 TAG,
@@ -285,12 +297,14 @@ class ChatQuestionViewModel(
         if (text.isEmpty()) return
         if (_isBusy.value) return
 
-        val localStage = withStateLock { stage }
-        if (localStage == ChatDrafts.ChatStage.DONE && allowResubmitAfterDone) {
+        val stageBeforeSubmit = withStateLock { stage }
+        if (stageBeforeSubmit == ChatDrafts.ChatStage.DONE && allowResubmitAfterDone) {
             reopenForEdit()
-        } else if (localStage == ChatDrafts.ChatStage.DONE) {
+        } else if (stageBeforeSubmit == ChatDrafts.ChatStage.DONE) {
             return
         }
+
+        val rollbackSnapshot = captureRollbackSnapshot()
 
         val attemptId = attemptCounter.incrementAndGet()
         activeAttemptId = attemptId
@@ -298,7 +312,7 @@ class ChatQuestionViewModel(
         _input.value = ""
         schedulePersistDraftForInput("submit.clearInput")
 
-        appendUser(text)
+        val submittedUserMessageId = appendUser(text)
 
         validationJob?.cancel()
         validationJob = null
@@ -314,6 +328,16 @@ class ChatQuestionViewModel(
                     ChatDrafts.ChatStage.AWAIT_FOLLOW_UP -> handleFollowUp(text, attemptId)
                     ChatDrafts.ChatStage.DONE -> Unit
                 }
+            } catch (t: CancellationException) {
+                throw t
+            } catch (t: Throwable) {
+                handleValidationFailure(
+                    submittedText = text,
+                    submittedUserMessageId = submittedUserMessageId,
+                    rollbackSnapshot = rollbackSnapshot,
+                    attemptId = attemptId,
+                    error = t,
+                )
             } finally {
                 _isBusy.value = false
                 validationJob = null
@@ -349,6 +373,46 @@ class ChatQuestionViewModel(
             cleanup()
         } else {
             viewModelScope.launch(Dispatchers.Main.immediate) { cleanup() }
+        }
+    }
+
+    private suspend fun handleValidationFailure(
+        submittedText: String,
+        submittedUserMessageId: String,
+        rollbackSnapshot: SubmitRollbackSnapshot,
+        attemptId: Long,
+        error: Throwable,
+    ) {
+        if (activeAttemptId != attemptId) {
+            AppLog.d(
+                TAG,
+                "validation failure ignored: stale attempt q=$qid attempt=$attemptId err=${error.javaClass.simpleName}",
+            )
+            return
+        }
+
+        AppLog.w(
+            TAG,
+            "validation failed q=$qid stage=${rollbackSnapshot.stage} attempt=$attemptId err=${error.javaClass.simpleName}",
+        )
+
+        val didRequestCancel = requestStreamCancel()
+        suppressNextCancelledError.set(didRequestCancel)
+        closeStreamWindow("validationFailure")
+
+        withContext(Dispatchers.Main.immediate) {
+            if (activeAttemptId != attemptId) return@withContext
+
+            restoreRollbackSnapshot(rollbackSnapshot)
+            clearActiveStreamUi("validationFailure")
+
+            if (containsMessage(submittedUserMessageId)) {
+                removeMessage(submittedUserMessageId)
+            }
+
+            _input.value = submittedText
+            appendAssistantText(buildValidationFailureMessage(error, rollbackSnapshot.stage))
+            safePersistDraft("validationFailure")
         }
     }
 
@@ -664,13 +728,15 @@ class ChatQuestionViewModel(
     // Transcript mutations
     // ---------------------------------------------------------------------
 
-    private fun appendUser(text: String) {
+    private fun appendUser(text: String): String {
+        val id = UUID.randomUUID().toString()
         val msg = ChatMessage.user(
-            id = UUID.randomUUID().toString(),
+            id = id,
             text = text,
         )
         appendMessageInternal(msg, "appendUser")
         safePersistDraft("appendUser")
+        return id
     }
 
     private fun appendAssistantText(text: String) {
@@ -1110,7 +1176,9 @@ class ChatQuestionViewModel(
 
             var cur = m
 
-            // Migrate legacy assistant details stored in streamText.
+            /**
+             * Migrate legacy assistant details stored in streamText.
+             */
             if (
                 cur.role == ChatRole.ASSISTANT &&
                 !cur.streamText.isNullOrBlank() &&
@@ -1230,6 +1298,47 @@ class ChatQuestionViewModel(
         return synchronized(stateLock) { block() }
     }
 
+    private fun captureRollbackSnapshot(): SubmitRollbackSnapshot {
+        return withStateLock {
+            SubmitRollbackSnapshot(
+                stage = stage,
+                mainAnswer = mainAnswer,
+                currentFollowUpQuestion = currentFollowUpQuestion,
+                followUps = followUps.toList(),
+                completionPayload = _completionPayload.value,
+            )
+        }
+    }
+
+    private fun restoreRollbackSnapshot(snapshot: SubmitRollbackSnapshot) {
+        withStateLock {
+            stage = snapshot.stage
+            mainAnswer = snapshot.mainAnswer
+            currentFollowUpQuestion = snapshot.currentFollowUpQuestion
+            followUps.clear()
+            followUps.addAll(snapshot.followUps)
+        }
+        _completionPayload.value = snapshot.completionPayload
+    }
+
+    private fun buildValidationFailureMessage(
+        error: Throwable,
+        failedStage: ChatDrafts.ChatStage,
+    ): String {
+        val stageLabel = when (failedStage) {
+            ChatDrafts.ChatStage.AWAIT_MAIN -> "The answer could not be validated."
+            ChatDrafts.ChatStage.AWAIT_FOLLOW_UP -> "The follow-up answer could not be validated."
+            ChatDrafts.ChatStage.DONE -> "The answer could not be re-validated."
+        }
+
+        val detail = when (error.javaClass.simpleName) {
+            "ModelNotReadyException" -> "The AI model is not ready yet. Please retry in a moment."
+            else -> "Your input was restored. Please retry."
+        }
+
+        return "$stageLabel $detail"
+    }
+
     companion object {
         private const val TAG = "ChatQVM"
 
@@ -1241,7 +1350,9 @@ class ChatQuestionViewModel(
 
         private const val INPUT_PERSIST_DEBOUNCE_MS: Long = 250L
 
-        // Debug-only noisy logs. Keep false in production.
+        /**
+         * Debug-only noisy logs. Keep false in production.
+         */
         private const val ENABLE_VERBOSE_EMIT_LOGS = false
     }
 }

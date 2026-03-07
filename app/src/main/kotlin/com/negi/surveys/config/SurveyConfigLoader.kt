@@ -311,6 +311,10 @@ data class SurveyConfig(
 
     /**
      * Builds the evaluation system prompt for two-step pipelines.
+     *
+     * Important:
+     * - Eval phase must NOT include follow-up empty JSON instructions.
+     * - Those belong only to follow-up phase.
      */
     fun composeSystemPromptEval(): String {
         val contract = slm.keyContractEval?.takeIf { it.isNotBlank() } ?: slm.keyContract
@@ -323,9 +327,9 @@ data class SurveyConfig(
             budget,
             slm.scoringRule,
             strict,
-            slm.emptyJsonInstruction
         ).filterNot { it.isNullOrBlank() }
             .map { it!!.trim() }
+
         return parts.joinToString("\n")
     }
 
