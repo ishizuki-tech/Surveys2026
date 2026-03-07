@@ -304,9 +304,34 @@ object SurveyAppRoot {
                 startupUi.toStartupBlockingUi()
             }
 
-        val onBlockingRetry =
-            if (startupUi.configState is StartupConfigState.Failed) {
-                { startupVm.retryAll("blockingUi") }
+        /**
+         * Offer retry only for safe failure states or for a post-startup service hole.
+         *
+         * Notes:
+         * - During normal loading we intentionally do not surface retry.
+         * - When startup claims services are ready but repository is still null,
+         *   the app is in an anomalous blocking state and retry is meaningful.
+         */
+        val shouldOfferBlockingRetry =
+            remember(
+                startupUi.configState,
+                startupServicesReady,
+                repo,
+                startupBlockingUi.showSpinner,
+            ) {
+                when {
+                    startupUi.configState is StartupConfigState.Failed -> true
+                    startupUi.configState is StartupConfigState.Ready &&
+                            startupServicesReady &&
+                            repo == null &&
+                            !startupBlockingUi.showSpinner -> true
+                    else -> false
+                }
+            }
+
+        val onBlockingRetry: (() -> Unit)? =
+            if (shouldOfferBlockingRetry) {
+                { launchRetryAll("blockingUi") }
             } else {
                 null
             }
