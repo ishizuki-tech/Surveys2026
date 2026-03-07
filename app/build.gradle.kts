@@ -21,13 +21,12 @@ plugins {
 
     // NOTE:
     // - AGP 9+ has built-in Kotlin support.
-    // - Do NOT apply org.jetbrains.kotlin.android (kotlin-android) here. :contentReference[oaicite:1]{index=1}
+    // - Do NOT apply org.jetbrains.kotlin.android (kotlin-android) here.
 
-    // Compose compiler Gradle plugin (should map to id "org.jetbrains.kotlin.plugin.compose")
-    // See Compose compiler plugin setup docs. :contentReference[oaicite:2]{index=2}
+    // Compose compiler Gradle plugin.
     alias(libs.plugins.kotlin.compose)
 
-    // Kotlinx Serialization compiler plugin
+    // Kotlinx Serialization compiler plugin.
     alias(libs.plugins.kotlin.serialization)
 }
 
@@ -42,7 +41,7 @@ val isCi: Boolean = System.getenv("CI")?.equals("true", ignoreCase = true) == tr
  * Load local.properties once.
  *
  * This file is developer-local and should NOT be committed.
- * We use it for safe overrides (appId, local tokens, version overrides, etc.).
+ * It is used for safe overrides such as appId, local tokens, and version overrides.
  */
 val localProps: Properties = Properties().apply {
     val f = rootProject.file("local.properties")
@@ -50,10 +49,10 @@ val localProps: Properties = Properties().apply {
 }
 
 /**
- * Resolve a property from (highest priority first):
- *  1) Gradle project property: -Pname=value  OR  ~/.gradle/gradle.properties
- *  2) local.properties (developer-local)
- *  3) default
+ * Resolve a property from the following priority order:
+ * 1) Gradle project property (-Pname=value or ~/.gradle/gradle.properties)
+ * 2) local.properties
+ * 3) default
  *
  * This keeps CI reproducible while allowing local convenience overrides.
  */
@@ -67,27 +66,28 @@ fun prop(name: String, default: String = ""): String =
 /**
  * Escape a string literal for BuildConfig fields.
  *
- * This is required because buildConfigField takes a raw Java literal string,
- * not a Kotlin string.
+ * buildConfigField expects a raw Java literal string, not a Kotlin string.
  */
 fun quote(v: String): String = "\"" + v.replace("\\", "\\\\").replace("\"", "\\\"") + "\""
 
 /**
- * Sanitize versionName for Android + Git tags:
- * - Must not contain spaces
+ * Sanitize versionName for Android and Git tags.
+ *
+ * Rules:
+ * - Remove spaces
  * - Keep it short and predictable for log aggregation
  */
 fun sanitizeVersionName(raw: String): String =
     raw.trim()
-        .replace("\\s+".toRegex(), "") // versionName must be tag-safe
-        .take(64) // defensive bound to avoid insane strings
+        .replace("\\s+".toRegex(), "")
+        .take(64)
 
 /**
  * Resolve versionName with explicit precedence:
- *  1) -Papp.versionName=...
- *  2) env CI_APP_VERSION_NAME
- *  3) local.properties app.versionName=...
- *  4) fallback
+ * 1) -Papp.versionName=...
+ * 2) env CI_APP_VERSION_NAME
+ * 3) local.properties app.versionName=...
+ * 4) fallback
  */
 fun resolveVersionName(): String {
     val fromGradle = (project.findProperty("app.versionName") as String?)?.trim()
@@ -105,10 +105,10 @@ fun resolveVersionName(): String {
 
 /**
  * Resolve versionCode with explicit precedence:
- *  1) -Papp.versionCode=...
- *  2) env CI_VERSION_CODE
- *  3) env GITHUB_RUN_NUMBER (nice CI default)
- *  4) fallback
+ * 1) -Papp.versionCode=...
+ * 2) env CI_VERSION_CODE
+ * 3) env GITHUB_RUN_NUMBER
+ * 4) fallback
  */
 fun resolveVersionCode(): Int {
     val fromGradle = (project.findProperty("app.versionCode") as String?)?.toIntOrNull()
@@ -118,19 +118,18 @@ fun resolveVersionCode(): Int {
 }
 
 /**
- * Reads a Gradle property as a non-blank string (or null).
+ * Read a Gradle property as a non-blank string, or null.
  *
  * Resolution order:
- * 1) Standard Gradle properties (gradle.properties, ~/.gradle/gradle.properties, -Pname=..., ORG_GRADLE_PROJECT_*)
- * 2) <repoRoot>/gradle.properties.local (gitignored)
- * 3) <repoRoot>/local.properties (gitignored; common in Android)
+ * 1) Standard Gradle properties
+ * 2) <repoRoot>/gradle.properties.local
+ * 3) <repoRoot>/local.properties
  *
  * Notes:
  * - Keep this helper tiny and dependency-free.
- * - Never log returned values (may contain secrets).
+ * - Never log returned values because they may contain secrets.
  */
 fun gradleProp(name: String): String? {
-    // 1) Standard Gradle properties (includes ~/.gradle/gradle.properties)
     val fromGradle = providers.gradleProperty(name).orNull
         ?.trim()
         ?.takeIf { it.isNotEmpty() }
@@ -148,10 +147,7 @@ fun gradleProp(name: String): String? {
         return line.substringAfter("=", "").trim().takeIf { it.isNotEmpty() }
     }
 
-    // 2) Local gitignored override
     readFromFile("gradle.properties.local")?.let { return it }
-
-    // 3) Android standard local file
     readFromFile("local.properties")?.let { return it }
 
     return null
@@ -160,28 +156,26 @@ fun gradleProp(name: String): String? {
 /**
  * Read the first non-blank property value from multiple keys.
  *
- * Notes:
- * - Useful during migration (e.g., github.* -> gh.*).
+ * Useful during naming migration such as github.* -> gh.*.
  */
 fun gradlePropAny(vararg names: String): String? =
     names.asSequence().mapNotNull { gradleProp(it) }.firstOrNull()
 
 /**
- * Returns true if this project looks like a git checkout.
+ * Returns true if this project looks like a Git checkout.
  *
- * Notes:
- * - `.git` can be a directory or a file (worktrees); exists() covers both.
+ * `.git` can be a directory or a file, so exists() is sufficient.
  */
 fun Project.hasGitRepo(): Boolean = rootProject.file(".git").exists()
 
 /**
- * Executes a command and returns stdout as a trimmed string.
+ * Execute a command and return stdout as a trimmed string.
  *
  * Notes:
- * - Best-effort and intentionally ignores failures by returning empty string.
- * - Do NOT use this to capture any sensitive/user content.
- * - Forces workingDir to the repo root for stability.
- * - Uses ProcessBuilder to avoid Gradle exec overload/deprecation issues.
+ * - Best-effort only. Failures return an empty string.
+ * - Do NOT use this for sensitive or user-provided content.
+ * - Working directory is forced to the repo root for stability.
+ * - ProcessBuilder is used to avoid Gradle exec overload/deprecation issues.
  */
 fun Project.execAndGetStdout(vararg args: String): String {
     return runCatching {
@@ -194,7 +188,6 @@ fun Project.execAndGetStdout(vararg args: String): String {
         val p = pb.start()
         val text = p.inputStream.bufferedReader().use { it.readText() }
 
-        // Avoid hanging Gradle configuration forever.
         val finished = p.waitFor(8, TimeUnit.SECONDS)
         if (!finished) {
             p.destroyForcibly()
@@ -203,24 +196,19 @@ fun Project.execAndGetStdout(vararg args: String): String {
 
         text.trim()
     }.getOrElse { t ->
-        // Keep logs minimal and non-sensitive.
         logger.info("execAndGetStdout failed: cmd=${args.firstOrNull() ?: "?"} err=${t.javaClass.simpleName}")
         ""
     }
 }
 
-/**
- * Returns short git SHA (8 chars) or "nogit" if unavailable.
- */
+/** Returns short Git SHA (8 chars) or "nogit" if unavailable. */
 fun Project.gitShaShort(): String {
     if (!hasGitRepo()) return "nogit"
     val s = execAndGetStdout("git", "rev-parse", "--short=8", "HEAD")
     return if (s.isNotBlank()) s else "nogit"
 }
 
-/**
- * Returns true if git working tree has uncommitted changes.
- */
+/** Returns true if the Git working tree has uncommitted changes. */
 fun Project.gitDirty(): Boolean {
     if (!hasGitRepo()) return false
     val s = execAndGetStdout("git", "status", "--porcelain")
@@ -228,12 +216,12 @@ fun Project.gitDirty(): Boolean {
 }
 
 /**
- * Resolves a deterministic-ish build time string.
+ * Resolve a deterministic-ish build time string.
  *
  * Priority:
  * 1) Gradle property: build.timeUtc
  * 2) Environment variable: BUILD_TIME_UTC
- * 3) Now (Instant)
+ * 3) Current time
  */
 fun buildTimeUtc(): String {
     val p = gradleProp("build.timeUtc")
@@ -246,12 +234,10 @@ fun buildTimeUtc(): String {
 }
 
 android {
-    // BuildConfig is generated under this namespace.
     namespace = "com.negi.surveys"
-
     compileSdk = 36
 
-    // ---- Config resolution (supports both "github.*" and legacy "gh.*") ----
+    // Config resolution supports both "github.*" and legacy "gh.*" keys.
     val ghOwner = gradlePropAny("github.owner", "gh.owner") ?: ""
     val ghRepo = gradlePropAny("github.repo", "gh.repo") ?: "SurveyExports"
     val ghBranch = gradlePropAny("github.branch", "gh.branch") ?: "main"
@@ -260,13 +246,14 @@ android {
     val ghToken = gradlePropAny("github.token", "gh.token") ?: ""
     val hfToken = gradlePropAny("hf.token", "HF_TOKEN") ?: ""
 
-    /**
-     * By default, secrets are NOT embedded in release builds.
-     * To explicitly allow (internal builds only), set:
-     *   -Prelease.allowSecrets=true
-     * or in gradle.properties.local:
-     *   release.allowSecrets=true
+    /*
+     * Runtime token policy for this project:
+     * - Tokens are exposed through BuildConfig for both debug and release variants.
+     * - Missing values resolve to empty strings so clean checkouts still compile.
+     * - The current release build is treated as an internal distribution build.
+     * - Public/app-store distribution should use a separate build type and signing policy.
      */
+
     defaultConfig {
         applicationId = "com.negi.surveys"
 
@@ -275,7 +262,6 @@ android {
         versionCode = resolveVersionCode()
         versionName = resolveVersionName()
 
-        // Build fingerprint (PII-safe, deterministic enough for debugging).
         val sha = rootProject.gitShaShort()
         val dirty = rootProject.gitDirty()
         val timeUtc = buildTimeUtc()
@@ -284,20 +270,22 @@ android {
         buildConfigField("boolean", "GIT_DIRTY", dirty.toString())
         buildConfigField("String", "BUILD_TIME_UTC", quote(timeUtc))
 
-        // GitHub upload config (KEEP TOKENS OUT OF GIT).
-        // Provide both GH_* and GITHUB_* for backward compatibility.
+        // GitHub upload config.
+        // Keep secret values out of Git and inject them from local/CI properties.
         buildConfigField("String", "GH_OWNER", quote(ghOwner))
         buildConfigField("String", "GH_REPO", quote(ghRepo))
         buildConfigField("String", "GH_BRANCH", quote(ghBranch))
         buildConfigField("String", "GH_PATH_PREFIX", quote(ghPathPrefix))
         buildConfigField("String", "GH_LOG_PREFIX", quote(ghLogPrefix))
 
+        // Backward-compatible aliases.
         buildConfigField("String", "GITHUB_OWNER", quote(ghOwner))
         buildConfigField("String", "GITHUB_REPO", quote(ghRepo))
         buildConfigField("String", "GITHUB_BRANCH", quote(ghBranch))
         buildConfigField("String", "GITHUB_LOG_PREFIX", quote(ghLogPrefix))
 
-        // Tokens must exist on all variants (compile-time), but default to empty.
+        // Token fields must exist for all variants at compile time.
+        // Variant-specific build types replace these empty defaults.
         buildConfigField("String", "GH_TOKEN", quote(""))
         buildConfigField("String", "GITHUB_TOKEN", quote(""))
         buildConfigField("String", "HF_TOKEN", quote(""))
@@ -305,7 +293,7 @@ android {
 
     buildTypes {
         debug {
-            // IMPORTANT: Debug builds only. Never include tokens in production releases.
+            // Debug embeds runtime tokens when configured.
             buildConfigField("String", "GH_TOKEN", quote(ghToken))
             buildConfigField("String", "GITHUB_TOKEN", quote(ghToken))
             buildConfigField("String", "HF_TOKEN", quote(hfToken))
@@ -318,29 +306,29 @@ android {
                 "proguard-rules.pro",
             )
 
-            /**
-             * Debug signing for CI/dev convenience.
-             * For production distribution, switch to a proper release keystore.
+            /*
+             * This release build is for internal distribution and intentionally
+             * embeds the same runtime tokens as debug when they are provided.
+             *
+             * For public distribution, create a separate release policy with:
+             * - proper release signing
+             * - no embedded secrets
+             * - distribution-specific hardening
              */
             signingConfig = signingConfigs.getByName("debug")
 
-            val ghTokenRelease = ghToken
-            val hfTokenRelease = hfToken
-
-            buildConfigField("String", "GH_TOKEN", quote(ghTokenRelease))
-            buildConfigField("String", "GITHUB_TOKEN", quote(ghTokenRelease))
-            buildConfigField("String", "HF_TOKEN", quote(hfTokenRelease))
+            buildConfigField("String", "GH_TOKEN", quote(ghToken))
+            buildConfigField("String", "GITHUB_TOKEN", quote(ghToken))
+            buildConfigField("String", "HF_TOKEN", quote(hfToken))
         }
     }
 
     buildFeatures {
         compose = true
-        // IMPORTANT: Ensure BuildConfig is generated.
         buildConfig = true
     }
 
     compileOptions {
-        // Keep Java bytecode target consistent with Kotlin.
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
@@ -351,7 +339,7 @@ android {
     }
 
     /**
-     * Optional pins (avoid breaking clean machines / CI):
+     * Optional version pins for local machines and CI.
      *
      * Usage:
      * - gradle.properties:
@@ -380,32 +368,32 @@ tasks.withType<KotlinCompile>().configureEach {
 }
 
 dependencies {
-    // Navigation3 (alpha) - keep consistent within this module.
+    // Navigation3 (alpha).
     implementation(libs.androidx.navigation3.runtime.alpha)
     implementation(libs.androidx.navigation3.ui.alpha)
 
     implementation(libs.kaml)
     implementation(libs.kotlinx.serialization.json)
 
-    // LiteRT-LM
+    // LiteRT-LM.
     implementation(libs.litertlm)
 
-    // Compose (BOM + modules)
+    // Compose.
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.activity.compose)
     implementation(libs.androidx.compose.ui)
     implementation(libs.androidx.compose.material3)
 
-    // Lifecycle Compose
+    // Lifecycle Compose.
     implementation(libs.androidx.lifecycle.viewmodel.compose)
     implementation(libs.androidx.lifecycle.runtime.compose)
 
-    // Tooling (preview/debug)
+    // Tooling.
     implementation(libs.androidx.compose.ui.tooling.preview)
     implementation(libs.androidx.compose.ui.text)
     implementation(libs.androidx.datastore.core)
     debugImplementation(libs.androidx.compose.ui.tooling)
 
-    // Icons
+    // Icons.
     implementation(libs.androidx.compose.material.icons.extended)
 }
