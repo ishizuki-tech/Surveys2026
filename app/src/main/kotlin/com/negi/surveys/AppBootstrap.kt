@@ -31,7 +31,8 @@ import kotlin.concurrent.thread
  * Process-scoped bootstrap to keep startup stable.
  *
  * Goals:
- * - Run initialization exactly once per process.
+ * - Run heavy initialization exactly once in the main process.
+ * - Install crash capture in every process.
  * - Avoid duplicated heavy work in non-main processes.
  * - Never prevent the app from showing UI (best-effort + non-fatal).
  *
@@ -51,12 +52,27 @@ object AppBootstrap {
     fun ensureInitialized(context: Context) {
         val appCtx = context.applicationContext
 
+        /**
+         * Crash capture must be installed in every process.
+         *
+         * Why:
+         * - UncaughtExceptionHandler is process-local.
+         * - Non-main processes can still crash (WorkManager, remote services, etc.).
+         * - CrashCapture itself is intentionally lightweight and does not perform network work here.
+         */
+        runCatching { CrashCapture.install(appCtx) }
+            .onFailure { t ->
+                SafeLog.w(TAG_BOOT, "CrashCapture.install failed (non-fatal) type=${t.javaClass.simpleName}")
+            }
+
         // Avoid duplicated heavy work in non-main processes (WorkManager/remote services, etc.).
-        if (!ProcessGuards.isMainProcess(appCtx)) {
-            val processName = ProcessGuards.currentProcessNameCached(appCtx)
+        val isMainProcess = ProcessGuards.isMainProcess(appCtx)
+        val processName = ProcessGuards.currentProcessNameCached(appCtx)
+        if (!isMainProcess) {
             SafeLog.i(
                 TAG_BOOT,
-                "bootstrap: non-main process detected (skip) pid=${Process.myPid()} process=$processName",
+                "bootstrap: non-main process detected (heavy init skipped) " +
+                        "pid=${Process.myPid()} process=$processName",
             )
             return
         }
@@ -67,18 +83,11 @@ object AppBootstrap {
         }
 
         val t0 = SystemClock.elapsedRealtime()
-        val processName = ProcessGuards.currentProcessNameCached(appCtx)
 
         runCatching { AppLog.init(appCtx) }
             .onFailure { t ->
                 // Do not pass Throwable to logger (may print exception.message).
                 SafeLog.w(TAG_BOOT, "AppLog.init failed (non-fatal) type=${t.javaClass.simpleName}")
-            }
-
-        runCatching { CrashCapture.install(appCtx) }
-            .onFailure { t ->
-                // Do not pass Throwable to logger (may print exception.message).
-                SafeLog.w(TAG_BOOT, "CrashCapture.install failed (non-fatal) type=${t.javaClass.simpleName}")
             }
 
         PendingCrashUploadKickoff.tryStart(appCtx)
@@ -114,7 +123,11 @@ object AppBootstrap {
                 SafeLog.d(TAG_UPLOAD, "pending crash upload: already started in this process (skip)")
                 return
             }
-            kickOffPendingCrashUpload(appCtx)
+
+            val launchOk = kickOffPendingCrashUpload(appCtx)
+            if (!launchOk) {
+                started.set(false)
+            }
         }
 
         private enum class UploadPhase {
@@ -133,8 +146,8 @@ object AppBootstrap {
             val errType: String?,
         )
 
-        private fun kickOffPendingCrashUpload(context: Context) {
-            runCatching {
+        private fun kickOffPendingCrashUpload(context: Context): Boolean {
+            return runCatching {
                 thread(
                     start = true,
                     name = THREAD_NAME,
@@ -145,6 +158,7 @@ object AppBootstrap {
                     val appCtx = context.applicationContext
                     val t0 = SystemClock.elapsedRealtime()
                     val phaseRef = AtomicReference(UploadPhase.INIT)
+                    val finishedRef = AtomicBoolean(false)
 
                     Thread.currentThread().uncaughtExceptionHandler =
                         Thread.UncaughtExceptionHandler { _, e ->
@@ -163,6 +177,8 @@ object AppBootstrap {
                     ) {
                         runCatching {
                             Thread.sleep(UPLOAD_WATCHDOG_MS)
+                            if (finishedRef.get()) return@thread
+
                             val elapsed = SystemClock.elapsedRealtime() - t0
                             SafeLog.w(
                                 TAG_UPLOAD,
@@ -175,7 +191,7 @@ object AppBootstrap {
 
                     try {
                         phaseRef.set(UploadPhase.COUNT_PENDING_INITIAL)
-                        val pending0 = runCatching { CrashCapture.countPendingCrashes(appCtx) }
+                        val pending0 = runCatching { com.negi.surveys.logging.CrashCapture.countPendingCrashes(appCtx) }
                             .getOrDefault(-1)
 
                         phaseRef.set(UploadPhase.CHECK_GH_CONFIG)
@@ -200,7 +216,7 @@ object AppBootstrap {
                         }
 
                         phaseRef.set(UploadPhase.UPLOAD_BLOCKING)
-                        val pendingBefore = runCatching { CrashCapture.countPendingCrashes(appCtx) }
+                        val pendingBefore = runCatching { com.negi.surveys.logging.CrashCapture.countPendingCrashes(appCtx) }
                             .getOrDefault(-1)
 
                         val meta = tryUploadPendingCrashesWithHardTimeout(appCtx, UPLOAD_HARD_TIMEOUT_MS)
@@ -219,7 +235,7 @@ object AppBootstrap {
                         }
 
                         phaseRef.set(UploadPhase.COUNT_PENDING_AFTER)
-                        val pendingAfter = runCatching { CrashCapture.countPendingCrashes(appCtx) }
+                        val pendingAfter = runCatching { com.negi.surveys.logging.CrashCapture.countPendingCrashes(appCtx) }
                             .getOrDefault(-1)
 
                         SafeLog.i(TAG_UPLOAD, "pending crash upload: end pendingAfter=$pendingAfter")
@@ -228,18 +244,21 @@ object AppBootstrap {
                         SafeLog.e(TAG_UPLOAD, "kickOffPendingCrashUpload: unexpected failure type=${t.javaClass.simpleName}")
                     } finally {
                         phaseRef.set(UploadPhase.DONE)
+                        finishedRef.set(true)
                         runCatching { watchdog.interrupt() }
 
                         val dt = SystemClock.elapsedRealtime() - t0
                         SafeLog.i(TAG_UPLOAD, "pending crash upload: done in ${dt}ms")
                     }
                 }
-            }.onFailure { t ->
+                true
+            }.getOrElse { t ->
                 // Do not pass Throwable to logger (may print exception.message).
                 SafeLog.w(
                     TAG_UPLOAD,
                     "Failed to start PendingCrashUpload thread (non-fatal) type=${t.javaClass.simpleName}",
                 )
+                false
             }
         }
 
@@ -273,7 +292,7 @@ object AppBootstrap {
                     onSuccess = { value ->
                         UploadCallOutcome(
                             ok = true,
-                            resultType = value.javaClass?.simpleName,
+                            resultType = value.javaClass.simpleName,
                             errType = null,
                         )
                     },
@@ -353,7 +372,7 @@ object AppBootstrap {
         }
 
         /**
-         * Returns the "main process name" declared by the app.
+         * Returns the main process name declared by the app.
          *
          * This is safer than assuming it equals packageName, because android:process can override it.
          */
@@ -383,7 +402,7 @@ object AppBootstrap {
                 if (!name.isNullOrBlank()) return name
             }
 
-            // Last resort: /proc/self/cmdline (small read, but still IO).
+            // Last resort: /proc/self/cmdline.
             return readProcCmdline()
         }
 

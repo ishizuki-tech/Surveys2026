@@ -52,11 +52,29 @@ import kotlinx.coroutines.SupervisorJob
 object AppProcessServices {
 
     private const val TAG = "AppProcessServices"
+    private const val FORCE_FAKE_REPO: Boolean = false
     private const val TAG_WARMUP_LOG = "WarmupController"
 
     enum class RepoMode {
         ON_DEVICE,
         FAKE,
+    }
+
+    /**
+     * Returns the configured process-wide repository mode.
+     *
+     * Notes:
+     * - Keep the decision centralized here so Application and startup orchestration
+     *   do not drift apart.
+     * - Replace the hardcoded switch with BuildConfig, SurveyConfig, or a dev menu
+     *   when this branch needs runtime control.
+     */
+    fun configuredRepoMode(): RepoMode {
+        return if (FORCE_FAKE_REPO) {
+            RepoMode.FAKE
+        } else {
+            RepoMode.ON_DEVICE
+        }
     }
 
     // ---------------------------------------------------------------------

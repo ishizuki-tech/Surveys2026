@@ -177,6 +177,15 @@ class SurveyApplication : Application() {
             if (!attemptedOnce.compareAndSet(false, true)) return
 
             scope.launch {
+                val repoMode = AppProcessServices.configuredRepoMode()
+                if (repoMode != AppProcessServices.RepoMode.ON_DEVICE) {
+                    SafeLog.i(
+                        TAG,
+                        "warmupInputs: earlyInject skipped (repoMode=$repoMode) pid=${Process.myPid()}",
+                    )
+                    return@launch
+                }
+
                 // Small delay so process bootstrap/config install can settle.
                 delay(INITIAL_DELAY_MS)
 
@@ -198,7 +207,7 @@ class SurveyApplication : Application() {
                         runCatching {
                             AppProcessServices.repository(
                                 appContext.applicationContext,
-                                AppProcessServices.RepoMode.ON_DEVICE,
+                                repoMode,
                             )
                         }.getOrNull()
 

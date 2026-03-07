@@ -1,6 +1,6 @@
 /*
  * =====================================================================
- *  IshizukiTech LLC — Survey App (Streaming Bridge)
+ *  IshizukiTech LLC — Survey App (Chat Stream Bridge)
  *  ---------------------------------------------------------------------
  *  File: ChatStreamBridge.kt
  *  Author: Shu Ishizuki
@@ -13,8 +13,8 @@
 
 package com.negi.surveys.chat
 
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
-import kotlinx.coroutines.channels.BufferOverflow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -23,382 +23,202 @@ import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * A thin, UI-agnostic streaming bridge for model output.
+ * Thread-safe bridge for streaming raw validation/model output to the UI.
  *
- * Replacement policy:
- * - Only one active session is supported.
- * - If begin() is called while another session is active:
- *   (1) activeSessionId is cleared first (so late deltas are ignored)
- *   (2) the previous session is terminated as Error("replaced") (NOT End)
- *   (3) Begin(new) is emitted
- *
- * Rationale:
- * - "replaced" is not a normal completion. Emitting End(prev) can cause the UI to treat partial
- *   output as a successful stream end and embed it into the next assistant bubble.
- *
- * Overflow note:
- * - BufferOverflow.DROP_OLDEST can overwrite older events without tryEmit() failing.
- * - droppedEvents counts only hard tryEmit failures (rare), not overwritten items.
- *
- * Threading contract:
- * - All producer APIs are safe to call from any thread.
- * - Event ordering is enforced per session: Begin -> Delta* -> End/Error.
- *
- * IMPORTANT (stability):
- * - Error.code MUST be a stable enum-like value (ChatStreamEvent.Codes.*).
- * - Error.token is metadata-only and may be a sanitized message.
+ * Notes:
+ * - This bridge is intentionally lightweight and event-based.
+ * - The repository/validator may emit multiple phase-tagged sessions over one logical attempt.
+ * - Final structured evaluation/follow-up state should not be inferred from these events alone.
  */
 class ChatStreamBridge(
-    private val logger: ((String) -> Unit)? = null
+    private val logger: ((String) -> Unit)? = null,
 ) {
+    private val sessionSeed = AtomicLong(0L)
 
-    private val lock = Any()
+    private val activePhaseBySession = ConcurrentHashMap<Long, ChatStreamEvent.Phase>()
+    private val lastActiveSessionId = AtomicLong(0L)
 
-    private val nextSessionId = AtomicLong(0L)
-    private val activeSessionId = AtomicLong(0L)
-
-    private val _events = MutableSharedFlow<ChatStreamEvent>(
-        replay = 0,
-        extraBufferCapacity = 2048,
-        onBufferOverflow = BufferOverflow.DROP_OLDEST
-    )
+    private val _events =
+        MutableSharedFlow<ChatStreamEvent>(
+            replay = 0,
+            extraBufferCapacity = 128,
+        )
     val events: SharedFlow<ChatStreamEvent> = _events.asSharedFlow()
 
-    // ---------------------------------------------------------------------
-    // Stats (PII-safe)
-    // ---------------------------------------------------------------------
-
-    private val emittedBegin = AtomicLong(0L)
-    private val emittedDelta = AtomicLong(0L)
-    private val emittedEnd = AtomicLong(0L)
-    private val emittedError = AtomicLong(0L)
-    private val droppedEvents = AtomicLong(0L)
-
-    private val ignoredDelta = AtomicLong(0L)
-    private val ignoredEnd = AtomicLong(0L)
-    private val ignoredError = AtomicLong(0L)
-    private val ignoredCancel = AtomicLong(0L)
-
-    private val deltaTick = AtomicLong(0L)
-
-    @Volatile private var lastEventNs: Long = 0L
-    @Volatile private var lastEventKind: String? = null
-    @Volatile private var lastEventSessionId: Long = 0L
-
-    @Volatile private var lastCancelSessionId: Long = 0L
-    @Volatile private var lastCancelMessage: String? = null
-
-    data class StreamStats(
-        val activeSessionId: Long,
-        val nextSessionId: Long,
-        val emittedBegin: Long,
-        val emittedDelta: Long,
-        val emittedEnd: Long,
-        val emittedError: Long,
-        val droppedEvents: Long,
-        val ignoredDelta: Long,
-        val ignoredEnd: Long,
-        val ignoredError: Long,
-        val ignoredCancel: Long,
-        val lastEventKind: String?,
-        val lastEventSessionId: Long,
-        val lastEventAgeMs: Long,
-        val lastCancelSessionId: Long,
-        val lastCancelMessage: String?
-    )
-
-    private val _stats = MutableStateFlow(statsSnapshot())
+    private val _stats = MutableStateFlow(StreamStats())
     val stats: StateFlow<StreamStats> = _stats.asStateFlow()
 
-    fun statsSnapshot(): StreamStats {
-        val now = System.nanoTime()
-        val ageMs = if (lastEventNs <= 0L) Long.MAX_VALUE else ((now - lastEventNs) / 1_000_000L)
+    data class StreamStats(
+        val activeSessionId: Long = 0L,
+        val droppedEvents: Long = 0L,
+        val ignoredDelta: Long = 0L,
+        val ignoredEnd: Long = 0L,
+        val ignoredError: Long = 0L,
+        val ignoredCancel: Long = 0L,
+    )
 
-        return StreamStats(
-            activeSessionId = activeSessionId.get(),
-            nextSessionId = nextSessionId.get(),
-            emittedBegin = emittedBegin.get(),
-            emittedDelta = emittedDelta.get(),
-            emittedEnd = emittedEnd.get(),
-            emittedError = emittedError.get(),
-            droppedEvents = droppedEvents.get(),
-            ignoredDelta = ignoredDelta.get(),
-            ignoredEnd = ignoredEnd.get(),
-            ignoredError = ignoredError.get(),
-            ignoredCancel = ignoredCancel.get(),
-            lastEventKind = lastEventKind,
-            lastEventSessionId = lastEventSessionId,
-            lastEventAgeMs = ageMs,
-            lastCancelSessionId = lastCancelSessionId,
-            lastCancelMessage = lastCancelMessage
-        )
-    }
+    /**
+     * Starts a new streaming session for the given phase.
+     */
+    fun begin(phase: ChatStreamEvent.Phase): Long {
+        val sessionId = sessionSeed.incrementAndGet()
+        activePhaseBySession[sessionId] = phase
+        lastActiveSessionId.set(sessionId)
 
-    private fun publishStats(force: Boolean) {
-        if (force) {
-            _stats.value = statsSnapshot()
-            return
-        }
-        val t = deltaTick.get()
-        if ((t and 0x3FL) == 0L) {
-            _stats.value = statsSnapshot()
-        }
-    }
+        emitEvent(ChatStreamEvent.Begin(sessionId = sessionId, phase = phase))
+        updateStats { it.copy(activeSessionId = sessionId) }
 
-    private fun emitEvent(ev: ChatStreamEvent, kind: String, sessionId: Long) {
-        val ok = _events.tryEmit(ev)
-
-        lastEventNs = System.nanoTime()
-        lastEventKind = kind
-        lastEventSessionId = sessionId
-
-        if (!ok) {
-            droppedEvents.incrementAndGet()
-            logger?.invoke("ChatStreamBridge: dropped kind=$kind session=$sessionId")
-        }
-    }
-
-    // ---------------------------------------------------------------------
-    // Producer API
-    // ---------------------------------------------------------------------
-
-    fun begin(): Long = synchronized(lock) {
-        val prev = activeSessionId.get()
-        if (prev > 0L) {
-            // NOTE: "replaced" is not a cancel; we do not record it as lastCancel*.
-            terminateLocked(
-                sessionId = prev,
-                token = ChatStreamEvent.Codes.REPLACED,
-                code = ChatStreamEvent.Codes.REPLACED,
-                kind = "Error(replaced)",
-                recordAsCancel = false
-            )
-            logger?.invoke("ChatStreamBridge: replaced prev session=$prev")
-        }
-
-        val id = nextSessionId.incrementAndGet()
-        activeSessionId.set(id)
-
-        emittedBegin.incrementAndGet()
-        emitEvent(ChatStreamEvent.Begin(sessionId = id), kind = "Begin", sessionId = id)
-
-        logger?.invoke("ChatStreamBridge: begin session=$id (prev=$prev)")
-        publishStats(force = true)
-        id
+        logger?.invoke("begin sid=$sessionId phase=$phase")
+        return sessionId
     }
 
     /**
-     * Emit a delta chunk for an active session.
-     *
-     * IMPORTANT:
-     * - This method is synchronized to guarantee ordering against end()/error()/cancel()/timeout().
-     * - Without this, "Delta after End/Error" can happen under race conditions.
+     * Emits a raw chunk for an active session.
      */
-    fun emitChunk(sessionId: Long, chunk: String) {
-        if (sessionId <= 0L) return
-        if (chunk.isEmpty()) return
+    fun emitChunk(
+        sessionId: Long,
+        text: String,
+    ) {
+        if (text.isEmpty()) return
 
-        synchronized(lock) {
-            val active = activeSessionId.get()
-            if (active != sessionId) {
-                ignoredDelta.incrementAndGet()
-                deltaTick.incrementAndGet()
-                publishStats(force = false)
-                return
-            }
-
-            emittedDelta.incrementAndGet()
-            deltaTick.incrementAndGet()
-            emitEvent(ChatStreamEvent.Delta(sessionId = sessionId, text = chunk), kind = "Delta", sessionId = sessionId)
-            publishStats(force = false)
-        }
-    }
-
-    fun end(sessionId: Long): Unit = synchronized(lock) {
-        if (sessionId <= 0L) return
-
-        val active = activeSessionId.get()
-        if (active != sessionId) {
-            ignoredEnd.incrementAndGet()
-            publishStats(force = true)
+        val phase = activePhaseBySession[sessionId]
+        if (phase == null) {
+            updateStats { it.copy(ignoredDelta = it.ignoredDelta + 1L) }
+            logger?.invoke("emitChunk ignored sid=$sessionId reason=no_session len=${text.length}")
             return
         }
 
-        activeSessionId.set(0L)
-
-        emittedEnd.incrementAndGet()
-        emitEvent(ChatStreamEvent.End(sessionId = sessionId), kind = "End", sessionId = sessionId)
-
-        logger?.invoke("ChatStreamBridge: end session=$sessionId")
-        publishStats(force = true)
+        emitEvent(
+            ChatStreamEvent.Delta(
+                sessionId = sessionId,
+                phase = phase,
+                text = text,
+            ),
+        )
     }
 
     /**
-     * Emits an error with a stable ERROR code and a sanitized token.
-     *
-     * NOTE:
-     * - Use [timeout] for stable TIMEOUT classification.
+     * Ends an active session normally.
      */
-    fun error(sessionId: Long, message: String): Unit = synchronized(lock) {
-        if (sessionId <= 0L) return
-
-        val active = activeSessionId.get()
-        if (active != sessionId) {
-            ignoredError.incrementAndGet()
-            publishStats(force = true)
+    fun end(sessionId: Long) {
+        val phase = activePhaseBySession.remove(sessionId)
+        if (phase == null) {
+            updateStats { it.copy(ignoredEnd = it.ignoredEnd + 1L) }
+            logger?.invoke("end ignored sid=$sessionId reason=no_session")
             return
         }
 
-        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.ERROR)
-        terminateLocked(
-            sessionId = sessionId,
-            token = token,
-            code = ChatStreamEvent.Codes.ERROR,
-            kind = "Error",
-            recordAsCancel = false
-        )
+        emitEvent(ChatStreamEvent.End(sessionId = sessionId, phase = phase))
+        updateActiveSessionAfterTerminal(sessionId)
 
-        logger?.invoke("ChatStreamBridge: error session=$sessionId token=${token.take(32)}")
-        publishStats(force = true)
+        logger?.invoke("end sid=$sessionId phase=$phase")
     }
 
     /**
-     * Emits a timeout with a stable TIMEOUT code.
+     * Ends an active session with an error token.
      */
-    fun timeout(sessionId: Long, message: String = ChatStreamEvent.Codes.TIMEOUT): Long = synchronized(lock) {
-        if (sessionId <= 0L) return 0L
-
-        val active = activeSessionId.get()
-        if (active != sessionId) {
-            ignoredError.incrementAndGet()
-            publishStats(force = true)
-            return 0L
-        }
-
-        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.TIMEOUT)
-        terminateLocked(
-            sessionId = sessionId,
-            token = token,
-            code = ChatStreamEvent.Codes.TIMEOUT,
-            kind = "Error(timeout)",
-            recordAsCancel = false
-        )
-
-        logger?.invoke("ChatStreamBridge: timeout session=$sessionId token=${token.take(32)}")
-        publishStats(force = true)
-        sessionId
-    }
-
-    /**
-     * Emits a timeout for the currently active session, if any.
-     */
-    fun timeoutActive(message: String = ChatStreamEvent.Codes.TIMEOUT): Long = synchronized(lock) {
-        val id = activeSessionId.get()
-        if (id <= 0L) {
-            ignoredError.incrementAndGet()
-            publishStats(force = true)
-            return 0L
-        }
-        return timeout(id, message)
-    }
-
-    fun cancel(sessionId: Long, message: String = ChatStreamEvent.Codes.CANCELLED): Long = synchronized(lock) {
-        if (sessionId <= 0L) return 0L
-
-        val active = activeSessionId.get()
-        if (active != sessionId) {
-            ignoredCancel.incrementAndGet()
-            publishStats(force = true)
-            return 0L
-        }
-
-        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.CANCELLED)
-        terminateLocked(
-            sessionId = sessionId,
-            token = token,
-            code = ChatStreamEvent.Codes.CANCELLED,
-            kind = "Error(cancel)",
-            recordAsCancel = true
-        )
-
-        logger?.invoke("ChatStreamBridge: cancel session=$sessionId token=${token.take(32)}")
-        publishStats(force = true)
-        sessionId
-    }
-
-    fun cancelActive(message: String = ChatStreamEvent.Codes.CANCELLED): Long = synchronized(lock) {
-        val id = activeSessionId.get()
-        if (id <= 0L) {
-            ignoredCancel.incrementAndGet()
-            publishStats(force = true)
-            return 0L
-        }
-
-        val token = sanitizeReason(message, fallback = ChatStreamEvent.Codes.CANCELLED)
-        terminateLocked(
-            sessionId = id,
-            token = token,
-            code = ChatStreamEvent.Codes.CANCELLED,
-            kind = "Error(cancelActive)",
-            recordAsCancel = true
-        )
-
-        logger?.invoke("ChatStreamBridge: cancelActive session=$id token=${token.take(32)}")
-        publishStats(force = true)
-        id
-    }
-
-    // ---------------------------------------------------------------------
-    // Internals
-    // ---------------------------------------------------------------------
-
-    private fun terminateLocked(
+    fun error(
         sessionId: Long,
         token: String,
-        code: String,
-        kind: String,
-        recordAsCancel: Boolean
+        code: String? = null,
     ) {
-        // Clear first so late deltas are ignored.
-        activeSessionId.set(0L)
-
-        if (recordAsCancel) {
-            lastCancelSessionId = sessionId
-            lastCancelMessage = token
+        val phase = activePhaseBySession.remove(sessionId)
+        if (phase == null) {
+            if (code == ChatStreamEvent.Codes.CANCELLED || token == ChatStreamEvent.Codes.CANCELLED) {
+                updateStats { it.copy(ignoredCancel = it.ignoredCancel + 1L) }
+            } else {
+                updateStats { it.copy(ignoredError = it.ignoredError + 1L) }
+            }
+            logger?.invoke("error ignored sid=$sessionId reason=no_session token=$token code=$code")
+            return
         }
 
-        emittedError.incrementAndGet()
         emitEvent(
             ChatStreamEvent.Error(
                 sessionId = sessionId,
+                phase = phase,
                 token = token,
-                code = code
+                code = code,
             ),
-            kind = kind,
-            sessionId = sessionId
         )
+        updateActiveSessionAfterTerminal(sessionId)
+
+        logger?.invoke("error sid=$sessionId phase=$phase token=$token code=$code")
     }
 
     /**
-     * Sanitizes a reason string into a short, metadata-only token.
-     *
-     * NOTE:
-     * - Avoid passing raw exception messages or user content here.
+     * Cancels the most recent active session and returns its id, if any.
      */
-    private fun sanitizeReason(raw: String, fallback: String, maxLen: Int = 256): String {
-        val t = raw.trim()
-        val base = if (t.isBlank()) fallback else t
+    fun cancelActive(code: String = ChatStreamEvent.Codes.CANCELLED): Long {
+        val sessionId = lastActiveSessionId.get()
+        if (sessionId <= 0L) return 0L
 
-        // Normalize whitespace to avoid UI/log disruption.
-        val normalized = buildString(base.length) {
-            for (c in base) {
-                when (c) {
-                    '\n', '\r', '\t' -> append(' ')
-                    else -> append(c)
-                }
-            }
+        val phase = activePhaseBySession[sessionId] ?: return 0L
+        activePhaseBySession.remove(sessionId)
+
+        emitEvent(
+            ChatStreamEvent.Error(
+                sessionId = sessionId,
+                phase = phase,
+                token = ChatStreamEvent.Codes.CANCELLED,
+                code = code,
+            ),
+        )
+        updateActiveSessionAfterTerminal(sessionId)
+
+        logger?.invoke("cancelActive sid=$sessionId phase=$phase code=$code")
+        return sessionId
+    }
+
+    /**
+     * Cancels a specific active session.
+     */
+    fun cancel(
+        sessionId: Long,
+        code: String = ChatStreamEvent.Codes.CANCELLED,
+    ) {
+        val phase = activePhaseBySession.remove(sessionId)
+        if (phase == null) {
+            updateStats { it.copy(ignoredCancel = it.ignoredCancel + 1L) }
+            logger?.invoke("cancel ignored sid=$sessionId reason=no_session code=$code")
+            return
         }
 
-        return normalized.trim().take(maxLen)
+        emitEvent(
+            ChatStreamEvent.Error(
+                sessionId = sessionId,
+                phase = phase,
+                token = ChatStreamEvent.Codes.CANCELLED,
+                code = code,
+            ),
+        )
+        updateActiveSessionAfterTerminal(sessionId)
+
+        logger?.invoke("cancel sid=$sessionId phase=$phase code=$code")
+    }
+
+    /**
+     * Snapshot current stats.
+     */
+    fun statsSnapshot(): StreamStats = _stats.value
+
+    private fun emitEvent(event: ChatStreamEvent) {
+        val emitted = _events.tryEmit(event)
+        if (!emitted) {
+            updateStats { it.copy(droppedEvents = it.droppedEvents + 1L) }
+            logger?.invoke("event dropped type=${event.javaClass.simpleName}")
+        }
+    }
+
+    private fun updateActiveSessionAfterTerminal(terminalSessionId: Long) {
+        val current = lastActiveSessionId.get()
+        if (current == terminalSessionId) {
+            lastActiveSessionId.set(0L)
+            updateStats { it.copy(activeSessionId = 0L) }
+        }
+    }
+
+    private fun updateStats(transform: (StreamStats) -> StreamStats) {
+        _stats.value = transform(_stats.value)
     }
 }

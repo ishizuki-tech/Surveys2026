@@ -1,6 +1,6 @@
 /*
  * =====================================================================
- *  IshizukiTech LLC — Survey App (Nav3 Frame)
+ *  IshizukiTech LLC — Survey App (GitHub Log Upload Manager)
  *  ---------------------------------------------------------------------
  *  File: GitHubLogUploadManager.kt
  *  Author: Shu Ishizuki
@@ -19,35 +19,35 @@ import android.util.Base64
 import com.negi.surveys.BuildConfig
 import java.io.File
 import java.io.IOException
+import java.io.InterruptedIOException
 import java.net.HttpURLConnection
 import java.net.URL
 import java.net.URLEncoder
 import java.util.concurrent.ThreadLocalRandom
-import kotlin.math.min
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 
 /**
- * Uploads log bundles to GitHub via "Create or update file contents".
+ * Uploads log bundles to GitHub via Create or update file contents.
  *
  * Regular path:
- * - Called manually from UI (e.g., HomeScreen) to upload a "regular" bundle.
+ * - Called manually from UI to upload a regular bundle.
  *
  * Crash path:
  * - Crash files are persisted to logs/crash/pending/ by CrashCapture.
  * - On next cold start, call tryUploadPendingCrashesBlocking to upload them.
  *
  * Security notes:
- * - DO NOT ship a personal access token in production builds.
- * - For production, use OAuth (device flow) or a backend broker.
+ * - Do not ship a personal access token in production builds.
+ * - For production, use OAuth device flow or a backend broker.
  *
  * Hardening:
- * - BuildConfig fields are resolved via reflection (supports both GH_* and GITHUB_* without compile-time coupling).
- * - Size cap is conservative to reduce memory spikes (base64 + JSON).
- * - Retries for transient failures (5xx/429), and conflict retry (409) by re-fetching sha.
- * - Retry-After header support (best-effort) for 429/secondary rate limiting.
- * - RateLimit reset support (best-effort) for some 403/429 cases.
+ * - BuildConfig fields are resolved via reflection.
+ * - Size cap is conservative to reduce memory spikes.
+ * - Retries for transient failures and 409 conflict.
+ * - Retry-After and rate limit reset are honored on a best-effort basis.
+ * - Interrupts are propagated so outer watchdog timeout can stop retry/backoff loops.
  */
 object GitHubLogUploadManager {
     private const val TAG = "GitHubLogUpload"
@@ -61,23 +61,20 @@ object GitHubLogUploadManager {
      * Soft safety cap.
      *
      * Rationale:
-     * - Contents API requires Base64 in JSON; memory footprint grows quickly (raw bytes + base64 string + JSON).
-     * - Keep this conservative for field stability; raise only if you truly need it.
+     * - Contents API requires Base64 in JSON.
+     * - Memory footprint grows quickly due to raw bytes + Base64 + JSON strings.
      */
     private const val SOFT_MAX_BYTES: Long = 16L * 1024L * 1024L // 16 MiB
 
     /**
-     * Additional sanity cap on Base64 character count (roughly 4/3 expansion).
-     *
-     * Notes:
-     * - Helps avoid large transient allocations from Base64 + JSON + UTF-8 encoding.
+     * Additional sanity cap on Base64 character count.
      */
     private const val SOFT_MAX_B64_CHARS: Int = 24 * 1024 * 1024 // 24M chars
 
     /** Retry count for transient HTTP failures. */
     private const val MAX_RETRIES: Int = 3
 
-    /** Base backoff (ms). */
+    /** Base backoff in milliseconds. */
     private const val BACKOFF_BASE_MS: Long = 700L
 
     /** Hard clamp for sleep to avoid blocking app start forever. */
@@ -88,7 +85,7 @@ object GitHubLogUploadManager {
         val repo: String,
         val branch: String,
         val token: String,
-        val logPrefix: String
+        val logPrefix: String,
     )
 
     /**
@@ -101,24 +98,24 @@ object GitHubLogUploadManager {
     private fun cfgOrNull(): GitHubCfg? {
         val owner = firstNonBlank(
             buildConfigString("GITHUB_OWNER"),
-            buildConfigString("GH_OWNER")
+            buildConfigString("GH_OWNER"),
         )
         val repo = firstNonBlank(
             buildConfigString("GITHUB_REPO"),
-            buildConfigString("GH_REPO")
+            buildConfigString("GH_REPO"),
         )
         val branch = firstNonBlank(
             buildConfigString("GITHUB_BRANCH"),
-            buildConfigString("GH_BRANCH")
+            buildConfigString("GH_BRANCH"),
         )
         val token = firstNonBlank(
             buildConfigString("GITHUB_TOKEN"),
-            buildConfigString("GH_TOKEN")
+            buildConfigString("GH_TOKEN"),
         )
         val logPrefix = firstNonBlank(
             buildConfigString("GITHUB_LOG_PREFIX"),
             buildConfigString("GH_LOG_PREFIX"),
-            "surveyapp"
+            "surveyapp",
         )
 
         if (owner.isBlank() || repo.isBlank() || branch.isBlank() || token.isBlank()) return null
@@ -127,102 +124,118 @@ object GitHubLogUploadManager {
             repo = repo.trim(),
             branch = branch.trim(),
             token = token.trim(),
-            logPrefix = logPrefix.trim()
+            logPrefix = logPrefix.trim(),
         )
     }
 
     fun isConfigured(): Boolean = cfgOrNull() != null
 
     /**
-     * Uploads a "regular" log bundle (blocking).
+     * Uploads a regular log bundle.
      *
      * Call this on a background thread.
      *
-     * @return Result.success(remotePath) on success
+     * @return Result.success(remotePath) on success.
      */
     fun uploadRegularBlocking(context: Context, reason: String? = null): Result<String> {
-        val cfg = cfgOrNull()
-            ?: return Result.failure(IllegalStateException("GitHub upload is not configured (owner/repo/branch/token)."))
+        return runCatching {
+            val cfg = cfgOrNull()
+                ?: throw IllegalStateException("GitHub upload is not configured (owner/repo/branch/token).")
 
-        // Ensure file logger exists so the bundle is not mysteriously empty.
-        runCatching { AppLog.ensureReady(context.applicationContext) }
+            runCatching { AppLog.ensureReady(context.applicationContext) }
+            throwIfInterrupted()
 
-        val installHash = LogFiles.installIdHash(context) // PII-safe stable directory key
-        val zip = LogFiles.createZipBundle(
-            context = context,
-            kind = LogFiles.UploadKind.REGULAR,
-            includeCrashFiles = emptyList(),
-            reason = reason
-        )
+            val installHash = LogFiles.installIdHash(context)
+            val zip = LogFiles.createZipBundle(
+                context = context,
+                kind = LogFiles.UploadKind.REGULAR,
+                includeCrashFiles = emptyList(),
+                reason = reason,
+            )
 
-        val remotePath = buildRepoPath(
-            cfg = cfg,
-            kind = LogFiles.UploadKind.REGULAR,
-            installKey = installHash,
-            fileName = zip.name
-        )
+            val remotePath = buildRepoPath(
+                cfg = cfg,
+                kind = LogFiles.UploadKind.REGULAR,
+                installKey = installHash,
+                fileName = zip.name,
+            )
 
-        AppLog.i(TAG, "uploadRegular: start path=$remotePath size=${zip.length()}")
-        val result = try {
-            uploadZipAsRepoContent(cfg = cfg, zipFile = zip, repoPath = remotePath, commitHint = "regular logs")
-        } finally {
-            runCatching { zip.delete() }
-        }
+            AppLog.i(TAG, "uploadRegular: start path=$remotePath size=${zip.length()}")
 
-        return result.onSuccess {
-            AppLog.i(TAG, "uploadRegular: ok path=$it")
+            try {
+                uploadZipAsRepoContent(
+                    cfg = cfg,
+                    zipFile = zip,
+                    repoPath = remotePath,
+                    commitHint = "regular logs",
+                ).getOrThrow()
+            } finally {
+                runCatching { zip.delete() }
+            }
+        }.onSuccess { path ->
+            AppLog.i(TAG, "uploadRegular: ok path=$path")
         }.onFailure { t ->
-            AppLog.e(TAG, "uploadRegular: failed", t)
+            AppLog.e(TAG, "uploadRegular: failed type=${t.javaClass.simpleName}")
         }
     }
 
     /**
-     * Uploads all pending crash logs as a single bundle (blocking).
+     * Uploads all pending crash logs as a single bundle.
      *
      * Call this on a background thread. Intended to be invoked at app start.
      *
-     * @return Result.success(movedCrashCount) on success
+     * @return Result.success(movedCrashCount) on success.
      */
     fun tryUploadPendingCrashesBlocking(context: Context): Result<Int> {
-        val cfg = cfgOrNull()
-        if (cfg == null) {
-            AppLog.w(TAG, "tryUploadPendingCrashes: GitHub not configured; skip")
-            return Result.success(0)
-        }
+        return runCatching {
+            val cfg = cfgOrNull()
+            if (cfg == null) {
+                AppLog.w(TAG, "tryUploadPendingCrashes: GitHub not configured; skip")
+                return@runCatching 0
+            }
 
-        val pending = CrashCapture.pendingCrashFiles(context)
-        if (pending.isEmpty()) return Result.success(0)
+            throwIfInterrupted()
 
-        val installHash = LogFiles.installIdHash(context) // PII-safe stable directory key
-        val zip = LogFiles.createZipBundle(
-            context = context,
-            kind = LogFiles.UploadKind.CRASH,
-            includeCrashFiles = pending,
-            reason = "auto:pending_crash"
-        )
+            val pending = CrashCapture.pendingCrashFiles(context)
+            if (pending.isEmpty()) return@runCatching 0
 
-        val remotePath = buildRepoPath(
-            cfg = cfg,
-            kind = LogFiles.UploadKind.CRASH,
-            installKey = installHash,
-            fileName = zip.name
-        )
+            val installHash = LogFiles.installIdHash(context)
+            val zip = LogFiles.createZipBundle(
+                context = context,
+                kind = LogFiles.UploadKind.CRASH,
+                includeCrashFiles = pending,
+                reason = "auto:pending_crash",
+            )
 
-        AppLog.i(TAG, "uploadCrash: start path=$remotePath crashes=${pending.size} size=${zip.length()}")
-        val uploadResult = try {
-            uploadZipAsRepoContent(cfg = cfg, zipFile = zip, repoPath = remotePath, commitHint = "crash logs")
-        } finally {
-            runCatching { zip.delete() }
-        }
+            val remotePath = buildRepoPath(
+                cfg = cfg,
+                kind = LogFiles.UploadKind.CRASH,
+                installKey = installHash,
+                fileName = zip.name,
+            )
 
-        return uploadResult.map { uploadedRepoPath ->
-            // Move crash files to uploaded/ only if upload succeeded.
+            AppLog.i(TAG, "uploadCrash: start path=$remotePath crashes=${pending.size} size=${zip.length()}")
+
+            val uploadedRepoPath = try {
+                uploadZipAsRepoContent(
+                    cfg = cfg,
+                    zipFile = zip,
+                    repoPath = remotePath,
+                    commitHint = "crash logs",
+                ).getOrThrow()
+            } finally {
+                runCatching { zip.delete() }
+            }
+
+            throwIfInterrupted()
+
+            // Move crash files to uploaded only if upload succeeded.
             val movedFiles = LogFiles.moveCrashFilesToUploaded(context, pending)
             val moved = movedFiles.size
             AppLog.i(TAG, "uploadCrash: ok path=$uploadedRepoPath pending=${pending.size} moved=$moved")
             moved
         }.onFailure { t ->
-            AppLog.e(TAG, "uploadCrash: failed", t)
+            AppLog.e(TAG, "uploadCrash: failed type=${t.javaClass.simpleName}")
         }
     }
 
@@ -242,7 +255,7 @@ object GitHubLogUploadManager {
         cfg: GitHubCfg,
         kind: LogFiles.UploadKind,
         installKey: String,
-        fileName: String
+        fileName: String,
     ): String {
         val prefix = cfg.logPrefix.trim().trim('/').ifBlank { "surveyapp" }
         val safeInstallKey = installKey.trim().ifBlank { "unknown" }
@@ -253,7 +266,7 @@ object GitHubLogUploadManager {
         cfg: GitHubCfg,
         zipFile: File,
         repoPath: String,
-        commitHint: String
+        commitHint: String,
     ): Result<String> {
         if (!zipFile.exists() || !zipFile.isFile) {
             return Result.failure(IllegalArgumentException("zipFile not found: ${zipFile.absolutePath}"))
@@ -264,17 +277,17 @@ object GitHubLogUploadManager {
             return Result.failure(
                 IllegalStateException(
                     "Bundle too large (${size} bytes). " +
-                            "Reduce bundle size or lower verbosity; contents API uses Base64-in-JSON and becomes unstable at large sizes."
-                )
+                            "Reduce bundle size or lower verbosity; contents API uses Base64-in-JSON and becomes unstable at large sizes.",
+                ),
             )
         }
 
         val uploadStartMs = SystemClock.elapsedRealtime()
 
-        // Read bytes (kept conservative by SOFT_MAX_BYTES).
+        throwIfInterrupted()
+
         val bytes = runCatching { zipFile.readBytes() }.getOrElse { return Result.failure(it) }
 
-        // Base64 expands payload; keep an additional sanity check.
         val estimatedB64Chars = estimateBase64Chars(bytes.size)
         if (estimatedB64Chars <= 0L) {
             return Result.failure(IllegalStateException("Invalid Base64 size estimation."))
@@ -283,24 +296,22 @@ object GitHubLogUploadManager {
             return Result.failure(
                 IllegalStateException(
                     "Bundle too large after Base64 expansion (estimatedB64Chars=$estimatedB64Chars). " +
-                            "Reduce bundle size; Contents API JSON payload becomes unstable."
-                )
+                            "Reduce bundle size; Contents API JSON payload becomes unstable.",
+                ),
             )
         }
 
         val contentB64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
 
-        // Final sanity check on actual Base64 length.
         if (contentB64.length > SOFT_MAX_B64_CHARS) {
             return Result.failure(
                 IllegalStateException(
                     "Bundle too large after Base64 expansion (actualB64Chars=${contentB64.length}). " +
-                            "Reduce bundle size; Contents API JSON payload becomes unstable."
-                )
+                            "Reduce bundle size; Contents API JSON payload becomes unstable.",
+                ),
             )
         }
 
-        // Encode path safely for GitHub Contents API.
         val encodedPath = encodePathSegments(repoPath)
         val endpoint = "$API_BASE/repos/${cfg.owner}/${cfg.repo}/contents/$encodedPath"
 
@@ -308,10 +319,12 @@ object GitHubLogUploadManager {
             val uploadId = LogFiles.utcCompactNow()
             AppLog.i(
                 TAG,
-                "upload: begin uploadId=$uploadId path=$repoPath rawBytes=${bytes.size} b64Chars=${contentB64.length} branch=${cfg.branch}"
+                "upload: begin uploadId=$uploadId path=$repoPath rawBytes=${bytes.size} " +
+                        "b64Chars=${contentB64.length} branch=${cfg.branch}",
             )
 
-            // Try to get SHA (non-fatal if missing).
+            throwIfInterrupted()
+
             var existingSha: String? = runCatching {
                 getExistingShaIfAny(endpoint = endpoint, branch = cfg.branch, token = cfg.token)
             }.getOrNull()
@@ -326,6 +339,8 @@ object GitHubLogUploadManager {
             for (attempt in 0 until MAX_RETRIES) {
                 val attemptNo = attempt + 1
                 try {
+                    throwIfInterrupted()
+
                     AppLog.d(TAG, "upload: attempt=$attemptNo/$MAX_RETRIES uploadId=$uploadId path=$repoPath")
 
                     val bodyJson = JSONObject().apply {
@@ -337,7 +352,7 @@ object GitHubLogUploadManager {
                             JSONObject().apply {
                                 put("name", "SurveyApp Bot")
                                 put("email", "noreply@users.noreply.github.com")
-                            }
+                            },
                         )
                         if (existingSha != null) put("sha", existingSha)
                     }.toString()
@@ -345,7 +360,7 @@ object GitHubLogUploadManager {
                     httpPutJson(
                         url = endpoint,
                         token = cfg.token,
-                        bodyJson = bodyJson
+                        bodyJson = bodyJson,
                     )
 
                     val elapsed = SystemClock.elapsedRealtime() - uploadStartMs
@@ -354,7 +369,6 @@ object GitHubLogUploadManager {
                 } catch (e: GitHubHttpException) {
                     lastError = e
 
-                    // 409 often indicates sha mismatch / conflict; refetch sha and retry.
                     if (e.code == 409 && attempt < MAX_RETRIES - 1) {
                         AppLog.w(TAG, "upload: conflict(409) refetch sha uploadId=$uploadId path=$repoPath")
                         existingSha = runCatching {
@@ -364,36 +378,43 @@ object GitHubLogUploadManager {
                             attempt = attempt,
                             retryAfterMs = e.retryAfterMs,
                             rateLimitResetEpochSec = e.rateLimitResetEpochSec,
-                            hint = "409-conflict"
+                            hint = "409-conflict",
                         )
                         continue
                     }
 
-                    // Retry transient issues only.
                     if (isRetryable(code = e.code, body = e.body) && attempt < MAX_RETRIES - 1) {
                         AppLog.w(
                             TAG,
                             "upload: retryable http=${e.code} uploadId=$uploadId path=$repoPath " +
-                                    "retryAfterMs=${e.retryAfterMs ?: -1} rateRemaining=${e.rateLimitRemaining ?: "?"}"
+                                    "retryAfterMs=${e.retryAfterMs ?: -1} rateRemaining=${e.rateLimitRemaining ?: "?"}",
                         )
                         sleepBackoffMs(
                             attempt = attempt,
                             retryAfterMs = e.retryAfterMs,
                             rateLimitResetEpochSec = e.rateLimitResetEpochSec,
-                            hint = "http-${e.code}"
+                            hint = "http-${e.code}",
                         )
                         continue
                     }
 
                     throw IOException(
                         "HTTP ${e.code}: ${summarizeGitHubError(e.body)}" +
-                                (e.rateLimitRemaining?.let { " | rateRemaining=$it" } ?: "")
+                                (e.rateLimitRemaining?.let { " | rateRemaining=$it" } ?: ""),
                     )
+                } catch (e: InterruptedIOException) {
+                    lastError = e
+                    throw e
                 } catch (e: IOException) {
                     lastError = e
                     if (attempt < MAX_RETRIES - 1) {
                         AppLog.w(TAG, "upload: io retry uploadId=$uploadId path=$repoPath err=${e.javaClass.simpleName}")
-                        sleepBackoffMs(attempt = attempt, retryAfterMs = null, rateLimitResetEpochSec = null, hint = "io")
+                        sleepBackoffMs(
+                            attempt = attempt,
+                            retryAfterMs = null,
+                            rateLimitResetEpochSec = null,
+                            hint = "io",
+                        )
                         continue
                     }
                     throw e
@@ -411,6 +432,7 @@ object GitHubLogUploadManager {
     }
 
     private fun getExistingShaIfAny(endpoint: String, branch: String, token: String): String? {
+        throwIfInterrupted()
         val url = "$endpoint?ref=${encodeQueryParam(branch)}"
         val res = httpGetJson(url = url, token = token, allow404 = true) ?: return null
         val obj = JSONObject(res)
@@ -418,6 +440,8 @@ object GitHubLogUploadManager {
     }
 
     private fun httpGetJson(url: String, token: String, allow404: Boolean): String? {
+        throwIfInterrupted()
+
         val conn = (URL(url).openConnection() as HttpURLConnection)
         try {
             conn.requestMethod = "GET"
@@ -442,7 +466,7 @@ object GitHubLogUploadManager {
                     body = resp,
                     retryAfterMs = parseRetryAfterMs(conn),
                     rateLimitRemaining = conn.getHeaderField("X-RateLimit-Remaining"),
-                    rateLimitResetEpochSec = parseRateLimitResetEpochSec(conn)
+                    rateLimitResetEpochSec = parseRateLimitResetEpochSec(conn),
                 )
             }
             return resp
@@ -452,6 +476,8 @@ object GitHubLogUploadManager {
     }
 
     private fun httpPutJson(url: String, token: String, bodyJson: String) {
+        throwIfInterrupted()
+
         val conn = (URL(url).openConnection() as HttpURLConnection)
         try {
             val bodyBytes = bodyJson.toByteArray(Charsets.UTF_8)
@@ -468,7 +494,6 @@ object GitHubLogUploadManager {
             conn.setRequestProperty("User-Agent", "SurveyApp-LogUploader")
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
 
-            // Best-effort: avoid internal buffering of the entire request body in some stacks.
             runCatching { conn.setFixedLengthStreamingMode(bodyBytes.size) }
 
             conn.outputStream.use { os ->
@@ -486,7 +511,7 @@ object GitHubLogUploadManager {
                     body = resp,
                     retryAfterMs = parseRetryAfterMs(conn),
                     rateLimitRemaining = conn.getHeaderField("X-RateLimit-Remaining"),
-                    rateLimitResetEpochSec = parseRateLimitResetEpochSec(conn)
+                    rateLimitResetEpochSec = parseRateLimitResetEpochSec(conn),
                 )
             }
         } finally {
@@ -495,6 +520,7 @@ object GitHubLogUploadManager {
     }
 
     private fun readResponseBody(conn: HttpURLConnection, ok: Boolean): String {
+        throwIfInterrupted()
         val stream = if (ok) conn.inputStream else conn.errorStream
         return runCatching {
             stream?.use { it.readBytes().toString(Charsets.UTF_8) } ?: ""
@@ -502,7 +528,7 @@ object GitHubLogUploadManager {
     }
 
     /**
-     * Encodes a query parameter value (UTF-8) and normalizes spaces to %20.
+     * Encodes a query parameter value in UTF-8 and normalizes spaces to %20.
      */
     private fun encodeQueryParam(s: String): String {
         return URLEncoder.encode(s, "UTF-8").replace("+", "%20")
@@ -513,7 +539,7 @@ object GitHubLogUploadManager {
      *
      * Notes:
      * - GitHub expects the path portion to be URL-encoded.
-     * - We encode each segment to avoid turning '/' into %2F.
+     * - Each segment is encoded independently so '/' stays as a separator.
      */
     private fun encodePathSegments(path: String): String {
         val trimmed = path.trim().trim('/')
@@ -546,11 +572,9 @@ object GitHubLogUploadManager {
     }
 
     private fun isRetryable(code: Int, body: String): Boolean {
-        // 429: rate/secondary limit; 5xx: transient server errors.
         if (code == 429) return true
         if (code in 500..599) return true
 
-        // GitHub may return 403 for secondary rate limits in some cases.
         if (code == 403) {
             val b = body.lowercase()
             if (b.contains("rate limit") || b.contains("secondary rate") || b.contains("abuse detection")) {
@@ -577,7 +601,7 @@ object GitHubLogUploadManager {
         attempt: Int,
         retryAfterMs: Long?,
         rateLimitResetEpochSec: Long?,
-        hint: String
+        hint: String,
     ) {
         val jitter = ThreadLocalRandom.current().nextLong(0L, 250L)
         val exp = (attempt + 1).toLong()
@@ -593,23 +617,30 @@ object GitHubLogUploadManager {
             0L,
             retryAfterMs ?: 0L,
             untilResetMs ?: 0L,
-            base
+            base,
         ) + jitter
 
         val clamped = ms.coerceIn(200L, BACKOFF_MAX_MS)
         AppLog.d(TAG, "backoff: hint=$hint attempt=${attempt + 1} sleepMs=$clamped")
-        runCatching { Thread.sleep(clamped) }
+
+        try {
+            Thread.sleep(clamped)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            throw InterruptedIOException("Backoff interrupted")
+        }
     }
 
     private fun estimateBase64Chars(byteCount: Int): Long {
         if (byteCount <= 0) return 0L
-        // Base64: 4 chars per 3 bytes, rounded up.
         val groups = (byteCount.toLong() + 2L) / 3L
         return groups * 4L
     }
 
     private fun firstNonBlank(vararg xs: String): String {
-        for (x in xs) if (x.isNotBlank()) return x
+        for (x in xs) {
+            if (x.isNotBlank()) return x
+        }
         return ""
     }
 
@@ -618,7 +649,7 @@ object GitHubLogUploadManager {
      *
      * Notes:
      * - Avoids compile-time dependency on optional fields.
-     * - Returns "" if missing or not a String.
+     * - Returns an empty string if missing or not a String.
      */
     private fun buildConfigString(fieldName: String): String {
         return runCatching {
@@ -628,11 +659,24 @@ object GitHubLogUploadManager {
         }.getOrDefault("")
     }
 
+    /**
+     * Throws when the current thread is already interrupted.
+     *
+     * Why:
+     * - AppBootstrap uses an outer hard-timeout and interrupts the worker thread.
+     * - Retry loops and backoff should stop quickly when that happens.
+     */
+    private fun throwIfInterrupted() {
+        if (Thread.currentThread().isInterrupted) {
+            throw InterruptedIOException("Thread interrupted")
+        }
+    }
+
     private class GitHubHttpException(
         val code: Int,
         val body: String,
         val retryAfterMs: Long?,
         val rateLimitRemaining: String?,
-        val rateLimitResetEpochSec: Long?
+        val rateLimitResetEpochSec: Long?,
     ) : IOException("HTTP $code")
 }
