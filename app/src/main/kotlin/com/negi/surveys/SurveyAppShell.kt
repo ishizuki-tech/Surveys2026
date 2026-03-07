@@ -35,6 +35,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.style.TextAlign
@@ -79,6 +80,13 @@ object SurveyAppShell {
         blockingDetail: String?,
         showBlockingSpinner: Boolean,
     ) {
+        val blockingSpec = rememberShellBlockingSpec(
+            repository = repository,
+            blockingTitle = blockingTitle,
+            blockingDetail = blockingDetail,
+            showBlockingSpinner = showBlockingSpinner,
+        )
+
         Scaffold(
             modifier = modifier.fillMaxSize(),
             contentWindowInsets = WindowInsets(0, 0, 0, 0),
@@ -90,32 +98,16 @@ object SurveyAppShell {
                 )
             },
         ) { innerPadding ->
-            Box(
+            AppBody(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding),
-            ) {
-                val showBlocking = repository == null || blockingTitle != null
-
-                if (showBlocking) {
-                    BlockingBody(
-                        title = blockingTitle ?: "Preparing app services…",
-                        detail = blockingDetail ?: "",
-                        showSpinner = showBlockingSpinner,
-                    )
-                } else {
-                    CompositionLocalProvider(
-                        LocalChatStreamBridge provides streamBridge,
-                        LocalRepositoryI provides repository,
-                    ) {
-                        NavDisplay(
-                            backStack = backStack,
-                            entryProvider = entryProvider,
-                            modifier = Modifier.fillMaxSize(),
-                        )
-                    }
-                }
-            }
+                backStack = backStack,
+                entryProvider = entryProvider,
+                streamBridge = streamBridge,
+                repository = repository,
+                blockingSpec = blockingSpec,
+            )
         }
     }
 
@@ -164,6 +156,60 @@ object SurveyAppShell {
     }
 
     @Composable
+    private fun AppBody(
+        modifier: Modifier,
+        backStack: NavBackStack<NavKey>,
+        entryProvider: (NavKey) -> NavEntry<NavKey>,
+        streamBridge: ChatStreamBridge,
+        repository: ChatValidation.RepositoryI?,
+        blockingSpec: ShellBlockingSpec,
+    ) {
+        Box(modifier = modifier) {
+            val readyRepository = repository
+
+            if (blockingSpec.visible || readyRepository == null) {
+                BlockingBody(
+                    title = blockingSpec.title,
+                    detail = blockingSpec.detail,
+                    showSpinner = blockingSpec.showSpinner,
+                )
+            } else {
+                ReadyNavHost(
+                    backStack = backStack,
+                    entryProvider = entryProvider,
+                    streamBridge = streamBridge,
+                    repository = readyRepository,
+                )
+            }
+        }
+    }
+
+    /**
+     * Hosts the navigation tree after startup/service blocking is cleared.
+     *
+     * Contract:
+     * - [repository] must be non-null and ready to provide through CompositionLocal.
+     */
+    @Composable
+    private fun ReadyNavHost(
+        backStack: NavBackStack<NavKey>,
+        entryProvider: (NavKey) -> NavEntry<NavKey>,
+        streamBridge: ChatStreamBridge,
+        repository: ChatValidation.RepositoryI,
+    ) {
+        CompositionLocalProvider(
+            LocalChatStreamBridge provides streamBridge,
+            LocalRepositoryI provides repository,
+        ) {
+            NavDisplay(
+                backStack = backStack,
+                entryProvider = entryProvider,
+                modifier = Modifier.fillMaxSize(),
+            )
+        }
+    }
+
+    @Composable
     private fun CompactTopBar(
         title: String,
         canPop: Boolean,
@@ -188,7 +234,10 @@ object SurveyAppShell {
                     horizontalArrangement = Arrangement.Start,
                 ) {
                     if (canPop) {
-                        IconButton(onClick = onBack, modifier = Modifier.size(40.dp)) {
+                        IconButton(
+                            onClick = onBack,
+                            modifier = Modifier.size(40.dp),
+                        ) {
                             Icon(
                                 imageVector = Icons.AutoMirrored.Filled.ArrowBack,
                                 contentDescription = "Back",
@@ -211,4 +260,72 @@ object SurveyAppShell {
             }
         }
     }
+
+    @Composable
+    private fun rememberShellBlockingSpec(
+        repository: ChatValidation.RepositoryI?,
+        blockingTitle: String?,
+        blockingDetail: String?,
+        showBlockingSpinner: Boolean,
+    ): ShellBlockingSpec {
+        return remember(
+            repository,
+            blockingTitle,
+            blockingDetail,
+            showBlockingSpinner,
+        ) {
+            resolveShellBlockingSpec(
+                repository = repository,
+                blockingTitle = blockingTitle,
+                blockingDetail = blockingDetail,
+                showBlockingSpinner = showBlockingSpinner,
+            )
+        }
+    }
+
+    /**
+     * Resolves a stable shell-level blocking contract from caller-provided signals.
+     *
+     * Why:
+     * - Callers currently pass service readiness and blocking message pieces separately.
+     * - The shell should derive one deterministic answer for whether blocking is visible.
+     * - This avoids subtle drift such as "detail exists but title is null" or
+     *   "repository is null but no explicit title was provided".
+     */
+    private fun resolveShellBlockingSpec(
+        repository: ChatValidation.RepositoryI?,
+        blockingTitle: String?,
+        blockingDetail: String?,
+        showBlockingSpinner: Boolean,
+    ): ShellBlockingSpec {
+        val normalizedTitle = blockingTitle?.trim().orEmpty()
+        val normalizedDetail = blockingDetail?.trim().orEmpty()
+
+        val hasBlockingMessage = normalizedTitle.isNotEmpty() || normalizedDetail.isNotEmpty()
+        val visible = repository == null || hasBlockingMessage
+
+        val title =
+            when {
+                normalizedTitle.isNotEmpty() -> normalizedTitle
+                repository == null && !showBlockingSpinner -> "App services are unavailable."
+                else -> "Preparing app services…"
+            }
+
+        return ShellBlockingSpec(
+            visible = visible,
+            title = title,
+            detail = normalizedDetail,
+            showSpinner = showBlockingSpinner,
+        )
+    }
+
+    /**
+     * Internal normalized blocking model for shell rendering.
+     */
+    private data class ShellBlockingSpec(
+        val visible: Boolean,
+        val title: String,
+        val detail: String,
+        val showSpinner: Boolean,
+    )
 }

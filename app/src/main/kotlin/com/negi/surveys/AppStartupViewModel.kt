@@ -114,6 +114,15 @@ class AppStartupViewModel(
                         "onDevice=$onDeviceEnabled keyPresent=${key != null}",
             )
 
+            /**
+             * Allow the same local file to re-trigger warmup wiring after retry.
+             *
+             * Why:
+             * - retryAll may hit the same file path / same bytes again.
+             * - Without clearing this fingerprint, onModelReady() can be skipped.
+             */
+            lastWarmupReadyFingerprint.set(null)
+
             if (onDeviceEnabled && downloader != null) {
                 runCatching {
                     downloader.resetForRetry(reason = "uiRetry")
@@ -129,7 +138,7 @@ class AppStartupViewModel(
                     runCatching {
                         downloader.ensureModelOnce(
                             timeoutMs = key.timeoutMs,
-                            forceFresh = false,
+                            forceFresh = key.forceFreshOnStart,
                             reason = "uiRetry",
                         )
                     }.onFailure { t ->
@@ -211,6 +220,27 @@ class AppStartupViewModel(
         val repoMode = computeRepoMode()
         val onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE
 
+        if (onDeviceEnabled && modelSpecKey == null) {
+            SafeLog.e(
+                TAG,
+                "Config: model download spec missing/invalid for ON_DEVICE mode",
+            )
+            _uiState.update {
+                it.copy(
+                    configState = StartupConfigState.Failed("ModelDownloadSpecMissing"),
+                    modelSpec = modelSpec,
+                    modelSpecKey = null,
+                    repoMode = repoMode,
+                    onDeviceEnabled = true,
+                    servicesReady = false,
+                    repository = null,
+                    warmup = null,
+                    modelDownloader = null,
+                )
+            }
+            return
+        }
+
         _uiState.update {
             it.copy(
                 configState = StartupConfigState.Ready(installed),
@@ -245,15 +275,28 @@ class AppStartupViewModel(
 
         val repo = AppProcessServices.repository(app, repoMode)
         val warmup = AppProcessServices.warmupController(app, repoMode)
-        val downloader = AppProcessServices.modelDownloader(
-            app,
-            spec = modelSpecKey?.let { modelSpec },
-        )
+
+        /**
+         * Important:
+         * - Do not pass null to AppProcessServices.modelDownloader() as a way to mean "disabled".
+         * - That API intentionally reuses the last non-null spec when spec == null.
+         * - Creating no downloader here avoids stale-spec resurrection.
+         */
+        val downloader =
+            if (repoMode == AppProcessServices.RepoMode.ON_DEVICE && modelSpec != null && modelSpecKey != null) {
+                AppProcessServices.modelDownloader(
+                    app,
+                    spec = modelSpec,
+                )
+            } else {
+                null
+            }
 
         SafeLog.i(
             TAG,
             "Services: obtained mode=$repoMode onDevice=${repoMode == AppProcessServices.RepoMode.ON_DEVICE} " +
-                    "keyPresent=${modelSpecKey != null} specPresent=${modelSpec != null}",
+                    "keyPresent=${modelSpecKey != null} specPresent=${modelSpec != null} " +
+                    "downloaderPresent=${downloader != null}",
         )
 
         _uiState.update {
@@ -261,8 +304,9 @@ class AppStartupViewModel(
                 repository = repo,
                 warmup = warmup,
                 modelDownloader = downloader,
-                servicesReady = true,
-                modelState = downloader.state.value,
+                servicesReady = !it.onDeviceEnabled || downloader != null,
+                modelState = downloader?.state?.value
+                    ?: ModelDownloadController.ModelState.Idle(elapsedMs = 0L),
                 prefetchState = warmup.prefetchState.value,
                 compileState = warmup.compileState.value,
             )
@@ -283,22 +327,24 @@ class AppStartupViewModel(
     private fun startCollectingServiceStates(
         repoMode: AppProcessServices.RepoMode,
         warmup: WarmupController,
-        downloader: ModelDownloadController,
+        downloader: ModelDownloadController?,
     ) {
         serviceCollectorsJob?.cancel()
 
         serviceCollectorsJob =
             viewModelScope.launch(Dispatchers.Default) {
-                launch {
-                    downloader.state.collect { modelState ->
-                        _uiState.update { it.copy(modelState = modelState) }
+                if (downloader != null) {
+                    launch {
+                        downloader.state.collect { modelState ->
+                            _uiState.update { it.copy(modelState = modelState) }
 
-                        if (modelState is ModelDownloadController.ModelState.Ready) {
-                            onModelReady(
-                                repoMode = repoMode,
-                                warmup = warmup,
-                                file = modelState.file,
-                            )
+                            if (modelState is ModelDownloadController.ModelState.Ready) {
+                                onModelReady(
+                                    repoMode = repoMode,
+                                    warmup = warmup,
+                                    file = modelState.file,
+                                )
+                            }
                         }
                     }
                 }

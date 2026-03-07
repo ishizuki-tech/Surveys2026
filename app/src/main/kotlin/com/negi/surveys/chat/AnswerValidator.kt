@@ -38,12 +38,12 @@ class AnswerValidator(
     private val streamBridge: ChatStreamBridge,
     private val timeoutMs: Long = DEFAULT_TIMEOUT_MS,
     private val maxChars: Int = 32_000,
-    private val logger: ((String) -> Unit)? = null
+    private val logger: ((String) -> Unit)? = null,
 ) : ChatValidation.AnswerValidatorI {
 
     override suspend fun validateMain(
         questionId: String,
-        answer: String
+        answer: String,
     ): ChatModels.ValidationOutcome {
         return withContext(Dispatchers.Default) {
             val t0 = SystemClock.elapsedRealtime()
@@ -53,7 +53,7 @@ class AnswerValidator(
                 phase = phase,
                 questionId = questionId,
                 mainAnswer = answer,
-                followUpAnswerPayload = null
+                followUpAnswerPayload = null,
             )
             val modelPrompt = repository.buildPrompt(userPrompt, phase)
 
@@ -63,13 +63,13 @@ class AnswerValidator(
                 promptChars = modelPrompt.length,
                 flowProvider = { repository.request(modelPrompt) },
                 timeoutMs = timeoutMs,
-                maxChars = maxChars
+                maxChars = maxChars,
             )
 
             val elapsed = SystemClock.elapsedRealtime() - t0
             log(
                 "validateMain: qid=${questionId.trim()} stop=${result.reason} " +
-                        "chars=${result.text.length} elapsedMs=$elapsed"
+                        "chars=${result.text.length} elapsedMs=$elapsed",
             )
 
             parseOutcomeOrFallback(
@@ -77,7 +77,7 @@ class AnswerValidator(
                 raw = result.text,
                 stopReason = result.reason,
                 errorToken = result.errorToken,
-                fallbackFollowUp = "Could you add one concrete detail or example?"
+                fallbackFollowUp = "Could you add one concrete detail or example?",
             )
         }
     }
@@ -85,7 +85,7 @@ class AnswerValidator(
     override suspend fun validateFollowUp(
         questionId: String,
         mainAnswer: String,
-        followUpAnswer: String
+        followUpAnswer: String,
     ): ChatModels.ValidationOutcome {
         return withContext(Dispatchers.Default) {
             val t0 = SystemClock.elapsedRealtime()
@@ -95,7 +95,7 @@ class AnswerValidator(
                 phase = phase,
                 questionId = questionId,
                 mainAnswer = mainAnswer,
-                followUpAnswerPayload = followUpAnswer
+                followUpAnswerPayload = followUpAnswer,
             )
             val modelPrompt = repository.buildPrompt(userPrompt, phase)
 
@@ -105,13 +105,13 @@ class AnswerValidator(
                 promptChars = modelPrompt.length,
                 flowProvider = { repository.request(modelPrompt) },
                 timeoutMs = timeoutMs,
-                maxChars = maxChars
+                maxChars = maxChars,
             )
 
             val elapsed = SystemClock.elapsedRealtime() - t0
             log(
                 "validateFollowUp: qid=${questionId.trim()} stop=${result.reason} " +
-                        "chars=${result.text.length} elapsedMs=$elapsed"
+                        "chars=${result.text.length} elapsedMs=$elapsed",
             )
 
             parseOutcomeOrFallback(
@@ -119,7 +119,7 @@ class AnswerValidator(
                 raw = result.text,
                 stopReason = result.reason,
                 errorToken = result.errorToken,
-                fallbackFollowUp = "Please add one short concrete detail so I can proceed."
+                fallbackFollowUp = "Please add one short concrete detail so I can proceed.",
             )
         }
     }
@@ -131,7 +131,7 @@ class AnswerValidator(
     /**
      * Build a strict JSON-only prompt with backward-compatible marker blocks.
      *
-     * IMPORTANT:
+     * Important:
      * - Phase is provided via Repository.buildPrompt(userPrompt, phase).
      * - Do NOT embed "PHASE=..." lines here to avoid contract drift.
      */
@@ -139,7 +139,7 @@ class AnswerValidator(
         phase: ChatValidation.PromptPhase,
         questionId: String,
         mainAnswer: String,
-        followUpAnswerPayload: String?
+        followUpAnswerPayload: String?,
     ): String {
         val qid = questionId.trim()
         val main = mainAnswer.trim()
@@ -147,7 +147,6 @@ class AnswerValidator(
         val fuRaw = followUpAnswerPayload?.trim().orEmpty()
         val hasFollowUp = fuRaw.isNotBlank()
 
-        // Detect "history" format. If it's not history, treat the payload as the actual follow-up answer text.
         val treatAsHistory = hasFollowUp && looksLikeFollowUpHistory(fuRaw)
 
         val extracted: FollowUpTurnExtract? = if (hasFollowUp && treatAsHistory) {
@@ -159,9 +158,7 @@ class AnswerValidator(
         val followUpAnswerText: String = when {
             !hasFollowUp -> ""
             extracted != null && extracted.answer.isNotBlank() -> extracted.answer.trim()
-            // If the payload is NOT a history format, it's a direct answer. Use it as-is.
             !treatAsHistory -> fuRaw
-            // History detected but extraction failed (rare). Fallback to raw payload (clipped below).
             else -> fuRaw
         }
 
@@ -171,18 +168,16 @@ class AnswerValidator(
         }
 
         if (hasFollowUp) {
-            // Do NOT log raw answers. Only metadata.
             val sha8 = sha256Hex(followUpAnswerText).take(8)
             log(
                 "followUpDetected: phase=${phase.name} treatAsHistory=$treatAsHistory " +
-                        "latestQlen=${followUpQuestionText.length} latestAlen=${followUpAnswerText.length} latestAsha8=$sha8"
+                        "latestQlen=${followUpQuestionText.length} latestAlen=${followUpAnswerText.length} latestAsha8=$sha8",
             )
         }
 
         val followUpSection = if (!hasFollowUp) {
             ""
         } else {
-            // Clip to keep prompt size sane (prevents prompt blowups when history is large).
             val clippedA = followUpAnswerText.safeTrimAndClip(MAX_FOLLOW_UP_ANSWER_CHARS)
             val clippedQ = followUpQuestionText.safeTrimAndClip(MAX_FOLLOW_UP_QUESTION_CHARS)
             val clippedHistory = if (treatAsHistory) fuRaw.safeTrimAndClip(MAX_FOLLOW_UP_HISTORY_CHARS) else ""
@@ -248,7 +243,7 @@ $followUpSection
         promptChars: Int,
         flowProvider: suspend () -> Flow<String>,
         timeoutMs: Long,
-        maxChars: Int
+        maxChars: Int,
     ): FlowTextCollector.Result {
         val maxCharsSafe = max(0, maxChars)
         val timeoutMsSafe = max(0L, timeoutMs)
@@ -259,7 +254,7 @@ $followUpSection
         val coalescer = StreamChunkCoalescer(
             minEmitChars = 64,
             maxEmitIntervalMs = 50L,
-            maxBufferedChars = 2048
+            maxBufferedChars = 2048,
         )
 
         return try {
@@ -274,7 +269,7 @@ $followUpSection
                         if (!out.isNullOrEmpty()) {
                             runCatching { streamBridge.emitChunk(sessionId, out) }
                         }
-                    }
+                    },
                 )
             }
 
@@ -290,7 +285,7 @@ $followUpSection
                 FlowTextCollector.StopReason.TIMEOUT -> streamBridge.error(sessionId, ChatStreamEvent.Codes.TIMEOUT)
                 FlowTextCollector.StopReason.ERROR -> streamBridge.error(
                     sessionId,
-                    result.errorToken ?: ChatStreamEvent.Codes.ERROR
+                    result.errorToken ?: ChatStreamEvent.Codes.ERROR,
                 )
             }
 
@@ -318,7 +313,7 @@ $followUpSection
             FlowTextCollector.Result(
                 text = "",
                 reason = FlowTextCollector.StopReason.ERROR,
-                errorToken = token
+                errorToken = token,
             )
         }
     }
@@ -332,7 +327,7 @@ $followUpSection
         raw: String,
         stopReason: FlowTextCollector.StopReason,
         errorToken: String?,
-        fallbackFollowUp: String
+        fallbackFollowUp: String,
     ): ChatModels.ValidationOutcome {
         val cleaned = raw
             .replace("\u0000", "")
@@ -357,13 +352,19 @@ $followUpSection
             log("parseOutcome: qid=${questionId.trim()} empty -> stop=$stopReason token=$errorToken")
             return ChatModels.ValidationOutcome(
                 status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
-                assistantMessage = msg,
-                followUpQuestion = fallbackFollowUp
+                assistantMessage = "",
+                followUpQuestion = fallbackFollowUp,
+                evalStatus = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
+                evalScore = null,
+                evalReason = msg,
             )
         }
 
-        val jsonStr = extractValidationJsonObject(cleaned)
-        if (jsonStr == null) {
+        val jsonObjects = extractJsonObjectsBestEffort(cleaned)
+        val eval = jsonObjects.mapNotNull { parseEvalJsonBestEffort(it) }.lastOrNull()
+        val verdict = jsonObjects.mapNotNull { parseVerdictJsonBestEffort(it) }.lastOrNull()
+
+        if (eval == null && verdict == null) {
             val msg = when (stopReason) {
                 FlowTextCollector.StopReason.TIMEOUT ->
                     "Validation timed out before producing a full result. One more detail would help."
@@ -378,119 +379,184 @@ $followUpSection
             log("parseOutcome: qid=${questionId.trim()} jsonNotFound -> stop=$stopReason")
             return ChatModels.ValidationOutcome(
                 status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
-                assistantMessage = msg,
-                followUpQuestion = fallbackFollowUp
+                assistantMessage = "",
+                followUpQuestion = fallbackFollowUp,
+                evalStatus = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
+                evalScore = null,
+                evalReason = msg,
             )
         }
 
-        return try {
-            val obj = JSONObject(jsonStr)
+        val finalStatus =
+            verdict?.status
+                ?: eval?.status
+                ?: ChatModels.ValidationStatus.NEED_FOLLOW_UP
 
-            val statusStr = obj.optString("status", "").trim()
-            val assistantMessage = obj
-                .optString("assistantMessage", "")
-                .replace("\u0000", "")
-                .trim()
-                .ifEmpty { "Thanks." }
+        val finalAssistantMessage =
+            verdict?.assistantMessage
+                ?.trim()
+                ?.takeIf { it.isNotBlank() }
+                .orEmpty()
 
-            val status = when (statusStr) {
-                "ACCEPTED" -> ChatModels.ValidationStatus.ACCEPTED
-                "NEED_FOLLOW_UP" -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
-                else -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
-            }
-
-            val followUpNormalized = normalizeFollowUpQuestion(obj.optString("followUpQuestion", ""))
-
-            if (status == ChatModels.ValidationStatus.ACCEPTED) {
-                ChatModels.ValidationOutcome(
-                    status = ChatModels.ValidationStatus.ACCEPTED,
-                    assistantMessage = assistantMessage,
-                    followUpQuestion = null
-                )
-            } else {
-                ChatModels.ValidationOutcome(
-                    status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
-                    assistantMessage = assistantMessage,
-                    followUpQuestion = followUpNormalized ?: fallbackFollowUp
-                )
-            }
-        } catch (_: Throwable) {
-            log("parseOutcome: qid=${questionId.trim()} jsonParseError -> fallback NEED_FOLLOW_UP stop=$stopReason")
-            ChatModels.ValidationOutcome(
-                status = ChatModels.ValidationStatus.NEED_FOLLOW_UP,
-                assistantMessage = "Validation output was malformed. Please add one more detail.",
-                followUpQuestion = fallbackFollowUp
-            )
+        val finalFollowUp = when (finalStatus) {
+            ChatModels.ValidationStatus.ACCEPTED -> null
+            ChatModels.ValidationStatus.NEED_FOLLOW_UP ->
+                normalizeFollowUpQuestion(verdict?.followUpQuestion) ?: fallbackFollowUp
         }
+
+        val finalEvalStatus =
+            eval?.status
+                ?: verdict?.status
+                ?: finalStatus
+
+        return ChatModels.ValidationOutcome(
+            status = finalStatus,
+            assistantMessage = finalAssistantMessage,
+            followUpQuestion = finalFollowUp,
+            evalStatus = finalEvalStatus,
+            evalScore = eval?.score,
+            evalReason = eval?.reason,
+        )
+    }
+
+    private data class EvalJson(
+        val status: ChatModels.ValidationStatus?,
+        val score: Int?,
+        val reason: String?,
+    )
+
+    private data class VerdictJson(
+        val status: ChatModels.ValidationStatus?,
+        val assistantMessage: String?,
+        val followUpQuestion: String?,
+    )
+
+    private fun parseEvalJsonBestEffort(json: String): EvalJson? {
+        if (json.isBlank()) return null
+
+        return runCatching {
+            val obj = JSONObject(json)
+            if (!obj.has("score")) return null
+
+            val status = parseStatus(obj.optString("status", "").trim())
+            val score = parseOptionalScore(obj)
+            val reason = obj.optString("reason", "").replace("\u0000", "").trim().ifBlank { null }
+
+            if (status == null && score == null && reason == null) return null
+            EvalJson(
+                status = status,
+                score = score,
+                reason = reason,
+            )
+        }.getOrNull()
+    }
+
+    private fun parseVerdictJsonBestEffort(json: String): VerdictJson? {
+        if (json.isBlank()) return null
+
+        return runCatching {
+            val obj = JSONObject(json)
+
+            val assistantMessage =
+                obj.optString("assistantMessage", "")
+                    .replace("\u0000", "")
+                    .trim()
+                    .ifBlank { null }
+
+            val followUpQuestion =
+                obj.optString("followUpQuestion", "")
+                    .replace("\u0000", "")
+                    .trim()
+                    .ifBlank { null }
+
+            val status = parseStatus(obj.optString("status", "").trim())
+
+            if (assistantMessage == null && followUpQuestion == null && status == null) return null
+
+            VerdictJson(
+                status = status,
+                assistantMessage = assistantMessage,
+                followUpQuestion = followUpQuestion,
+            )
+        }.getOrNull()
+    }
+
+    private fun parseStatus(statusStr: String): ChatModels.ValidationStatus? {
+        return when (statusStr) {
+            "ACCEPTED" -> ChatModels.ValidationStatus.ACCEPTED
+            "NEED_FOLLOW_UP" -> ChatModels.ValidationStatus.NEED_FOLLOW_UP
+            else -> null
+        }
+    }
+
+    private fun parseOptionalScore(obj: JSONObject): Int? {
+        if (!obj.has("score")) return null
+
+        return runCatching {
+            when (val raw = obj.get("score")) {
+                is Number -> raw.toInt()
+                is String -> raw.trim().toInt()
+                else -> null
+            }
+        }.getOrNull()?.coerceIn(0, 100)
     }
 
     /**
-     * Extract a single JSON object from a blob (tolerant to prefixed garbage).
+     * Extract complete JSON objects from a mixed text blob.
      */
-    private fun extractValidationJsonObject(text: String): String? {
-        if (text.isBlank()) return null
+    private fun extractJsonObjectsBestEffort(text: String): List<String> {
+        if (text.isBlank()) return emptyList()
 
-        var cursor = 0
-        while (cursor < text.length) {
-            val start = text.indexOf('{', cursor)
-            if (start < 0) return null
+        val out = ArrayList<String>(4)
 
-            val candidate = extractJsonObjectAt(text, start)
-            if (candidate == null) {
-                cursor = start + 1
-                continue
-            }
-
-            if (!candidate.contains("\"status\"")) {
-                cursor = start + 1
-                continue
-            }
-
-            val ok = runCatching {
-                val obj = JSONObject(candidate)
-                obj.optString("status", "").trim().isNotEmpty()
-            }.getOrDefault(false)
-
-            if (ok) return candidate
-            cursor = start + 1
-        }
-
-        return null
-    }
-
-    private fun extractJsonObjectAt(text: String, start: Int): String? {
-        if (start < 0 || start >= text.length || text[start] != '{') return null
-
-        var i = start
+        var start = -1
         var depth = 0
         var inString = false
         var escape = false
 
-        while (i < text.length) {
+        for (i in text.indices) {
             val c = text[i]
-            if (inString) {
-                if (escape) {
+
+            if (start < 0) {
+                if (c == '{') {
+                    start = i
+                    depth = 1
+                    inString = false
                     escape = false
-                } else {
-                    when (c) {
-                        '\\' -> escape = true
-                        '"' -> inString = false
-                    }
                 }
-            } else {
-                when (c) {
-                    '"' -> inString = true
-                    '{' -> depth++
-                    '}' -> {
-                        depth--
-                        if (depth == 0) return text.substring(start, i + 1).trim()
-                        if (depth < 0) return null
+                continue
+            }
+
+            if (escape) {
+                escape = false
+                continue
+            }
+
+            if (c == '\\' && inString) {
+                escape = true
+                continue
+            }
+
+            if (c == '"') {
+                inString = !inString
+                continue
+            }
+
+            if (inString) continue
+
+            when (c) {
+                '{' -> depth += 1
+                '}' -> {
+                    depth -= 1
+                    if (depth == 0) {
+                        out.add(text.substring(start, i + 1).trim())
+                        start = -1
                     }
                 }
             }
-            i++
         }
-        return null
+
+        return out
     }
 
     private fun normalizeFollowUpQuestion(text: String?): String? {
@@ -505,7 +571,7 @@ $followUpSection
             "follow up:",
             "followup:",
             "question:",
-            "next question:"
+            "next question:",
         )
 
         val lower0 = t.lowercase(Locale.US)
@@ -520,7 +586,7 @@ $followUpSection
         val garbage = setOf(
             "none", "(none)", "n/a", "na", "null", "nil",
             "no", "nope", "no follow up", "no follow-up",
-            "skip", "0", "-"
+            "skip", "0", "-",
         )
         if (l2 in garbage) return null
         if (t.length < 3) return null
@@ -609,12 +675,15 @@ $followUpSection
         val a = (currentA ?: latestA).orEmpty().trim()
 
         if (q.isBlank() && a.isBlank()) return null
-        return FollowUpTurnExtract(question = q, answer = a)
+        return FollowUpTurnExtract(
+            question = q,
+            answer = a,
+        )
     }
 
     private data class FollowUpTurnExtract(
         val question: String,
-        val answer: String
+        val answer: String,
     )
 
     // ---------------------------------------------------------------------
@@ -638,13 +707,13 @@ $followUpSection
      * Coalesce streaming chunks to reduce UI event pressure.
      *
      * Guarantees:
-     * - Does not drop data (only batches).
+     * - Does not drop data.
      * - Flushes on buffer cap, time interval, chunk size, or newline.
      */
     private class StreamChunkCoalescer(
         private val minEmitChars: Int,
         private val maxEmitIntervalMs: Long,
-        private val maxBufferedChars: Int
+        private val maxBufferedChars: Int,
     ) {
         private val buffer = StringBuilder()
         private var lastEmitMs: Long = SystemClock.uptimeMillis()
@@ -682,7 +751,7 @@ $followUpSection
         }
 
         private fun flushInternal(nowMs: Long): String? {
-            if (buffer.length == 0) return null
+            if (buffer.isEmpty()) return null
             val out = buffer.toString()
             buffer.setLength(0)
             lastEmitMs = nowMs
@@ -717,18 +786,14 @@ $followUpSection
 
     private companion object {
         private const val TAG = "AnswerValidator"
-
         private const val DEFAULT_TIMEOUT_MS = 90_000L
 
-        // Prompt-size guards (avoid giant follow-up payloads causing prompt bloat).
         private const val MAX_FOLLOW_UP_ANSWER_CHARS = 8_000
         private const val MAX_FOLLOW_UP_QUESTION_CHARS = 2_000
         private const val MAX_FOLLOW_UP_HISTORY_CHARS = 16_000
 
-        // Hex table for sha256 logging tokens.
         private const val HEX = "0123456789abcdef"
 
-        // Precompiled regex (avoid per-call allocations).
         private val FOLLOW_UP_HISTORY_LINE_RE = Regex("""^FOLLOW_UP_\d+_[QA]:\s*.*$""")
         private val CURRENT_Q_RE = Regex("""^CURRENT_FOLLOW_UP_Q:\s*(.*)$""")
         private val CURRENT_A_RE = Regex("""^CURRENT_FOLLOW_UP_A:\s*(.*)$""")
@@ -736,7 +801,7 @@ $followUpSection
         private val TURN_A_RE = Regex("""^FOLLOW_UP_(\d+)_A:\s*(.*)$""")
 
         private val ANY_MARKER_RE = Regex(
-            """^(CURRENT_FOLLOW_UP_[QA]|FOLLOW_UP_\d+_[QA]|FOLLOW_UP_TURNS:|FOLLOW_UP_HISTORY_BEGIN|FOLLOW_UP_HISTORY_END)\s*:?.*$"""
+            """^(CURRENT_FOLLOW_UP_[QA]|FOLLOW_UP_\d+_[QA]|FOLLOW_UP_TURNS:|FOLLOW_UP_HISTORY_BEGIN|FOLLOW_UP_HISTORY_END)\s*:?.*$""",
         )
     }
 }
