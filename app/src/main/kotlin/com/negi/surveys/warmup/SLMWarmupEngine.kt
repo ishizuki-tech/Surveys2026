@@ -63,7 +63,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  * - Best-effort EGL context warmup (optional).
  *
  * Key invariants:
- * - Public entrypoints MUST NOT block the caller thread.
+ * - Public entry points MUST NOT block the caller thread.
  * - This engine MUST NOT throw.
  * - "Not ready yet" is treated as retryable.
  *

@@ -15,6 +15,7 @@ package com.negi.surveys.slm
 
 import android.content.Context
 import com.google.ai.edge.litertlm.Message
+import com.negi.surveys.AppProcessServices
 import com.negi.surveys.chat.ChatModels
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatStreamEvent
@@ -25,6 +26,7 @@ import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.NodeType
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.config.SurveyConfigLoader
+import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.AppLog
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.warmup.WarmupController
@@ -151,12 +153,11 @@ class SlmRepository(
         if (input.isBlank()) return emptyFlow()
 
         val cfg = getConfigSuspendBestEffort()
-        val file = resolveModelFile(cfg)
-        val stat = safeFileStat(file)
-        if (!stat.exists || !stat.isFile || stat.length <= 0L) {
-            AppLog.w(TAG, "Model not ready: exists=${stat.exists} isFile=${stat.isFile} len=${stat.length}")
-            throw ModelNotReadyException("Model file missing or empty")
-        }
+        val file = resolveConfiguredReadyModelFileOrNull(cfg)
+            ?: run {
+                AppLog.w(TAG, "Model not ready: configured local model unavailable")
+                throw ModelNotReadyException("Configured local model is missing or unusable")
+            }
 
         val model = getOrCreateModel(cfg = cfg, file = file)
         withContext(Dispatchers.Default) {
@@ -177,11 +178,8 @@ class SlmRepository(
         streamBridge: ChatStreamBridge?,
     ): ChatValidation.TwoStepAssessmentResult {
         val cfg = getConfigSuspendBestEffort()
-        val file = resolveModelFile(cfg)
-        val stat = safeFileStat(file)
-        if (!stat.exists || !stat.isFile || stat.length <= 0L) {
-            throw ModelNotReadyException("Model file missing or empty")
-        }
+        val file = resolveConfiguredReadyModelFileOrNull(cfg)
+            ?: throw ModelNotReadyException("Configured local model is missing or unusable")
 
         val model = getOrCreateModel(cfg = cfg, file = file)
         withContext(Dispatchers.Default) {
@@ -344,12 +342,8 @@ class SlmRepository(
         options: WarmupController.Options,
     ): Boolean {
         val cfg = InstalledSurveyConfigStore.getOrNull() ?: cachedConfig.get()
-        val stat = safeFileStat(modelFile)
-        if (!stat.exists || !stat.isFile || stat.length <= 0L) {
-            AppLog.w(
-                TAG,
-                "warmup: skipped (model file missing/empty) exists=${stat.exists} isFile=${stat.isFile} len=${stat.length}",
-            )
+        if (!AppProcessServices.isUsableLocalModelFile(modelFile)) {
+            AppLog.w(TAG, "warmup: skipped (model file missing or unusable)")
             return false
         }
 
@@ -1526,33 +1520,13 @@ class SlmRepository(
         }
     }
 
-    private fun resolveModelFile(cfg: SurveyConfig?): File {
-        val rawFileName = cfg?.modelDefaults?.defaultFileName?.trim()?.takeIf { it.isNotBlank() } ?: fallbackModelFileName
-        val safeName = sanitizeSimpleFileName(rawFileName) ?: fallbackModelFileName
-        return File(appContext.filesDir, safeName)
-    }
-
-    private fun sanitizeSimpleFileName(name: String): String? {
-        val n = name.trim()
-        if (n.isBlank()) return null
-        if (n.contains('/') || n.contains('\\')) return null
-        if (n.contains("..")) return null
-        if (n.length > 200) return null
-        return n
-    }
-
-    private data class FileStat(
-        val exists: Boolean,
-        val isFile: Boolean,
-        val length: Long,
-    )
-
-    private fun safeFileStat(file: File): FileStat {
-        return runCatching {
-            FileStat(exists = file.exists(), isFile = file.isFile, length = file.length())
-        }.getOrElse {
-            FileStat(exists = false, isFile = false, length = 0L)
-        }
+    private fun resolveConfiguredReadyModelFileOrNull(cfg: SurveyConfig?): File? {
+        val spec = cfg?.resolveModelDownloadSpec()
+        val file = AppProcessServices.resolveConfiguredLocalModelFileOrNull(
+            context = appContext,
+            spec = spec,
+        )
+        return file?.takeIf { AppProcessServices.isUsableLocalModelFile(it) }
     }
 
     private fun getOrCreateModel(cfg: SurveyConfig?, file: File): Model {
