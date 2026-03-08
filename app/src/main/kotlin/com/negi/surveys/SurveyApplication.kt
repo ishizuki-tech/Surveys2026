@@ -121,22 +121,15 @@ class SurveyApplication : Application() {
         }
 
         runCatching {
-            val cfg = SurveyConfigLoader.fromAssetsValidated(appContext, CONFIG_ASSET_NAME)
-            when (InstalledSurveyConfigStore.installOnce(cfg)) {
-                InstalledSurveyConfigStore.InstallResult.INSTALLED -> {
-                    SafeLog.i(
-                        TAG,
-                        "Config install: success dt=${SystemClock.elapsedRealtime() - tCfg}ms",
-                    )
-                }
-
-                InstalledSurveyConfigStore.InstallResult.ALREADY_INSTALLED -> {
-                    SafeLog.w(
-                        TAG,
-                        "Config install: ignored duplicate install dt=${SystemClock.elapsedRealtime() - tCfg}ms",
-                    )
-                }
-            }
+            SurveyConfigLoader.installProcessConfigFromAssetsValidated(
+                context = appContext,
+                fileName = CONFIG_ASSET_NAME,
+            )
+        }.onSuccess {
+            SafeLog.i(
+                TAG,
+                "Config install: success dt=${SystemClock.elapsedRealtime() - tCfg}ms",
+            )
         }.onFailure { t ->
             // Important: Do not log exception.message.
             SafeLog.e(TAG, "Config install: failed (non-fatal) ${t.safeTypeAndHint()}")

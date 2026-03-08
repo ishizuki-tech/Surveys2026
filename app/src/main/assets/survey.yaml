@@ -198,3 +198,7 @@ model_defaults:
   timeout_ms: 1800000
   ui_throttle_ms: 250
   ui_min_delta_bytes: 1048576
+
+debug:
+  enable_slm_debug_logs: true
+  stream_eval_output_to_client: false

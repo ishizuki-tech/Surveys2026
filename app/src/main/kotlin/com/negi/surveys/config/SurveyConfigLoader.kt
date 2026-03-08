@@ -78,7 +78,8 @@ data class SurveyConfig(
     val graph: Graph,
     val slm: SlmMeta = SlmMeta(),
     val whisper: WhisperMeta = WhisperMeta(),
-    @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults()
+    @SerialName("model_defaults") val modelDefaults: ModelDefaults = ModelDefaults(),
+    @SerialName("debug") val debug: DebugMeta = DebugMeta(),
 ) {
 
     /**
@@ -235,6 +236,12 @@ data class SurveyConfig(
         @SerialName("timeout_ms") val timeoutMs: Long? = null,
         @SerialName("ui_throttle_ms") val uiThrottleMs: Long? = null,
         @SerialName("ui_min_delta_bytes") val uiMinDeltaBytes: Long? = null
+    )
+
+    @Serializable
+    data class DebugMeta(
+        @SerialName("enable_slm_debug_logs") val enableSlmDebugLogs: Boolean? = null,
+        @SerialName("stream_eval_output_to_client") val streamEvalOutputToClient: Boolean? = null,
     )
 
     /**
@@ -1091,6 +1098,29 @@ object SurveyConfigLoader {
                 AppLog.w(TAG, "installProcessConfig: ignored duplicate process install")
             }
         }
+    }
+
+    /**
+     * Loads, validates, and installs the process-wide config from assets.
+     *
+     * Notes:
+     * - First successful install wins.
+     * - Returns the installed config snapshot for the current process.
+     */
+    fun installProcessConfigFromAssetsValidated(
+        context: Context,
+        fileName: String,
+        charset: Charset = Charsets.UTF_8,
+        format: ConfigFormat = ConfigFormat.AUTO,
+    ): SurveyConfig {
+        val cfg = fromAssetsValidated(
+            context = context,
+            fileName = fileName,
+            charset = charset,
+            format = format,
+        )
+        installProcessConfig(cfg)
+        return getInstalledConfigOrNull() ?: cfg
     }
 
     /** Returns the installed process config if present, otherwise null. */
