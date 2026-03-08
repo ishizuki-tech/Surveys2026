@@ -21,7 +21,6 @@ import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.config.SurveyConfig
-import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.utils.ModelDownloadController
@@ -45,7 +44,6 @@ import kotlinx.coroutines.launch
  *
  * Responsibilities:
  * - Wait for the Application-installed SurveyConfig.
- * - Recover installed config best-effort when bootstrap did not install it.
  * - Resolve model download spec and repo mode.
  * - Obtain process-scoped repository / warmup / downloader instances.
  * - Collect downloader + warmup states once and expose a single UI state.
@@ -145,14 +143,34 @@ class AppStartupViewModel(
                     _uiState.update {
                         it.copy(
                             modelState = localReadyModelState(localFile),
-                            servicesReady = true,
+                            servicesReady = false,
                         )
                     }
-                    onModelReady(
-                        repoMode = current.repoMode,
-                        warmup = warmup,
-                        file = localFile,
-                    )
+
+                    val localWarmupReady =
+                        onModelReady(
+                            repoMode = current.repoMode,
+                            warmup = warmup,
+                            file = localFile,
+                        )
+
+                    _uiState.update {
+                        it.copy(
+                            servicesReady = deriveServicesReady(
+                                onDeviceEnabled = it.onDeviceEnabled,
+                                downloader = it.modelDownloader,
+                                localWarmupReady = localWarmupReady,
+                            ),
+                        )
+                    }
+
+                    if (!localWarmupReady) {
+                        SafeLog.w(
+                            TAG,
+                            "RetryAll: local-only warmup wiring did not complete; leaving servicesReady=false",
+                        )
+                    }
+
                     return@launch
                 }
 
@@ -245,20 +263,17 @@ class AppStartupViewModel(
     }
 
     /**
-     * Waits briefly for the process-installed config and then builds process-scoped services.
+     * Waits briefly for the Application-installed config and then builds process-scoped services.
      */
     private suspend fun awaitInstalledConfigAndBuildServices() {
         val t0 = SystemClock.elapsedRealtime()
         SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
 
-        var installed = waitForInstalledConfigOrNull(deadlineAt = t0 + INSTALLED_CONFIG_WAIT_MS)
-        if (installed == null) {
-            installed = recoverInstalledConfigBestEffort()
-        }
+        val installed = waitForInstalledConfigOrNull(deadlineAt = t0 + INSTALLED_CONFIG_WAIT_MS)
 
         if (installed == null) {
             val dt = SystemClock.elapsedRealtime() - t0
-            SafeLog.e(TAG, "Config: missing (installed config not found) after ${dt}ms")
+            SafeLog.e(TAG, "Config: missing (Application install not observed) after ${dt}ms")
             failStartup(
                 safeReason = "InstalledConfigMissing",
                 repoMode = computeRepoMode(),
@@ -333,50 +348,6 @@ class AppStartupViewModel(
     }
 
     /**
-     * Performs a best-effort fallback install when bootstrap did not populate the store.
-     *
-     * Design:
-     * - Application remains the primary owner of initial config installation.
-     * - This path exists only so retry can genuinely recover within the same process.
-     * - The loaded config is validated before being installed into the process store.
-     *
-     * Privacy:
-     * - Never logs exception.message.
-     */
-    private fun recoverInstalledConfigBestEffort(): SurveyConfig? {
-        SafeLog.w(TAG, "Config: fallback install attempt")
-
-        val loaded =
-            runCatching {
-                SurveyConfigLoader.fromAssetsValidated(
-                    context = app,
-                    fileName = CONFIG_ASSET_NAME,
-                )
-            }.onFailure { t ->
-                SafeLog.e(
-                    TAG,
-                    "Config: fallback load failed type=${t::class.java.simpleName}",
-                )
-            }.getOrNull()
-
-        if (loaded == null) {
-            return InstalledSurveyConfigStore.getOrNull()
-        }
-
-        return when (InstalledSurveyConfigStore.installOnce(loaded)) {
-            InstalledSurveyConfigStore.InstallResult.INSTALLED -> {
-                SafeLog.i(TAG, "Config: fallback install succeeded")
-                loaded
-            }
-
-            InstalledSurveyConfigStore.InstallResult.ALREADY_INSTALLED -> {
-                SafeLog.w(TAG, "Config: fallback install reused existing store value")
-                InstalledSurveyConfigStore.getOrNull()
-            }
-        }
-    }
-
-    /**
      * Obtains process-scoped services and starts centralized state collection.
      *
      * Notes:
@@ -399,9 +370,9 @@ class AppStartupViewModel(
 
                 /**
                  * Important:
-                 * - Do not pass null to AppProcessServices.modelDownloader() as a way to mean "disabled".
-                 * - That API intentionally reuses the last non-null spec when spec == null.
-                 * - Creating no downloader here avoids stale-spec resurrection.
+                 * - Downloader enable/disable is explicit.
+                 * - A missing spec means "disable downloader now", not "reuse previous spec".
+                 * - This prevents stale remote-download state from surviving a switch to local-only mode.
                  */
                 val downloader =
                     if (
@@ -411,6 +382,7 @@ class AppStartupViewModel(
                     ) {
                         AppProcessServices.modelDownloader(app, spec = modelSpec)
                     } else {
+                        AppProcessServices.clearModelDownloader()
                         null
                     }
 
@@ -455,7 +427,11 @@ class AppStartupViewModel(
                 repository = services.repository,
                 warmup = services.warmup,
                 modelDownloader = services.downloader,
-                servicesReady = !it.onDeviceEnabled || services.downloader != null || initialLocalModelFile != null,
+                servicesReady = deriveServicesReady(
+                    onDeviceEnabled = it.onDeviceEnabled,
+                    downloader = services.downloader,
+                    localWarmupReady = false,
+                ),
                 modelState = initialModelState,
                 prefetchState = services.warmup.prefetchState.value,
                 compileState = services.warmup.compileState.value,
@@ -469,11 +445,29 @@ class AppStartupViewModel(
         )
 
         if (initialLocalModelFile != null) {
-            onModelReady(
-                repoMode = repoMode,
-                warmup = services.warmup,
-                file = initialLocalModelFile,
-            )
+            val localWarmupReady =
+                onModelReady(
+                    repoMode = repoMode,
+                    warmup = services.warmup,
+                    file = initialLocalModelFile,
+                )
+
+            _uiState.update {
+                it.copy(
+                    servicesReady = deriveServicesReady(
+                        onDeviceEnabled = it.onDeviceEnabled,
+                        downloader = it.modelDownloader,
+                        localWarmupReady = localWarmupReady,
+                    ),
+                )
+            }
+
+            if (!localWarmupReady) {
+                SafeLog.w(
+                    TAG,
+                    "Services: local model found but warmup wiring did not complete; servicesReady stays false",
+                )
+            }
         }
 
         tryStartStartup(reason = "servicesReady")
@@ -583,6 +577,10 @@ class AppStartupViewModel(
     /**
      * Wires warmup inputs once a concrete local model file is ready.
      *
+     * Returns:
+     * - true when warmup wiring is already satisfied or newly completed.
+     * - false when input injection or compile scheduling did not complete.
+     *
      * Notes:
      * - This is intentionally idempotent.
      * - The in-memory fingerprint never stores or logs file paths.
@@ -592,12 +590,12 @@ class AppStartupViewModel(
         repoMode: AppProcessServices.RepoMode,
         warmup: WarmupController,
         file: File,
-    ) {
-        if (repoMode != AppProcessServices.RepoMode.ON_DEVICE) return
+    ): Boolean {
+        if (repoMode != AppProcessServices.RepoMode.ON_DEVICE) return false
 
         val fingerprint = ModelReadyFingerprint.from(file)
         val previous = lastWarmupReadyFingerprint.get()
-        if (previous == fingerprint) return
+        if (previous == fingerprint) return true
 
         val inputsUpdated =
             runCatching {
@@ -614,7 +612,7 @@ class AppStartupViewModel(
                 )
             }.isSuccess
 
-        if (!inputsUpdated) return
+        if (!inputsUpdated) return false
 
         val compileRequested =
             runCatching {
@@ -629,6 +627,26 @@ class AppStartupViewModel(
         if (compileRequested) {
             lastWarmupReadyFingerprint.set(fingerprint)
         }
+
+        return compileRequested
+    }
+
+    /**
+     * Derives whether startup services are truly ready for the current mode.
+     *
+     * Notes:
+     * - Remote on-device mode is ready once the downloader exists.
+     * - Local-only on-device mode is ready only after warmup wiring succeeds.
+     * - Non-on-device mode is ready once the repository graph is built.
+     */
+    private fun deriveServicesReady(
+        onDeviceEnabled: Boolean,
+        downloader: ModelDownloadController?,
+        localWarmupReady: Boolean,
+    ): Boolean {
+        if (!onDeviceEnabled) return true
+        if (downloader != null) return true
+        return localWarmupReady
     }
 
     /**
@@ -832,7 +850,6 @@ class AppStartupViewModel(
 
     companion object {
         private const val TAG = "AppStartupViewModel"
-        private const val CONFIG_ASSET_NAME = "survey.yaml"
         private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
         private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
         private const val STARTUP_AFTER_FIRST_FRAME_DELAY_MS: Long = 150L

@@ -19,6 +19,7 @@ import androidx.lifecycle.viewModelScope
 import com.negi.surveys.chat.ChatModels.ChatMessage
 import com.negi.surveys.chat.ChatModels.ChatRole
 import com.negi.surveys.chat.ChatModels.ChatStreamState
+import com.negi.surveys.chat.ChatModels.ModelPhase
 import com.negi.surveys.logging.AppLog
 import java.security.MessageDigest
 import java.util.Collections
@@ -57,10 +58,9 @@ import kotlinx.coroutines.withContext
  *   [ChatModels.ValidationOutcome].
  *
  * Persistence policy:
- * - Live UI may contain ephemeral MODEL bubbles.
- * - Persisted drafts must exclude ephemeral MODEL bubbles and keep only stable
- *   assistant-side step details.
- * - Legacy assistant streamText is migrated into step2Raw when possible.
+ * - Live UI may contain one ephemeral streaming MODEL bubble.
+ * - Final step-1 / step-2 JSON is persisted as stable MODEL messages.
+ * - Legacy assistant-side raw fields are migrated into stable MODEL messages on restore.
  *
  * Robustness policy:
  * - Show TTFT by creating a placeholder MODEL bubble immediately on submit.
@@ -277,6 +277,19 @@ class ChatQuestionViewModel(
     @Volatile
     private var activeAttemptId: Long = 0L
 
+    /**
+     * Tracks whether the current attempt has already committed a stable step-1 MODEL message.
+     *
+     * Notes:
+     * - Step-1 may be finalized immediately when its streaming phase ends.
+     * - The final validator outcome can arrive later; avoid appending a duplicate step-1 MODEL entry.
+     */
+    @Volatile
+    private var committedStep1AttemptId: Long = 0L
+
+    @Volatile
+    private var committedStep1Raw: String? = null
+
     private val streamCollector = StreamCollector()
 
     init {
@@ -314,6 +327,7 @@ class ChatQuestionViewModel(
 
         val attemptId = attemptCounter.incrementAndGet()
         activeAttemptId = attemptId
+        resetCommittedModelStateForNewAttempt()
 
         _input.value = ""
         schedulePersistDraftForInput("submit.clearInput")
@@ -367,6 +381,7 @@ class ChatQuestionViewModel(
         validationJob?.cancel()
         validationJob = null
         _isBusy.value = false
+        resetCommittedModelStateForNewAttempt()
 
         closeStreamWindow("cancelValidation")
 
@@ -405,6 +420,7 @@ class ChatQuestionViewModel(
         val didRequestCancel = requestStreamCancel()
         suppressNextCancelledError.set(didRequestCancel)
         closeStreamWindow("validationFailure")
+        resetCommittedModelStateForNewAttempt()
 
         withContext(Dispatchers.Main.immediate) {
             if (activeAttemptId != attemptId) return@withContext
@@ -475,14 +491,15 @@ class ChatQuestionViewModel(
             null
         }
 
+        appendModelOutcome(
+            step1Raw = out.step1Raw,
+            step2Raw = out.step2Raw,
+            attemptId = attemptId,
+        )
+
         appendAssistantOutcome(
             assistantMessage = out.assistantMessage,
             followUpQuestion = followUp,
-            evalStatus = out.evalStatus,
-            evalScore = out.evalScore,
-            evalReason = out.evalReason,
-            step1Raw = out.step1Raw,
-            step2Raw = out.step2Raw,
         )
 
         if (!isAttemptActive(attemptId)) return
@@ -543,14 +560,15 @@ class ChatQuestionViewModel(
             null
         }
 
+        appendModelOutcome(
+            step1Raw = out.step1Raw,
+            step2Raw = out.step2Raw,
+            attemptId = attemptId,
+        )
+
         appendAssistantOutcome(
             assistantMessage = out.assistantMessage,
             followUpQuestion = followUp,
-            evalStatus = out.evalStatus,
-            evalScore = out.evalScore,
-            evalReason = out.evalReason,
-            step1Raw = out.step1Raw,
-            step2Raw = out.step2Raw,
         )
 
         if (!isAttemptActive(attemptId)) return
@@ -624,6 +642,7 @@ class ChatQuestionViewModel(
                 m.copy(
                     role = ChatRole.MODEL,
                     text = retained,
+                    modelPhase = m.modelPhase,
                     streamText = retained,
                     streamState = if (retained.isNotBlank()) ChatStreamState.ENDED else ChatStreamState.NONE,
                     streamCollapsed = false,
@@ -648,6 +667,7 @@ class ChatQuestionViewModel(
 
         val bubble = ChatMessage.modelStreaming(
             id = id,
+            phase = phaseToModelPhase(ChatStreamEvent.Phase.STEP1_EVAL),
             text = phasePlaceholderText(ChatStreamEvent.Phase.STEP1_EVAL),
             streamSessionId = null,
         )
@@ -667,6 +687,13 @@ class ChatQuestionViewModel(
         return when (phase) {
             ChatStreamEvent.Phase.STEP1_EVAL -> "[Step 1]\n"
             ChatStreamEvent.Phase.STEP2_FOLLOW_UP -> "[Step 2]\n"
+        }
+    }
+
+    private fun phaseToModelPhase(phase: ChatStreamEvent.Phase): ModelPhase {
+        return when (phase) {
+            ChatStreamEvent.Phase.STEP1_EVAL -> ModelPhase.STEP1_EVAL
+            ChatStreamEvent.Phase.STEP2_FOLLOW_UP -> ModelPhase.STEP2_FOLLOW_UP
         }
     }
 
@@ -759,16 +786,9 @@ class ChatQuestionViewModel(
     private fun appendAssistantOutcome(
         assistantMessage: String,
         followUpQuestion: String?,
-        evalStatus: ChatModels.ValidationStatus?,
-        evalScore: Int?,
-        evalReason: String?,
-        step1Raw: String?,
-        step2Raw: String?,
     ) {
         val a = assistantMessage.trim()
         val q = followUpQuestion.normalizedOptionalText()
-        val cleanedStep1Raw = step1Raw.normalizedOptionalText()
-        val cleanedStep2Raw = step2Raw.normalizedOptionalText()
 
         val composite = buildString {
             if (a.isNotEmpty()) append(a)
@@ -785,15 +805,72 @@ class ChatQuestionViewModel(
             assistantMessage = a,
             followUpQuestion = q,
             textFallback = composite,
-            evalStatus = evalStatus,
-            evalScore = evalScore,
-            evalReason = evalReason?.trim()?.takeIf { it.isNotEmpty() },
-            step1Raw = cleanedStep1Raw,
-            step2Raw = cleanedStep2Raw,
         )
 
         appendMessageInternal(msg, "appendAssistantOutcome")
         safePersistDraft("appendAssistantOutcome")
+    }
+
+    private fun resetCommittedModelStateForNewAttempt() {
+        committedStep1AttemptId = 0L
+        committedStep1Raw = null
+    }
+
+    private fun markStep1CommittedForActiveAttempt(raw: String) {
+        val attemptId = activeAttemptId
+        if (attemptId <= 0L) return
+        committedStep1AttemptId = attemptId
+        committedStep1Raw = raw
+    }
+
+    private fun hasCommittedStep1ForAttempt(attemptId: Long): Boolean {
+        return committedStep1AttemptId == attemptId
+    }
+
+    private fun appendStableModelMessage(
+        phase: ModelPhase,
+        rawText: String,
+        reason: String,
+    ) {
+        appendMessageInternal(
+            ChatMessage.modelFinal(
+                id = UUID.randomUUID().toString(),
+                phase = phase,
+                text = rawText,
+            ),
+            reason,
+        )
+    }
+
+
+    private fun appendModelOutcome(
+        step1Raw: String?,
+        step2Raw: String?,
+        attemptId: Long,
+    ) {
+        val cleanedStep1Raw = step1Raw.normalizedOptionalText()
+        val cleanedStep2Raw = step2Raw.normalizedOptionalText()
+
+        clearActiveStreamUi("appendModelOutcome")
+
+        if (cleanedStep1Raw != null && !hasCommittedStep1ForAttempt(attemptId)) {
+            appendStableModelMessage(
+                phase = ModelPhase.STEP1_EVAL,
+                rawText = cleanedStep1Raw,
+                reason = "appendModelOutcome.step1",
+            )
+            markStep1CommittedForActiveAttempt(cleanedStep1Raw)
+        }
+
+        if (cleanedStep2Raw != null) {
+            appendStableModelMessage(
+                phase = ModelPhase.STEP2_FOLLOW_UP,
+                rawText = cleanedStep2Raw,
+                reason = "appendModelOutcome.step2",
+            )
+        }
+
+        safePersistDraft("appendModelOutcome")
     }
 
     private fun removeMessage(id: String) {
@@ -906,25 +983,42 @@ class ChatQuestionViewModel(
                 return
             }
 
+            val streamedRaw = buf.toString().normalizedOptionalText()
             val rendered = renderPhaseText(phase = phase, body = buf.toString())
 
             withContext(Dispatchers.Main.immediate) {
                 val id = localStreamMsgId
-                if (id != null) {
+
+                if (phase == ChatStreamEvent.Phase.STEP1_EVAL && id != null && streamedRaw != null) {
+                    updateMessage(id) {
+                        ChatMessage.modelFinal(
+                            id = id,
+                            phase = ModelPhase.STEP1_EVAL,
+                            text = streamedRaw,
+                        )
+                    }
+                    markStep1CommittedForActiveAttempt(streamedRaw)
+                    activeStreamMsgId = null
+                    activeStreamSessionId = 0L
+                    AppLog.d(TAG, "stream step1 finalized immediately len=${streamedRaw.length}")
+                } else if (id != null) {
                     updateMessage(id) { m ->
                         m.copy(
                             role = ChatRole.MODEL,
                             text = rendered,
+                            modelPhase = phaseToModelPhase(phase),
                             streamText = rendered,
                             streamState = ChatStreamState.ENDED,
                             streamCollapsed = false,
                             streamSessionId = null,
                         )
                     }
+                    clearVmStreamSessionAfterTerminal("stream.end")
+                } else {
+                    clearVmStreamSessionAfterTerminal("stream.end")
                 }
 
                 resetLocalState()
-                clearVmStreamSessionAfterTerminal("stream.end")
                 safePersistDraft("stream.end")
             }
         }
@@ -1004,6 +1098,7 @@ class ChatQuestionViewModel(
                         m.copy(
                             role = ChatRole.MODEL,
                             text = label,
+                            modelPhase = phaseToModelPhase(phase),
                             streamText = label,
                             streamState = ChatStreamState.STREAMING,
                             streamCollapsed = false,
@@ -1014,6 +1109,7 @@ class ChatQuestionViewModel(
                     appendMessageInternal(
                         ChatMessage.modelStreaming(
                             id = id,
+                            phase = phaseToModelPhase(phase),
                             text = label,
                             streamSessionId = sessionId,
                         ),
@@ -1048,6 +1144,7 @@ class ChatQuestionViewModel(
                     m.copy(
                         role = ChatRole.MODEL,
                         text = rendered,
+                        modelPhase = localPhase?.let(::phaseToModelPhase),
                         streamText = rendered,
                         streamState = ChatStreamState.STREAMING,
                         streamCollapsed = false,
@@ -1166,10 +1263,9 @@ class ChatQuestionViewModel(
      * Build a persisted transcript snapshot from the live in-memory transcript.
      *
      * Rules:
-     * - Drop MODEL bubbles because they are ephemeral UI-only artifacts.
-     * - Clear transient stream fields from persisted messages.
-     * - Migrate legacy assistant streamText into step2Raw when step details are absent.
-     * - Normalize optional assistant-side detail strings.
+     * - Drop transient MODEL streaming bubbles.
+     * - Keep final MODEL step messages as stable transcript entries.
+     * - Migrate legacy assistant-side raw fields into stable MODEL messages.
      */
     private fun buildPersistableMessagesSnapshot(): List<ChatMessage> {
         return normalizePersistedMessages(messagesBacking.toList())
@@ -1182,82 +1278,136 @@ class ChatQuestionViewModel(
         if (raw.isEmpty()) return raw
 
         var changed = false
-        val out = ArrayList<ChatMessage>(raw.size)
+        val out = ArrayList<ChatMessage>(raw.size + 4)
 
         for (m in raw) {
-            val normalized = normalizePersistedMessageOrNull(m)
-            if (normalized == null) {
+            val normalized = normalizePersistedMessagesForOne(m)
+            if (normalized.isEmpty()) {
                 changed = true
                 continue
             }
-            if (normalized != m) {
+            if (normalized.size != 1 || normalized[0] != m) {
                 changed = true
             }
-            out += normalized
+            out.addAll(normalized)
         }
 
         return if (changed) out else raw
     }
 
     /**
-     * Convert one live message into a stable persisted/restored message.
-     *
-     * Returns null when the message must not be persisted.
+     * Convert one live message into stable persisted/restored message(s).
      */
-    private fun normalizePersistedMessageOrNull(message: ChatMessage): ChatMessage? {
-        if (message.role == ChatRole.MODEL) {
-            return null
+    private fun normalizePersistedMessagesForOne(message: ChatMessage): List<ChatMessage> {
+        return when (message.role) {
+            ChatRole.USER -> listOf(normalizeUserMessage(message))
+            ChatRole.ASSISTANT -> normalizeAssistantMessages(message)
+            ChatRole.MODEL -> normalizeModelMessages(message)
+        }
+    }
+
+    private fun normalizeUserMessage(message: ChatMessage): ChatMessage {
+        if (
+            message.streamText == null &&
+            message.streamState == ChatStreamState.NONE &&
+            message.streamSessionId == null
+        ) {
+            return message
         }
 
-        var cur = message
+        return message.copy(
+            streamText = null,
+            streamState = ChatStreamState.NONE,
+            streamSessionId = null,
+        )
+    }
 
-        val normalizedAssistantMessage = cur.assistantMessage.normalizedOptionalText()
-        val normalizedFollowUpQuestion = cur.followUpQuestion.normalizedOptionalText()
-        val normalizedEvalReason = cur.evalReason.normalizedOptionalText()
+    private fun normalizeAssistantMessages(message: ChatMessage): List<ChatMessage> {
+        val normalizedAssistantMessage = message.assistantMessage.normalizedOptionalText()
+        val normalizedFollowUpQuestion = message.followUpQuestion.normalizedOptionalText()
+        val normalizedEvalReason = message.evalReason.normalizedOptionalText()
+        var normalizedStep1Raw = message.step1Raw.normalizedOptionalText()
+        var normalizedStep2Raw = message.step2Raw.normalizedOptionalText()
+        val legacyStream = message.streamText.normalizedOptionalText()
 
-        var normalizedStep1Raw = cur.step1Raw.normalizedOptionalText()
-        var normalizedStep2Raw = cur.step2Raw.normalizedOptionalText()
-
-        val legacyStream = cur.streamText.normalizedOptionalText()
-
-        if (
-            cur.role == ChatRole.ASSISTANT &&
-            legacyStream != null &&
-            normalizedStep1Raw == null &&
-            normalizedStep2Raw == null
-        ) {
+        if (legacyStream != null && normalizedStep1Raw == null && normalizedStep2Raw == null) {
             normalizedStep2Raw = legacyStream
         }
 
-        cur = cur.copy(
-            assistantMessage = normalizedAssistantMessage,
-            followUpQuestion = normalizedFollowUpQuestion,
-            evalReason = normalizedEvalReason,
-            step1Raw = normalizedStep1Raw,
-            step2Raw = normalizedStep2Raw,
-        )
+        val out = ArrayList<ChatMessage>(3)
 
-        val targetCollapsed = when (cur.role) {
-            ChatRole.ASSISTANT -> true
-            ChatRole.USER -> cur.streamCollapsed
-            ChatRole.MODEL -> cur.streamCollapsed
-        }
-
-        if (
-            cur.streamText != null ||
-            cur.streamState != ChatStreamState.NONE ||
-            cur.streamSessionId != null ||
-            cur.streamCollapsed != targetCollapsed
-        ) {
-            cur = cur.copy(
-                streamText = null,
-                streamState = ChatStreamState.NONE,
-                streamCollapsed = targetCollapsed,
-                streamSessionId = null,
+        if (normalizedStep1Raw != null) {
+            out += ChatMessage.modelFinal(
+                id = message.id + "#step1",
+                phase = ModelPhase.STEP1_EVAL,
+                text = normalizedStep1Raw,
             )
         }
 
-        return cur
+        if (normalizedStep2Raw != null) {
+            out += ChatMessage.modelFinal(
+                id = message.id + "#step2",
+                phase = ModelPhase.STEP2_FOLLOW_UP,
+                text = normalizedStep2Raw,
+            )
+        }
+
+        val assistant = message.copy(
+            assistantMessage = normalizedAssistantMessage,
+            followUpQuestion = normalizedFollowUpQuestion,
+            evalStatus = null,
+            evalScore = null,
+            evalReason = normalizedEvalReason,
+            step1Raw = null,
+            step2Raw = null,
+            streamText = null,
+            streamState = ChatStreamState.NONE,
+            streamCollapsed = true,
+            streamSessionId = null,
+            modelPhase = null,
+        )
+
+        val hasAssistantPayload = !assistant.assistantMessage.isNullOrBlank() ||
+                !assistant.followUpQuestion.isNullOrBlank() ||
+                assistant.text.isNotBlank()
+
+        if (hasAssistantPayload) {
+            out += assistant
+        }
+
+        return out
+    }
+
+    private fun normalizeModelMessages(message: ChatMessage): List<ChatMessage> {
+        val normalizedText = (message.text.takeIf { it.isNotBlank() } ?: message.streamText)
+            .normalizedOptionalText()
+            ?: return emptyList()
+
+        val phase = message.modelPhase ?: inferModelPhaseFromText(normalizedText) ?: return emptyList()
+
+        if (
+            message.streamState != ChatStreamState.NONE ||
+            message.streamSessionId != null ||
+            !message.streamText.isNullOrBlank()
+        ) {
+            return emptyList()
+        }
+
+        return listOf(
+            ChatMessage.modelFinal(
+                id = message.id,
+                phase = phase,
+                text = normalizedText,
+            )
+        )
+    }
+
+    private fun inferModelPhaseFromText(text: String): ModelPhase? {
+        return when {
+            text.startsWith("[Step 1]") -> ModelPhase.STEP1_EVAL
+            text.startsWith("[Step 2]") -> ModelPhase.STEP2_FOLLOW_UP
+            else -> null
+        }
     }
 
     private fun String?.normalizedOptionalText(): String? {

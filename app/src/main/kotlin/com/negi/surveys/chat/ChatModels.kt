@@ -26,6 +26,18 @@ object ChatModels {
         MODEL,
     }
 
+    /**
+     * Distinguishes the two structured model phases.
+     *
+     * Notes:
+     * - STEP1_EVAL is the score / status assessment phase.
+     * - STEP2_FOLLOW_UP is the follow-up generation / verdict phase.
+     */
+    enum class ModelPhase {
+        STEP1_EVAL,
+        STEP2_FOLLOW_UP,
+    }
+
     enum class ChatStreamState {
         NONE,
         STREAMING,
@@ -43,15 +55,16 @@ object ChatModels {
         val id: String,
         val role: ChatRole,
         val text: String,
+        val modelPhase: ModelPhase? = null,
         val assistantMessage: String? = null,
         val followUpQuestion: String? = null,
 
         /**
-         * Legacy/ephemeral raw stream text.
+         * Ephemeral stream text for live MODEL bubbles.
          *
          * Notes:
-         * - Primarily used by MODEL streaming bubbles.
-         * - Final assistant details should prefer [step1Raw] / [step2Raw].
+         * - Final stored MODEL messages should prefer [text] and keep this null.
+         * - Persisted drafts must not keep transient stream text.
          */
         val streamText: String? = null,
         val streamState: ChatStreamState = ChatStreamState.NONE,
@@ -59,19 +72,15 @@ object ChatModels {
         val streamSessionId: Long? = null,
 
         /**
-         * Structured step-1 metadata.
+         * Legacy compatibility fields kept for migration of older drafts.
+         *
+         * Notes:
+         * - New code should store step-1 / step-2 raw JSON as MODEL messages.
+         * - These fields may still appear in restored drafts from older app versions.
          */
         val evalStatus: ValidationStatus? = null,
         val evalScore: Int? = null,
         val evalReason: String? = null,
-
-        /**
-         * Final raw details for the two phases.
-         *
-         * Notes:
-         * - These are stored on the final assistant bubble so the user can inspect both phases later.
-         * - They are optional and may be absent in fallback/error cases.
-         */
         val step1Raw: String? = null,
         val step2Raw: String? = null,
     ) {
@@ -82,8 +91,15 @@ object ChatModels {
         val hasEvalMeta: Boolean
             get() = evalStatus != null || evalScore != null || !evalReason.isNullOrBlank()
 
-        val hasStepDetails: Boolean
+        val hasLegacyStepDetails: Boolean
             get() = !step1Raw.isNullOrBlank() || !step2Raw.isNullOrBlank()
+
+        val isStableModelMessage: Boolean
+            get() = role == ChatRole.MODEL &&
+                    modelPhase != null &&
+                    streamState == ChatStreamState.NONE &&
+                    streamText.isNullOrBlank() &&
+                    streamSessionId == null
 
         fun fallbackDisplayText(): String {
             val a = assistantMessage?.trim().orEmpty()
@@ -133,7 +149,8 @@ object ChatModels {
             val r2 = step2Raw?.length ?: 0
             val es = evalStatus?.name ?: "-"
             val sc = evalScore ?: -1
-            return "ChatMessage(id=$id8 role=$role state=$streamState collapsed=$streamCollapsed " +
+            val phase = modelPhase?.name ?: "-"
+            return "ChatMessage(id=$id8 role=$role phase=$phase state=$streamState collapsed=$streamCollapsed " +
                     "lens[text=$textLen a=$aLen q=$qLen stream=$sLen evalReason=$eLen step1=$r1 step2=$r2] " +
                     "eval[$es,$sc] sid=${streamSessionId ?: 0})"
         }
@@ -162,6 +179,7 @@ object ChatModels {
                     id = id,
                     role = ChatRole.ASSISTANT,
                     text = textFallback,
+                    modelPhase = null,
                     assistantMessage = assistantMessage,
                     followUpQuestion = followUpQuestion,
                     streamText = null,
@@ -178,6 +196,7 @@ object ChatModels {
 
             fun modelStreaming(
                 id: String,
+                phase: ModelPhase,
                 text: String = "",
                 streamSessionId: Long? = null,
             ): ChatMessage {
@@ -185,10 +204,28 @@ object ChatModels {
                     id = id,
                     role = ChatRole.MODEL,
                     text = text,
+                    modelPhase = phase,
                     streamText = text,
                     streamState = ChatStreamState.STREAMING,
                     streamCollapsed = false,
                     streamSessionId = streamSessionId,
+                )
+            }
+
+            fun modelFinal(
+                id: String,
+                phase: ModelPhase,
+                text: String,
+            ): ChatMessage {
+                return ChatMessage(
+                    id = id,
+                    role = ChatRole.MODEL,
+                    text = text,
+                    modelPhase = phase,
+                    streamText = null,
+                    streamState = ChatStreamState.NONE,
+                    streamCollapsed = false,
+                    streamSessionId = null,
                 )
             }
         }

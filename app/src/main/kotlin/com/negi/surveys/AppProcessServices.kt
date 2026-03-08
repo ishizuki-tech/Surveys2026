@@ -29,6 +29,8 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import java.lang.reflect.Method
+import kotlin.run
 
 /**
  * Process-scoped service holder.
@@ -467,31 +469,29 @@ object AppProcessServices {
     // IMPORTANT: Never log this token.
     private val hfTokenRef = AtomicReference<String?>(null)
 
-    // Keep the last non-null spec so later callers can pass null without clobbering config.
-    private val lastModelSpecRef = AtomicReference<ModelDownloadSpec?>(null)
-
+    /**
+     * Returns the process-scoped model downloader for the provided spec.
+     *
+     * Contract:
+     * - [spec] is required and must represent the downloader that should be active now.
+     * - Passing null is not supported; disabling the downloader must use [clearModelDownloader].
+     * - This avoids accidental stale-spec reuse when configuration changes from
+     *   remote-download mode to local-only mode.
+     */
     fun modelDownloader(
         context: Context,
-        spec: ModelDownloadSpec?,
+        spec: ModelDownloadSpec,
     ): ModelDownloadController {
         val appCtx = context.applicationContext
 
-        val effectiveSpec =
-            if (spec != null) {
-                lastModelSpecRef.set(spec)
-                spec
-            } else {
-                lastModelSpecRef.get()
-            }
-
-        hfTokenRef.set(effectiveSpec?.hfToken)
+        hfTokenRef.set(spec.hfToken)
 
         val cfg =
             DownloaderConfig(
-                modelUrl = effectiveSpec?.modelUrl,
-                fileName = effectiveSpec?.fileName,
-                uiThrottleMs = effectiveSpec?.uiThrottleMs ?: 200L,
-                uiMinDeltaBytes = effectiveSpec?.uiMinDeltaBytes ?: (512L * 1024L),
+                modelUrl = spec.modelUrl,
+                fileName = spec.fileName,
+                uiThrottleMs = spec.uiThrottleMs,
+                uiMinDeltaBytes = spec.uiMinDeltaBytes,
             )
 
         synchronized(downloaderLock) {
@@ -539,6 +539,34 @@ object AppProcessServices {
         return requireNotNull(installed)
     }
 
+    /**
+     * Explicitly disables the process-scoped downloader and clears its cached config.
+     *
+     * Why:
+     * - A missing download spec means "no downloader should be active".
+     * - Reusing the last non-null spec here would resurrect stale remote-download state.
+     */
+    fun clearModelDownloader() {
+        var toClose: Any? = null
+        var cleared = false
+
+        synchronized(downloaderLock) {
+            if (downloader != null || downloaderConfig != null) {
+                toClose = downloader
+                downloader = null
+                downloaderConfig = null
+                hfTokenRef.set(null)
+                cleared = true
+            }
+        }
+
+        toClose?.let { closeIfSupportedSafely(it) }
+
+        if (cleared) {
+            SafeLog.i(TAG, "modelDownloader: cleared")
+        }
+    }
+
     private data class DownloaderConfig(
         val modelUrl: String?,
         val fileName: String?,
@@ -550,7 +578,7 @@ object AppProcessServices {
     // Close helpers (best-effort, privacy-safe)
     // ---------------------------------------------------------------------
 
-    private val closeMethodCache = ConcurrentHashMap<Class<*>, java.lang.reflect.Method?>()
+    private val closeMethodCache = ConcurrentHashMap<Class<*>, java.lang.reflect.Method>()
 
     /**
      * Best-effort close helper.
@@ -578,11 +606,11 @@ object AppProcessServices {
             val m =
                 cached ?: run {
                     val found = cls.methods.firstOrNull { it.name == "close" && it.parameterTypes.isEmpty() }
-                    closeMethodCache[cls] = found
+                    closeMethodCache[cls] = found as Method
                     found
                 }
 
-            m?.invoke(target)
+            m.invoke(target)
         }.onFailure { t ->
             SafeLog.w(
                 TAG,

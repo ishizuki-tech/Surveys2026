@@ -196,7 +196,7 @@ internal fun SlmGateScreen(
 
     val nowMs = rememberWarmupUiNowMs(
         inProgress = modelInProgress || prefetchInProgress || compileInProgress,
-        tickIntervalMs = 250L,
+        tickIntervalMs = 50L,
     )
 
     val prefetchElapsedMs = rememberDynamicElapsedMs(
@@ -542,5 +542,5 @@ internal fun sanitizeLabel(raw: String): String {
         }
     }
 
-    return if (safe.isNotBlank()) safe else "unknown"
+    return safe.ifBlank { "unknown" }
 }
