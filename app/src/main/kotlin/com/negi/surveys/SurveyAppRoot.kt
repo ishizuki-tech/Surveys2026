@@ -176,7 +176,7 @@ object SurveyAppRoot {
             rememberWarmupUiLabels(
                 prefetchState = rootPrefetchState,
                 compileState = rootCompileState,
-                tickIntervalMs = 500L,
+                tickIntervalMs = 5L,
                 format = WARMUP_UI_FORMAT_HOME,
             )
 

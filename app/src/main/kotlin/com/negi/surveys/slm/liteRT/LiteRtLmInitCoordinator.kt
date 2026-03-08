@@ -133,9 +133,9 @@ internal object LiteRtLmInitCoordinator {
     /** Resolve preferred backend from model config. */
     private fun preferredBackend(model: Model): Backend {
         return when (normalizedAccelerator(model)) {
-            Model.Accelerator.CPU.label -> Backend.CPU
-            Model.Accelerator.GPU.label -> Backend.GPU
-            else -> Backend.GPU
+            Model.Accelerator.CPU.label -> Backend.CPU()
+            Model.Accelerator.GPU.label -> Backend.GPU()
+            else -> Backend.GPU()
         }
     }
 
@@ -190,8 +190,8 @@ internal object LiteRtLmInitCoordinator {
         if (warm) return INIT_AWAIT_TIMEOUT_MS_DEFAULT
 
         return when (backend) {
-            Backend.GPU -> INIT_AWAIT_TIMEOUT_MS_GPU_COLD
-            Backend.CPU -> INIT_AWAIT_TIMEOUT_MS_CPU_COLD
+            Backend.GPU() -> INIT_AWAIT_TIMEOUT_MS_GPU_COLD
+            Backend.CPU() -> INIT_AWAIT_TIMEOUT_MS_CPU_COLD
             else -> INIT_AWAIT_TIMEOUT_MS_DEFAULT
         }
     }
@@ -202,7 +202,7 @@ internal object LiteRtLmInitCoordinator {
         serializationDirHint: String? = null,
     ): Long {
         val p = initWaitProfiles[key]
-        val backend = backendHint ?: p?.backend ?: Backend.GPU
+        val backend = backendHint ?: p?.backend ?: Backend.GPU()
         val dir = serializationDirHint ?: p?.serializationDir
         return recommendedInitAwaitTimeoutMs(backend, dir)
     }
@@ -393,8 +393,8 @@ internal object LiteRtLmInitCoordinator {
 
         val backendHint = preferredBackend(model)
         val normalizedModelPath = LiteRtLmKeys.normalizeTaskPath(model.getPath())
-        val visionHint = if (supportImage) Backend.GPU else null
-        val audioHint = if (supportAudio) Backend.CPU else null
+        val visionHint = if (supportImage) Backend.GPU() else null
+        val audioHint = if (supportAudio) Backend.CPU() else null
         val serializationDirHint = runCatching {
             persistentLiteRtSerializationDir(
                 context = context,
@@ -464,8 +464,8 @@ internal object LiteRtLmInitCoordinator {
                     val rawModelPath = model.getPath()
                     val normalizedPath = LiteRtLmKeys.normalizeTaskPath(rawModelPath)
 
-                    val visionPreferred = if (supportImage) Backend.GPU else null
-                    val audioPreferred = if (supportAudio) Backend.CPU else null
+                    val visionPreferred = if (supportImage) Backend.GPU() else null
+                    val audioPreferred = if (supportAudio) Backend.CPU() else null
 
                     fun resolveCacheDir(forBackend: Backend, v: Backend?, a: Backend?): String? {
                         return runCatching {
@@ -517,14 +517,14 @@ internal object LiteRtLmInitCoordinator {
                             it.initialize()
                         }
                     }.getOrElse { first ->
-                        if (backend == Backend.GPU) {
+                        if (backend == Backend.GPU()) {
                             AppLog.w(LiteRtLmLogging.TAG, "GPU init failed; trying CPU fallback: ${first.message}")
-                            val v = if (supportImage) Backend.CPU else null
-                            val a = if (supportAudio) Backend.CPU else null
-                            engineConfig = buildConfig(Backend.CPU, v, a)
+                            val v = if (supportImage) Backend.CPU() else null
+                            val a = if (supportAudio) Backend.CPU() else null
+                            engineConfig = buildConfig(Backend.CPU(), v, a)
                             runCatching {
                                 initWaitProfiles[key] = InitWaitProfile(
-                                    backend = Backend.CPU,
+                                    backend = Backend.CPU(),
                                     serializationDir = engineConfig.cacheDir,
                                     createdAtMs = SystemClock.elapsedRealtime(),
                                 )
