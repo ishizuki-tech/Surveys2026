@@ -21,6 +21,7 @@ import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.config.SurveyConfig
+import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.utils.ModelDownloadController
@@ -263,17 +264,21 @@ class AppStartupViewModel(
     }
 
     /**
-     * Waits briefly for the Application-installed config and then builds process-scoped services.
+     * Waits for the process-installed config and attempts a best-effort recovery
+     * from the asset config if the Application-owned install was not observed.
      */
     private suspend fun awaitInstalledConfigAndBuildServices() {
         val t0 = SystemClock.elapsedRealtime()
         SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
 
-        val installed = waitForInstalledConfigOrNull(deadlineAt = t0 + INSTALLED_CONFIG_WAIT_MS)
+        val installed =
+            waitForInstalledConfigOrRecoverOrNull(
+                deadlineAt = t0 + INSTALLED_CONFIG_WAIT_MS,
+            )
 
         if (installed == null) {
             val dt = SystemClock.elapsedRealtime() - t0
-            SafeLog.e(TAG, "Config: missing (Application install not observed) after ${dt}ms")
+            SafeLog.e(TAG, "Config: missing after recovery attempt dt=${dt}ms")
             failStartup(
                 safeReason = "InstalledConfigMissing",
                 repoMode = computeRepoMode(),
@@ -284,7 +289,7 @@ class AppStartupViewModel(
         }
 
         val dt = SystemClock.elapsedRealtime() - t0
-        SafeLog.i(TAG, "Config: ready (installed) in ${dt}ms")
+        SafeLog.i(TAG, "Config: ready in ${dt}ms")
 
         val modelSpec = installed.resolveModelDownloadSpec()
         val modelSpecKey = buildModelSpecKey(modelSpec)
@@ -331,9 +336,10 @@ class AppStartupViewModel(
     }
 
     /**
-     * Polls the installed-config store until a deadline is reached.
+     * Polls the installed-config store until a deadline is reached and then
+     * performs a best-effort recovery from assets if needed.
      */
-    private suspend fun waitForInstalledConfigOrNull(
+    private suspend fun waitForInstalledConfigOrRecoverOrNull(
         deadlineAt: Long,
     ): SurveyConfig? {
         var installed: SurveyConfig? = null
@@ -344,7 +350,27 @@ class AppStartupViewModel(
             delay(INSTALLED_CONFIG_POLL_MS)
         }
 
-        return installed
+        if (installed != null) return installed
+
+        SafeLog.w(TAG, "Config: install not observed; attempting best-effort recovery")
+        return recoverInstalledConfigBestEffort()
+    }
+
+    /**
+     * Rebuilds the process config from the bundled asset as a last-resort recovery path.
+     */
+    private fun recoverInstalledConfigBestEffort(): SurveyConfig? {
+        return runCatching {
+            SurveyConfigLoader.installProcessConfigFromAssetsValidated(
+                context = app,
+                fileName = CONFIG_ASSET_NAME,
+            )
+        }.onFailure { t ->
+            SafeLog.e(
+                TAG,
+                "Config: recovery install failed type=${t::class.java.simpleName}",
+            )
+        }.getOrNull()
     }
 
     /**
@@ -679,52 +705,25 @@ class AppStartupViewModel(
     }
 
     /**
-     * Best-effort local model resolution aligned with Application bootstrap.
+     * Strict local model resolution aligned with Application bootstrap.
      *
      * Strategy:
-     * - Prefer the configured file name under known app-private roots.
-     * - Fallback to a bounded scan for the largest plausible model file.
+     * - Trust only the configured file name.
+     * - Search only known app-private roots.
+     * - Never guess by extension, size, or "largest file wins".
      * - Never logs file paths or file names.
      */
     private fun resolveExistingLocalModelFileOrNull(modelSpec: ModelDownloadSpec?): File? {
-        val spec = modelSpec ?: return null
+        val safeName = modelSpec?.fileName?.let(::sanitizeSimpleFileName) ?: return null
 
-        val preferred =
-            sanitizeSimpleFileName(spec.fileName)?.let { safeName ->
-                candidateRoots()
-                    .asSequence()
-                    .map { File(it, safeName) }
-                    .firstOrNull { candidate ->
-                        runCatching {
-                            candidate.exists() && candidate.isFile && candidate.length() > 0L
-                        }.getOrDefault(false)
-                    }
+        return candidateRoots()
+            .asSequence()
+            .map { root -> File(root, safeName) }
+            .firstOrNull { candidate ->
+                runCatching {
+                    candidate.exists() && candidate.isFile && candidate.length() > 0L
+                }.getOrDefault(false)
             }
-
-        if (preferred != null) return preferred
-
-        var best: File? = null
-        var bestLen = 0L
-
-        for (dir in candidateRoots()) {
-            val list = runCatching { dir.listFiles() ?: emptyArray() }.getOrDefault(emptyArray())
-            for (file in list) {
-                if (!file.isFile) continue
-
-                val name = file.name.lowercase()
-                if (ALLOWED_MODEL_EXTENSIONS.none { name.endsWith(it) }) continue
-
-                val len = runCatching { file.length() }.getOrDefault(0L)
-                if (len < MIN_LOCAL_MODEL_BYTES) continue
-
-                if (len > bestLen) {
-                    best = file
-                    bestLen = len
-                }
-            }
-        }
-
-        return best
     }
 
     /**
@@ -850,17 +849,10 @@ class AppStartupViewModel(
 
     companion object {
         private const val TAG = "AppStartupViewModel"
+        private const val CONFIG_ASSET_NAME = "survey.yaml"
         private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
         private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
         private const val STARTUP_AFTER_FIRST_FRAME_DELAY_MS: Long = 150L
-
-        private const val MIN_LOCAL_MODEL_BYTES: Long = 128L * 1024L * 1024L
-        private val ALLOWED_MODEL_EXTENSIONS = setOf(
-            ".litertlm",
-            ".bin",
-            ".task",
-            ".gguf",
-        )
     }
 }
 

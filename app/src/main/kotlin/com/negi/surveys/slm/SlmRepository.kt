@@ -89,7 +89,7 @@ class SlmRepository(
         val logFullText: Boolean = false,
         val maxPromptLogChars: Int = 2_000,
         val maxResultLogChars: Int = 2_000,
-        val streamEvalOutputToClient: Boolean = true,
+        val streamEvalOutputToClient: Boolean = false,
     ) {
         val streamAssessmentOutputToClient: Boolean
             get() = streamEvalOutputToClient

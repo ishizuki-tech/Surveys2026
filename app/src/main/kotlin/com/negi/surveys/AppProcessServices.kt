@@ -16,6 +16,7 @@ package com.negi.surveys
 import android.content.Context
 import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.chat.FakeSlmRepository
+import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.slm.SlmRepository
@@ -86,6 +87,63 @@ object AppProcessServices {
     private val repoRef = AtomicReference<ChatValidation.RepositoryI?>(null)
     private val repoModeRef = AtomicReference<RepoMode?>(null)
     private val repoLock = Any()
+    private val repoDebugOverridesRef = AtomicReference<RepoDebugOverrides?>(null)
+
+    data class RepoDebugOverrides(
+        val enableSlmDebugLogs: Boolean? = null,
+        val streamEvalOutputToClient: Boolean? = null,
+    )
+
+    private data class RepoDebugOptions(
+        val enableSlmDebugLogs: Boolean,
+        val streamEvalOutputToClient: Boolean,
+    )
+
+    /**
+     * Installs optional debug overrides for repository creation.
+     *
+     * Notes:
+     * - Intended for dev menu / debug panels.
+     * - Rebuilds the repository so the new debug options take effect.
+     */
+    fun setRepoDebugOverrides(overrides: RepoDebugOverrides?) {
+        repoDebugOverridesRef.set(overrides)
+        clearRepositoryForRebuild()
+    }
+
+    private fun resolveRepoDebugOptions(): RepoDebugOptions {
+        val cfg = InstalledSurveyConfigStore.getOrNull()
+        val cfgDebug = cfg?.debug
+        val overrides = repoDebugOverridesRef.get()
+
+        val enableLogsRequested =
+            overrides?.enableSlmDebugLogs
+                ?: cfgDebug?.enableSlmDebugLogs
+                ?: BuildConfig.DEBUG
+
+        val streamEvalRequested =
+            overrides?.streamEvalOutputToClient
+                ?: cfgDebug?.streamEvalOutputToClient
+                ?: false
+
+        return RepoDebugOptions(
+            enableSlmDebugLogs = BuildConfig.DEBUG && enableLogsRequested,
+            streamEvalOutputToClient = BuildConfig.DEBUG && streamEvalRequested,
+        )
+    }
+
+    private fun clearRepositoryForRebuild() {
+        var toClose: Any? = null
+
+        synchronized(repoLock) {
+            toClose = repoRef.get()
+            repoRef.set(null)
+            repoModeRef.set(null)
+        }
+
+        toClose?.let { closeIfSupportedSafely(it) }
+        SafeLog.i(TAG, "repository: cleared for rebuild")
+    }
 
     fun repository(
         context: Context,
@@ -111,14 +169,15 @@ object AppProcessServices {
                         RepoMode.ON_DEVICE -> {
                             // IMPORTANT:
                             // - Avoid logging raw model outputs in production.
-                            // - Step-1 Assessment streaming should stay OFF by default unless
-                            //   a deliberate debug/dev switch enables it.
+                            // - Step-1 Assessment streaming stays OFF by default unless
+                            //   an explicit config or dev override enables it.
                             val twoStepAssessmentEnabled = true
+                            val debugOptions = resolveRepoDebugOptions()
 
                             val dbg =
                                 SlmRepository.DebugConfig(
-                                    enabled = BuildConfig.DEBUG,
-                                    streamEvalOutputToClient = true,
+                                    enabled = debugOptions.enableSlmDebugLogs,
+                                    streamEvalOutputToClient = debugOptions.streamEvalOutputToClient,
                                 )
 
                             SafeLog.i(
