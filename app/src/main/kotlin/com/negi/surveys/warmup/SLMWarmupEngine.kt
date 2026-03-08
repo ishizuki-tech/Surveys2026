@@ -223,7 +223,7 @@ class SLMWarmupEngine(
                         return@launch
                     }
 
-                    runPrefetch(file = file, runId = runId)
+                    runPrefetch(file = file!!, runId = runId)
                 } catch (ce: CancellationException) {
                     setPrefetchCancelled(nowMs = SystemClock.elapsedRealtime())
                     val req = prefetchCancelRequestRef.get()
@@ -290,7 +290,7 @@ class SLMWarmupEngine(
                     startPrefetch(ctx)
 
                     runCompile(
-                        file = file,
+                        file = file!!,
                         repo = inputs.repository,
                         opts = inputs.options,
                         appContext = ctx,

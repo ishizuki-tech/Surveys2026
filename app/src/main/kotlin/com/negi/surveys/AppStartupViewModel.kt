@@ -708,49 +708,16 @@ class AppStartupViewModel(
      * Strict local model resolution aligned with Application bootstrap.
      *
      * Strategy:
-     * - Trust only the configured file name.
-     * - Search only known app-private roots.
+     * - Trust only config-named local model files.
+     * - Reuse the shared process-scoped validation rules.
      * - Never guess by extension, size, or "largest file wins".
      * - Never logs file paths or file names.
      */
     private fun resolveExistingLocalModelFileOrNull(modelSpec: ModelDownloadSpec?): File? {
-        val safeName = modelSpec?.fileName?.let(::sanitizeSimpleFileName) ?: return null
-
-        return candidateRoots()
-            .asSequence()
-            .map { root -> File(root, safeName) }
-            .firstOrNull { candidate ->
-                runCatching {
-                    candidate.exists() && candidate.isFile && candidate.length() > 0L
-                }.getOrDefault(false)
-            }
-    }
-
-    /**
-     * Returns small app-private roots that may contain model files.
-     */
-    private fun candidateRoots(): List<File> {
-        return listOfNotNull(
-            app.filesDir,
-            File(app.filesDir, "models"),
-            File(app.filesDir, "slm"),
-            File(app.filesDir, "litert"),
-            app.noBackupFilesDir,
-            app.cacheDir,
-        ).distinct()
-    }
-
-    /**
-     * Sanitizes a simple file name to avoid traversal-like inputs.
-     */
-    private fun sanitizeSimpleFileName(name: String): String? {
-        val n = name.trim()
-        if (n.isBlank()) return null
-        if (n.contains('/')) return null
-        if (n.contains('\\')) return null
-        if (n.contains("..")) return null
-        if (n.length > 200) return null
-        return n
+        return AppProcessServices.resolveConfiguredLocalModelFileOrNull(
+            context = app,
+            spec = modelSpec,
+        )
     }
 
     /**

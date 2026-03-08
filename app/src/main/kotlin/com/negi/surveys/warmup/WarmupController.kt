@@ -18,7 +18,6 @@ import android.os.Process
 import com.negi.surveys.logging.AppLog
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
-import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
@@ -55,7 +54,7 @@ class WarmupController(
      * - Do not log file names/paths derived from [file].
      */
     data class Inputs(
-        val file: File,
+        val file: File?,
         val repository: WarmupCapableRepository,
         val options: Options = Options(),
     )

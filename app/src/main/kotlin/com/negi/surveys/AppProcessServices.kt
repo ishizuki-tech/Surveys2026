@@ -18,6 +18,7 @@ import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.chat.FakeSlmRepository
 import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.ModelDownloadSpec
+import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.slm.SlmRepository
 import com.negi.surveys.utils.ModelDownloadController
@@ -31,7 +32,6 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
 import java.lang.reflect.Method
-import kotlin.run
 
 /**
  * Process-scoped service holder.
@@ -78,6 +78,114 @@ object AppProcessServices {
         } else {
             RepoMode.ON_DEVICE
         }
+    }
+
+    private const val MIN_LOCAL_MODEL_BYTES: Long = 128L * 1024L * 1024L
+
+    private val allowedModelExtensions = setOf(
+        ".litertlm",
+        ".bin",
+        ".task",
+        ".gguf",
+    )
+
+    /**
+     * Resolves a local model file using configured file names only.
+     *
+     * Resolution order:
+     * - Explicit [spec].fileName when provided
+     * - Installed config resolved model spec file name
+     * - Installed config modelDefaults.defaultFileName
+     *
+     * Notes:
+     * - Never scans arbitrary files.
+     * - Never falls back to "largest file wins".
+     * - Never logs file paths or file names.
+     */
+    fun resolveConfiguredLocalModelFileOrNull(
+        context: Context,
+        spec: ModelDownloadSpec? = null,
+    ): File? {
+        val appCtx = context.applicationContext
+        val installed = InstalledSurveyConfigStore.getOrNull()
+
+        val candidateNames = LinkedHashSet<String>()
+
+        spec?.fileName
+            ?.let(::sanitizeSimpleFileName)
+            ?.let(candidateNames::add)
+
+        installed?.resolveModelDownloadSpec()
+            ?.fileName
+            ?.let(::sanitizeSimpleFileName)
+            ?.let(candidateNames::add)
+
+        installed?.modelDefaults
+            ?.defaultFileName
+            ?.let(::sanitizeSimpleFileName)
+            ?.let(candidateNames::add)
+
+        if (candidateNames.isEmpty()) return null
+
+        for (safeName in candidateNames) {
+            for (root in candidateModelRoots(appCtx)) {
+                val candidate = File(root, safeName)
+                if (isUsableLocalModelFile(candidate)) {
+                    return candidate
+                }
+            }
+        }
+
+        return null
+    }
+
+    /**
+     * Returns true only when the file looks like a usable local model artifact.
+     *
+     * Validation:
+     * - file exists
+     * - file is regular
+     * - extension is explicitly allowed
+     * - size meets the shared minimum threshold
+     */
+    fun isUsableLocalModelFile(file: File?): Boolean {
+        if (file == null) return false
+
+        return runCatching {
+            if (!file.exists() || !file.isFile) return@runCatching false
+
+            val lowerName = file.name.lowercase()
+            if (allowedModelExtensions.none { lowerName.endsWith(it) }) {
+                return@runCatching false
+            }
+
+            file.length() >= MIN_LOCAL_MODEL_BYTES
+        }.getOrDefault(false)
+    }
+
+    /**
+     * Returns the repository-supported app-private roots for configured model files.
+     *
+     * Notes:
+     * - Keep this aligned with the runtime repository path contract.
+     * - Avoid probing alternate directories that the repository cannot open later.
+     */
+    fun candidateModelRoots(context: Context): List<File> {
+        val appCtx = context.applicationContext
+        return listOf(appCtx.filesDir)
+    }
+
+    /**
+     * Sanitizes a simple file name to avoid traversal-like inputs.
+     */
+    private fun sanitizeSimpleFileName(name: String?): String? {
+        val n = name?.trim().orEmpty()
+        if (n.isBlank()) return null
+        if (n.contains('/')) return null
+        if (n.contains('\\')) return null
+        if (n.contains("..")) return null
+        if (n.length > 200) return null
+        return n
     }
 
     // ---------------------------------------------------------------------
@@ -348,8 +456,7 @@ object AppProcessServices {
             return
         }
 
-        val fileOk = modelFile != null && modelFile.exists() && modelFile.isFile && modelFile.length() > 0L
-        if (!fileOk) {
+        if (!isUsableLocalModelFile(modelFile)) {
             SafeLog.w(TAG, "warmupInputs: file not ready; keeping previous inputs")
             return
         }
@@ -443,11 +550,7 @@ object AppProcessServices {
         val cached = warmupInputsRef.get() ?: return null
         val file = cached.file
 
-        val fileOk = runCatching {
-            file.exists() && file.isFile && file.length() > 0L
-        }.getOrDefault(false)
-
-        if (!fileOk) {
+        if (!isUsableLocalModelFile(file)) {
             SafeLog.w(TAG, "warmupInputs: cached file not ready; skipping restore")
             return null
         }
@@ -483,11 +586,7 @@ object AppProcessServices {
         val cached = warmupInputsRef.get() ?: return
         val file = cached.file
 
-        val fileOk = runCatching {
-            file.exists() && file.isFile && file.length() > 0L
-        }.getOrDefault(false)
-
-        if (!fileOk) {
+        if (!isUsableLocalModelFile(file)) {
             SafeLog.w(TAG, "warmupInputs: cached file not ready; skip repo rebind")
             return
         }
@@ -637,7 +736,7 @@ object AppProcessServices {
     // Close helpers (best-effort, privacy-safe)
     // ---------------------------------------------------------------------
 
-    private val closeMethodCache = ConcurrentHashMap<Class<*>, java.lang.reflect.Method>()
+    private val closeMethodCache = ConcurrentHashMap<Class<*>, Method>()
 
     /**
      * Best-effort close helper.
@@ -661,15 +760,13 @@ object AppProcessServices {
             }
 
             val cls = target.javaClass
-            val cached = closeMethodCache[cls]
             val m =
-                cached ?: run {
-                    val found = cls.methods.firstOrNull { it.name == "close" && it.parameterTypes.isEmpty() }
-                    closeMethodCache[cls] = found as Method
-                    found
-                }
+                closeMethodCache[cls]
+                    ?: cls.methods
+                        .firstOrNull { it.name == "close" && it.parameterTypes.isEmpty() }
+                        ?.also { found -> closeMethodCache[cls] = found }
 
-            m.invoke(target)
+            m?.invoke(target)
         }.onFailure { t ->
             SafeLog.w(
                 TAG,
