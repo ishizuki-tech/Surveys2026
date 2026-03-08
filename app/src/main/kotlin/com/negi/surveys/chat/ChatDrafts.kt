@@ -2,7 +2,7 @@
  * =====================================================================
  *  IshizukiTech LLC — Survey App (Chat Draft Store)
  *  ---------------------------------------------------------------------
- *  File: ChatDraftStore.kt
+ *  File: ChatDrafts.kt
  *  Author: Shu Ishizuki
  *  License: MIT License
  *  © 2026 IshizukiTech LLC. All rights reserved.
@@ -34,7 +34,7 @@ object ChatDrafts {
      */
     data class DraftKey(
         val questionId: String,
-        val promptHash: Int
+        val promptHash: Int,
     ) {
         /** Returns a normalized copy safe for map keys. */
         fun normalized(): DraftKey = copy(questionId = normalizeQuestionId(questionId))
@@ -65,7 +65,7 @@ object ChatDrafts {
         val currentFollowUpQuestion: String,
         val completionPayload: String?,
         val inputDraft: String = "",
-        val version: Int = 1
+        val version: Int = 1,
     ) {
         /**
          * Returns a defensively-copied version so external mutable lists cannot mutate stored drafts.
@@ -79,7 +79,7 @@ object ChatDrafts {
             // Keep element types immutable for stronger safety.
             return copy(
                 messages = messages.toList(),
-                followUps = followUps.toList()
+                followUps = followUps.toList(),
             )
         }
     }
@@ -88,7 +88,7 @@ object ChatDrafts {
     enum class ChatStage {
         AWAIT_MAIN,
         AWAIT_FOLLOW_UP,
-        DONE
+        DONE,
     }
 
     /**
@@ -99,7 +99,7 @@ object ChatDrafts {
      */
     data class FollowUpTurn(
         val question: String,
-        val answer: String
+        val answer: String,
     )
 
     /**
@@ -133,7 +133,7 @@ object ChatDrafts {
      */
     class InMemoryChatDraftStore(
         config: Config = Config(),
-        private val logger: ((String) -> Unit)? = null
+        private val logger: ((String) -> Unit)? = null,
     ) : ChatDraftStore {
 
         /**
@@ -166,7 +166,7 @@ object ChatDrafts {
             val maxInputDraftChars: Int = 16_000,
 
             // -----------------------------------------------------------------
-            // Per-message caps (to avoid huge streamText bloating memory)
+            // Per-message caps
             // -----------------------------------------------------------------
 
             /** Max chars for ChatMessage.text (fallback). */
@@ -181,6 +181,12 @@ object ChatDrafts {
             /** Max chars for ChatMessage.streamText (embedded model output / debug). */
             val maxMessageStreamTextChars: Int = 16_000,
 
+            /** Max chars for ChatMessage.step1Raw (stable step-1 detail). */
+            val maxMessageStep1RawChars: Int = 16_000,
+
+            /** Max chars for ChatMessage.step2Raw (stable step-2 detail). */
+            val maxMessageStep2RawChars: Int = 16_000,
+
             // -----------------------------------------------------------------
             // Per-follow-up caps
             // -----------------------------------------------------------------
@@ -189,7 +195,7 @@ object ChatDrafts {
             val maxFollowUpTurnQuestionChars: Int = 2_000,
 
             /** Max chars for FollowUpTurn.answer. */
-            val maxFollowUpTurnAnswerChars: Int = 8_000
+            val maxFollowUpTurnAnswerChars: Int = 8_000,
         ) {
             /** Normalize config to safe operational values. */
             fun normalized(): Config {
@@ -205,8 +211,10 @@ object ChatDrafts {
                     maxMessageAssistantChars = max(0, maxMessageAssistantChars),
                     maxMessageFollowUpQuestionChars = max(0, maxMessageFollowUpQuestionChars),
                     maxMessageStreamTextChars = max(0, maxMessageStreamTextChars),
+                    maxMessageStep1RawChars = max(0, maxMessageStep1RawChars),
+                    maxMessageStep2RawChars = max(0, maxMessageStep2RawChars),
                     maxFollowUpTurnQuestionChars = max(0, maxFollowUpTurnQuestionChars),
-                    maxFollowUpTurnAnswerChars = max(0, maxFollowUpTurnAnswerChars)
+                    maxFollowUpTurnAnswerChars = max(0, maxFollowUpTurnAnswerChars),
                 )
             }
         }
@@ -225,7 +233,7 @@ object ChatDrafts {
             val saves: Long,
             val clears: Long,
             val evictions: Long,
-            val lastEvictedKey: DraftKey?
+            val lastEvictedKey: DraftKey?,
         )
 
         private val cfg: Config = config.normalized()
@@ -240,7 +248,7 @@ object ChatDrafts {
         private val lru = LinkedHashMap<DraftKey, ChatDraft>(
             /* initialCapacity */ 128,
             /* loadFactor */ 0.75f,
-            /* accessOrder */ true
+            /* accessOrder */ true,
         )
 
         // Stats (guarded by lock)
@@ -260,7 +268,7 @@ object ChatDrafts {
                 saves = saves,
                 clears = clears,
                 evictions = evictions,
-                lastEvictedKey = lastEvictedKey
+                lastEvictedKey = lastEvictedKey,
             )
         }
 
@@ -385,7 +393,7 @@ object ChatDrafts {
                 mainAnswer = mainAnswer.takeSafeChars(cfg.maxMainAnswerChars),
                 currentFollowUpQuestion = currentFollowUpQuestion.takeSafeChars(cfg.maxCurrentFollowUpQuestionChars),
                 completionPayload = completionPayload?.takeSafeChars(cfg.maxCompletionPayloadChars),
-                inputDraft = inputDraft.takeSafeChars(cfg.maxInputDraftChars)
+                inputDraft = inputDraft.takeSafeChars(cfg.maxInputDraftChars),
             )
         }
 
@@ -401,7 +409,9 @@ object ChatDrafts {
                 text = text.takeSafeChars(cfg.maxMessageTextChars),
                 assistantMessage = assistantMessage?.takeSafeChars(cfg.maxMessageAssistantChars),
                 followUpQuestion = followUpQuestion?.takeSafeChars(cfg.maxMessageFollowUpQuestionChars),
-                streamText = streamText?.takeSafeChars(cfg.maxMessageStreamTextChars)
+                streamText = streamText?.takeSafeChars(cfg.maxMessageStreamTextChars),
+                step1Raw = step1Raw?.takeSafeChars(cfg.maxMessageStep1RawChars),
+                step2Raw = step2Raw?.takeSafeChars(cfg.maxMessageStep2RawChars),
             )
         }
 
@@ -409,7 +419,7 @@ object ChatDrafts {
         private fun FollowUpTurn.capStrings(cfg: Config): FollowUpTurn {
             return copy(
                 question = question.takeSafeChars(cfg.maxFollowUpTurnQuestionChars),
-                answer = answer.takeSafeChars(cfg.maxFollowUpTurnAnswerChars)
+                answer = answer.takeSafeChars(cfg.maxFollowUpTurnAnswerChars),
             )
         }
 
