@@ -19,12 +19,9 @@ import android.os.Process
 import android.os.SystemClock
 import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.SurveyConfigLoader
-import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.warmup.WarmupController
-import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -89,7 +86,7 @@ class SurveyApplication : Application() {
 
         // 4) Warmup Inputs (best-effort):
         // - Do not use reflection to guess warmup entrypoints.
-        // - If a model file is already present, inject Inputs once to enable early warmup later.
+        // - Trust only config-named local model files that pass shared validation.
         // - Never blocks the main thread.
         WarmupInputsBootstrap.tryInjectOnceBestEffort(appContext)
 
@@ -189,9 +186,11 @@ class SurveyApplication : Application() {
                 while (SystemClock.elapsedRealtime() < deadlineAt) {
                     attempts += 1
 
-                    val file = ModelFileProbe.findModelFileOrNull(appContext.applicationContext)
-                    val fileReady = file != null && file.exists() && file.isFile && file.length() > 0L
-                    if (!fileReady) {
+                    val file =
+                        AppProcessServices.resolveConfiguredLocalModelFileOrNull(
+                            appContext.applicationContext,
+                        )
+                    if (!AppProcessServices.isUsableLocalModelFile(file)) {
                         delay(RETRY_INTERVAL_MS)
                         continue
                     }
@@ -320,178 +319,6 @@ class SurveyApplication : Application() {
             }
 
             return null
-        }
-    }
-
-    /**
-     * Best-effort model file probe without depending on ModelDownloadController internals.
-     *
-     * Privacy:
-     * - Never logs file paths.
-     *
-     * Strategy:
-     * - Prefer config-resolved file name if installed config is available.
-     * - Fallback to modelDefaults.defaultFileName for backward compatibility.
-     * - Otherwise, scan a small set of app-private directories.
-     * - Pick the largest plausible model file by extension and minimum size threshold.
-     *
-     * Notes:
-     * - Keep this fast and rate-limited.
-     * - Never assume the model lives only in filesDir root.
-     */
-    private object ModelFileProbe {
-
-        private const val TAG = "SurveyApplication"
-
-        private val lastScanAtMs = AtomicLong(0L)
-        private val cachedFile = AtomicReference<File?>(null)
-
-        private const val SCAN_INTERVAL_READY_MS: Long = 30_000L
-        private const val SCAN_INTERVAL_EMPTY_MS: Long = 1_000L
-        private const val MIN_BYTES: Long = 128L * 1024L * 1024L
-
-        private val allowedExtensions = setOf(
-            ".litertlm",
-            ".bin",
-            ".task",
-            ".gguf",
-        )
-
-        fun findModelFileOrNull(appContext: Context): File? {
-            // 1) Prefer config-resolved file name if available.
-            val preferred = resolvePreferredFromInstalledConfig(appContext)
-            if (preferred != null) {
-                cachedFile.set(preferred)
-                return preferred
-            }
-
-            // 2) Validate cached file before using it.
-            val cached = cachedFile.get()
-            if (cached != null) {
-                val cachedOk = runCatching {
-                    cached.exists() && cached.isFile && cached.length() >= MIN_BYTES
-                }.getOrDefault(false)
-
-                if (cachedOk) {
-                    return cached
-                }
-
-                cachedFile.compareAndSet(cached, null)
-            }
-
-            // 3) Rate-limit scans.
-            val now = SystemClock.elapsedRealtime()
-            val last = lastScanAtMs.get()
-
-            val interval =
-                if (cachedFile.get() == null) {
-                    SCAN_INTERVAL_EMPTY_MS
-                } else {
-                    SCAN_INTERVAL_READY_MS
-                }
-
-            if (now - last < interval) {
-                return cachedFile.get()
-            }
-            if (!lastScanAtMs.compareAndSet(last, now)) {
-                return cachedFile.get()
-            }
-
-            var best: File? = null
-            var bestLen = 0L
-
-            for (dir in candidateRoots(appContext)) {
-                val list = runCatching { dir.listFiles() ?: emptyArray() }.getOrDefault(emptyArray())
-                for (f in list) {
-                    if (!f.isFile) continue
-
-                    val name = f.name.lowercase()
-                    if (allowedExtensions.none { name.endsWith(it) }) continue
-
-                    val len = runCatching { f.length() }.getOrDefault(0L)
-                    if (len < MIN_BYTES) continue
-
-                    if (len > bestLen) {
-                        best = f
-                        bestLen = len
-                    }
-                }
-            }
-
-            cachedFile.set(best)
-
-            if (best != null) {
-                SafeLog.d(TAG, "warmupProbe: best-effort file found size=$bestLen pid=${Process.myPid()}")
-            } else {
-                SafeLog.d(TAG, "warmupProbe: no candidate found pid=${Process.myPid()}")
-            }
-
-            return best
-        }
-
-        /**
-         * Resolves a preferred model file using installed config without directory scans.
-         *
-         * Notes:
-         * - This does not log any file name.
-         * - It checks a small set of known app-private roots to stay aligned with the
-         *   general scan strategy.
-         */
-        private fun resolvePreferredFromInstalledConfig(appContext: Context): File? {
-            val cfg = InstalledSurveyConfigStore.getOrNull() ?: return null
-
-            val candidates = LinkedHashSet<String>()
-
-            cfg.resolveModelDownloadSpec()
-                .fileName
-                .trim()
-                .takeIf { it.isNotBlank() }
-                ?.let { candidates.add(it) }
-
-            cfg.modelDefaults.defaultFileName
-                ?.trim()
-                ?.takeIf { it.isNotBlank() }
-                ?.let { candidates.add(it) }
-
-            for (raw in candidates) {
-                val safeName = sanitizeSimpleFileName(raw) ?: continue
-                for (dir in candidateRoots(appContext)) {
-                    val f = File(dir, safeName)
-                    val ok = runCatching {
-                        f.exists() && f.isFile && f.length() > 0L
-                    }.getOrDefault(false)
-                    if (ok) return f
-                }
-            }
-
-            return null
-        }
-
-        /**
-         * Returns small app-private roots that may contain model files.
-         */
-        private fun candidateRoots(appContext: Context): List<File> {
-            return listOfNotNull(
-                appContext.filesDir,
-                File(appContext.filesDir, "models"),
-                File(appContext.filesDir, "slm"),
-                File(appContext.filesDir, "litert"),
-                appContext.noBackupFilesDir,
-                appContext.cacheDir,
-            ).distinct()
-        }
-
-        /**
-         * Simple file-name sanitizer to avoid traversal-like inputs.
-         */
-        private fun sanitizeSimpleFileName(name: String): String? {
-            val n = name.trim()
-            if (n.isBlank()) return null
-            if (n.contains('/')) return null
-            if (n.contains('\\')) return null
-            if (n.contains("..")) return null
-            if (n.length > 200) return null
-            return n
         }
     }
 
