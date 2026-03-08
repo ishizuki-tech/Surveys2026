@@ -56,6 +56,12 @@ import kotlinx.coroutines.withContext
  * - Final assistant output is appended separately using structured fields from
  *   [ChatModels.ValidationOutcome].
  *
+ * Persistence policy:
+ * - Live UI may contain ephemeral MODEL bubbles.
+ * - Persisted drafts must exclude ephemeral MODEL bubbles and keep only stable
+ *   assistant-side step details.
+ * - Legacy assistant streamText is migrated into step2Raw when possible.
+ *
  * Robustness policy:
  * - Show TTFT by creating a placeholder MODEL bubble immediately on submit.
  * - Keep the "stream window" open for the whole validation attempt.
@@ -760,11 +766,13 @@ class ChatQuestionViewModel(
         step2Raw: String?,
     ) {
         val a = assistantMessage.trim()
-        val q = followUpQuestion?.trim().orEmpty()
+        val q = followUpQuestion.normalizedOptionalText()
+        val cleanedStep1Raw = step1Raw.normalizedOptionalText()
+        val cleanedStep2Raw = step2Raw.normalizedOptionalText()
 
         val composite = buildString {
             if (a.isNotEmpty()) append(a)
-            if (q.isNotEmpty()) {
+            if (!q.isNullOrEmpty()) {
                 if (isNotEmpty()) append("\n\n")
                 append(q)
             }
@@ -775,13 +783,13 @@ class ChatQuestionViewModel(
         val msg = ChatMessage.assistant(
             id = id,
             assistantMessage = a,
-            followUpQuestion = followUpQuestion,
+            followUpQuestion = q,
             textFallback = composite,
             evalStatus = evalStatus,
             evalScore = evalScore,
-            evalReason = evalReason,
-            step1Raw = step1Raw,
-            step2Raw = step2Raw,
+            evalReason = evalReason?.trim()?.takeIf { it.isNotEmpty() },
+            step1Raw = cleanedStep1Raw,
+            step2Raw = cleanedStep2Raw,
         )
 
         appendMessageInternal(msg, "appendAssistantOutcome")
@@ -1103,7 +1111,7 @@ class ChatQuestionViewModel(
     private fun restoreOrSeed() {
         val draft = draftStore.load(draftKey)
         if (draft != null) {
-            val sanitized = sanitizeRestoredMessages(draft.messages)
+            val sanitized = normalizePersistedMessages(draft.messages)
 
             withStateLock {
                 stage = draft.stage
@@ -1124,7 +1132,7 @@ class ChatQuestionViewModel(
 
             AppLog.i(TAG, "draft restored qid=$qid stage=${withStateLock { stage }} msgs=${sanitized.size}")
 
-            if (sanitized.size != draft.messages.size) {
+            if (sanitized.size != draft.messages.size || sanitized != draft.messages) {
                 safePersistDraft("restore.sanitized")
             }
             return
@@ -1155,68 +1163,105 @@ class ChatQuestionViewModel(
     }
 
     /**
-     * Sanitize restored messages for a stable post-restore UI.
+     * Build a persisted transcript snapshot from the live in-memory transcript.
      *
      * Rules:
-     * - Drop MODEL bubbles because they are ephemeral.
-     * - Collapse any leftover STREAMING state.
-     * - Migrate legacy assistant streamText into step2Raw when possible.
+     * - Drop MODEL bubbles because they are ephemeral UI-only artifacts.
+     * - Clear transient stream fields from persisted messages.
+     * - Migrate legacy assistant streamText into step2Raw when step details are absent.
+     * - Normalize optional assistant-side detail strings.
      */
-    private fun sanitizeRestoredMessages(raw: List<ChatMessage>): List<ChatMessage> {
+    private fun buildPersistableMessagesSnapshot(): List<ChatMessage> {
+        return normalizePersistedMessages(messagesBacking.toList())
+    }
+
+    /**
+     * Normalize persisted/restored messages for a stable non-streaming transcript.
+     */
+    private fun normalizePersistedMessages(raw: List<ChatMessage>): List<ChatMessage> {
         if (raw.isEmpty()) return raw
 
         var changed = false
         val out = ArrayList<ChatMessage>(raw.size)
 
         for (m in raw) {
-            if (m.role == ChatRole.MODEL) {
+            val normalized = normalizePersistedMessageOrNull(m)
+            if (normalized == null) {
                 changed = true
                 continue
             }
-
-            var cur = m
-
-            /**
-             * Migrate legacy assistant details stored in streamText.
-             */
-            if (
-                cur.role == ChatRole.ASSISTANT &&
-                !cur.streamText.isNullOrBlank() &&
-                cur.step1Raw.isNullOrBlank() &&
-                cur.step2Raw.isNullOrBlank()
-            ) {
+            if (normalized != m) {
                 changed = true
-                cur = cur.copy(
-                    step2Raw = cur.streamText,
-                    streamText = null,
-                    streamState = ChatStreamState.NONE,
-                    streamCollapsed = true,
-                    streamSessionId = null,
-                )
             }
-
-            if (cur.streamState == ChatStreamState.STREAMING) {
-                changed = true
-                val hasText = !cur.streamText.isNullOrBlank()
-                cur = if (hasText) {
-                    cur.copy(
-                        streamState = ChatStreamState.ENDED,
-                        streamCollapsed = true,
-                    )
-                } else {
-                    cur.copy(
-                        streamText = null,
-                        streamState = ChatStreamState.NONE,
-                        streamCollapsed = true,
-                        streamSessionId = null,
-                    )
-                }
-            }
-
-            out += cur
+            out += normalized
         }
 
         return if (changed) out else raw
+    }
+
+    /**
+     * Convert one live message into a stable persisted/restored message.
+     *
+     * Returns null when the message must not be persisted.
+     */
+    private fun normalizePersistedMessageOrNull(message: ChatMessage): ChatMessage? {
+        if (message.role == ChatRole.MODEL) {
+            return null
+        }
+
+        var cur = message
+
+        val normalizedAssistantMessage = cur.assistantMessage.normalizedOptionalText()
+        val normalizedFollowUpQuestion = cur.followUpQuestion.normalizedOptionalText()
+        val normalizedEvalReason = cur.evalReason.normalizedOptionalText()
+
+        var normalizedStep1Raw = cur.step1Raw.normalizedOptionalText()
+        var normalizedStep2Raw = cur.step2Raw.normalizedOptionalText()
+
+        val legacyStream = cur.streamText.normalizedOptionalText()
+
+        if (
+            cur.role == ChatRole.ASSISTANT &&
+            legacyStream != null &&
+            normalizedStep1Raw == null &&
+            normalizedStep2Raw == null
+        ) {
+            normalizedStep2Raw = legacyStream
+        }
+
+        cur = cur.copy(
+            assistantMessage = normalizedAssistantMessage,
+            followUpQuestion = normalizedFollowUpQuestion,
+            evalReason = normalizedEvalReason,
+            step1Raw = normalizedStep1Raw,
+            step2Raw = normalizedStep2Raw,
+        )
+
+        val targetCollapsed = when (cur.role) {
+            ChatRole.ASSISTANT -> true
+            ChatRole.USER -> cur.streamCollapsed
+            ChatRole.MODEL -> cur.streamCollapsed
+        }
+
+        if (
+            cur.streamText != null ||
+            cur.streamState != ChatStreamState.NONE ||
+            cur.streamSessionId != null ||
+            cur.streamCollapsed != targetCollapsed
+        ) {
+            cur = cur.copy(
+                streamText = null,
+                streamState = ChatStreamState.NONE,
+                streamCollapsed = targetCollapsed,
+                streamSessionId = null,
+            )
+        }
+
+        return cur
+    }
+
+    private fun String?.normalizedOptionalText(): String? {
+        return this?.trim()?.takeIf { it.isNotEmpty() }
     }
 
     // ---------------------------------------------------------------------
@@ -1224,7 +1269,7 @@ class ChatQuestionViewModel(
     // ---------------------------------------------------------------------
 
     private fun persistDraftOnMain() {
-        val messagesSnapshot = messagesBacking.toList()
+        val messagesSnapshot = buildPersistableMessagesSnapshot()
         val snapshot = synchronized(stateLock) {
             ChatDrafts.ChatDraft(
                 stage = stage,
@@ -1263,10 +1308,6 @@ class ChatQuestionViewModel(
             safePersistDraft("inputDebounce:$reason")
         }
     }
-
-    // ---------------------------------------------------------------------
-    // Debug helpers
-    // ---------------------------------------------------------------------
 
     private fun logAnswerDigest(label: String, text: String) {
         val t = text.trim()
