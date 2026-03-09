@@ -52,7 +52,7 @@ class AnswerValidator(
         )
 
         log(
-            "validateMain: qid=$qid " +
+            "validateMain: qid=${qid.ifBlank { "<blank>" }} " +
                     "step1Status=${result.step1.status} " +
                     "step1Score=${result.step1.score} " +
                     "step2Present=${result.step2 != null} " +
@@ -87,7 +87,7 @@ class AnswerValidator(
         )
 
         log(
-            "validateFollowUp: qid=$qid " +
+            "validateFollowUp: qid=${qid.ifBlank { "<blank>" }} " +
                     "step1Status=${result.step1.status} " +
                     "step1Score=${result.step1.score} " +
                     "step2Present=${result.step2 != null} " +
@@ -120,31 +120,42 @@ class AnswerValidator(
 
         val assistantMessageFromStep2 = result.step2
             ?.assistantMessage
-            ?.trim()
+            .normalizedOptionalText()
             .orEmpty()
 
         val followUpFromStep2 = result.step2
             ?.followUpQuestion
-            ?.trim()
+            .normalizedOptionalText()
             .orEmpty()
+
+        val normalizedFallbackFollowUp = fallbackFollowUp
+            .trim()
+            .ifBlank {
+                when (finalStatus) {
+                    ChatModels.ValidationStatus.ACCEPTED -> ""
+                    ChatModels.ValidationStatus.NEED_FOLLOW_UP -> DEFAULT_FOLLOW_UP_MORE
+                }
+            }
 
         val normalizedFollowUp = when (finalStatus) {
             ChatModels.ValidationStatus.ACCEPTED -> null
             ChatModels.ValidationStatus.NEED_FOLLOW_UP -> {
-                followUpFromStep2.takeIf { it.isNotBlank() } ?: fallbackFollowUp
+                followUpFromStep2.takeIf { it.isNotBlank() } ?: normalizedFallbackFollowUp
             }
         }
 
         val normalizedAssistantMessage = when {
             assistantMessageFromStep2.isNotBlank() -> assistantMessageFromStep2
-            finalStatus == ChatModels.ValidationStatus.ACCEPTED ->
+            finalStatus == ChatModels.ValidationStatus.ACCEPTED -> {
                 DEFAULT_ACCEPTED_ASSISTANT_MESSAGE
-            else ->
+            }
+            else -> {
                 DEFAULT_NEED_MORE_ASSISTANT_MESSAGE
+            }
         }
 
         log(
-            "mapOutcome: qid=$questionId " +
+            "mapOutcome: qid=${questionId.ifBlank { "<blank>" }} " +
                     "finalStatus=$finalStatus " +
                     "score=${result.step1.score} " +
                     "assistantLen=${normalizedAssistantMessage.length} " +
@@ -168,6 +179,10 @@ class AnswerValidator(
      */
     private fun log(msg: String) {
         logger?.invoke(msg) ?: SafeLog.d(TAG, msg)
+    }
+
+    private fun String?.normalizedOptionalText(): String? {
+        return this?.trim()?.takeIf { it.isNotEmpty() }
     }
 
     companion object {

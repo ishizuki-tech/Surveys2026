@@ -287,9 +287,6 @@ class ChatQuestionViewModel(
     @Volatile
     private var committedStep1AttemptId: Long = 0L
 
-    @Volatile
-    private var committedStep1Raw: String? = null
-
     private val streamCollector = StreamCollector()
 
     init {
@@ -441,18 +438,18 @@ class ChatQuestionViewModel(
     private fun requestStreamCancel(): Boolean {
         var didRequestCancel = false
 
+        val localSessionId = activeStreamSessionId
+        if (localSessionId > 0L) {
+            didRequestCancel = true
+            lastCancelledStreamSessionId = localSessionId
+            streamBridge.cancel(localSessionId, ChatStreamEvent.Codes.CANCELLED)
+            return true
+        }
+
         val cancelledId = streamBridge.cancelActive(ChatStreamEvent.Codes.CANCELLED)
         if (cancelledId > 0L) {
             didRequestCancel = true
             lastCancelledStreamSessionId = cancelledId
-            return didRequestCancel
-        }
-
-        val sessionId = activeStreamSessionId
-        if (sessionId > 0L) {
-            didRequestCancel = true
-            lastCancelledStreamSessionId = sessionId
-            streamBridge.cancel(sessionId, ChatStreamEvent.Codes.CANCELLED)
         }
 
         return didRequestCancel
@@ -790,6 +787,11 @@ class ChatQuestionViewModel(
         val a = assistantMessage.trim()
         val q = followUpQuestion.normalizedOptionalText()
 
+        if (a.isEmpty() && q.isNullOrEmpty()) {
+            AppLog.d(TAG, "appendAssistantOutcome skipped: empty payload")
+            return
+        }
+
         val composite = buildString {
             if (a.isNotEmpty()) append(a)
             if (!q.isNullOrEmpty()) {
@@ -813,18 +815,29 @@ class ChatQuestionViewModel(
 
     private fun resetCommittedModelStateForNewAttempt() {
         committedStep1AttemptId = 0L
-        committedStep1Raw = null
     }
 
     private fun markStep1CommittedForActiveAttempt(raw: String) {
         val attemptId = activeAttemptId
         if (attemptId <= 0L) return
         committedStep1AttemptId = attemptId
-        committedStep1Raw = raw
+        AppLog.d(TAG, "step1 committed q=$qid attempt=$attemptId len=${raw.length}")
     }
 
     private fun hasCommittedStep1ForAttempt(attemptId: Long): Boolean {
         return committedStep1AttemptId == attemptId
+    }
+
+    private fun isDuplicateStableModelTail(
+        phase: ModelPhase,
+        rawText: String,
+    ): Boolean {
+        val tail = messagesBacking.lastOrNull() ?: return false
+        if (tail.role != ChatRole.MODEL) return false
+        if (tail.modelPhase != phase) return false
+        if (tail.streamState != ChatStreamState.NONE) return false
+        if (tail.streamSessionId != null) return false
+        return tail.text.trim() == rawText.trim()
     }
 
     private fun appendStableModelMessage(
@@ -832,6 +845,11 @@ class ChatQuestionViewModel(
         rawText: String,
         reason: String,
     ) {
+        if (isDuplicateStableModelTail(phase = phase, rawText = rawText)) {
+            AppLog.d(TAG, "appendStableModelMessage skipped duplicate phase=$phase len=${rawText.length}")
+            return
+        }
+
         appendMessageInternal(
             ChatMessage.modelFinal(
                 id = UUID.randomUUID().toString(),
@@ -841,7 +859,6 @@ class ChatQuestionViewModel(
             reason,
         )
     }
-
 
     private fun appendModelOutcome(
         step1Raw: String?,

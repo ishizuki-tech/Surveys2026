@@ -21,6 +21,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
 
 /**
  * Thread-safe bridge for streaming raw validation/model output to the UI.
@@ -109,7 +110,7 @@ class ChatStreamBridge(
         }
 
         emitEvent(ChatStreamEvent.End(sessionId = sessionId, phase = phase))
-        updateActiveSessionAfterTerminal(sessionId)
+        recomputeActiveSessionAfterTerminal()
 
         logger?.invoke("end sid=$sessionId phase=$phase")
     }
@@ -141,7 +142,7 @@ class ChatStreamBridge(
                 code = code,
             ),
         )
-        updateActiveSessionAfterTerminal(sessionId)
+        recomputeActiveSessionAfterTerminal()
 
         logger?.invoke("error sid=$sessionId phase=$phase token=$token code=$code")
     }
@@ -153,8 +154,10 @@ class ChatStreamBridge(
         val sessionId = lastActiveSessionId.get()
         if (sessionId <= 0L) return 0L
 
-        val phase = activePhaseBySession[sessionId] ?: return 0L
-        activePhaseBySession.remove(sessionId)
+        val phase = activePhaseBySession.remove(sessionId) ?: run {
+            recomputeActiveSessionAfterTerminal()
+            return 0L
+        }
 
         emitEvent(
             ChatStreamEvent.Error(
@@ -164,7 +167,7 @@ class ChatStreamBridge(
                 code = code,
             ),
         )
-        updateActiveSessionAfterTerminal(sessionId)
+        recomputeActiveSessionAfterTerminal()
 
         logger?.invoke("cancelActive sid=$sessionId phase=$phase code=$code")
         return sessionId
@@ -192,7 +195,7 @@ class ChatStreamBridge(
                 code = code,
             ),
         )
-        updateActiveSessionAfterTerminal(sessionId)
+        recomputeActiveSessionAfterTerminal()
 
         logger?.invoke("cancel sid=$sessionId phase=$phase code=$code")
     }
@@ -210,15 +213,22 @@ class ChatStreamBridge(
         }
     }
 
-    private fun updateActiveSessionAfterTerminal(terminalSessionId: Long) {
-        val current = lastActiveSessionId.get()
-        if (current == terminalSessionId) {
-            lastActiveSessionId.set(0L)
-            updateStats { it.copy(activeSessionId = 0L) }
-        }
+    /**
+     * Recomputes the current active session from the remaining active session map.
+     *
+     * Notes:
+     * - Session ids are monotonic increasing.
+     * - The maximum remaining id is the newest still-active session.
+     * - This keeps stats and cancelActive() aligned with reality even if an older or
+     *   non-current session terminates out of order.
+     */
+    private fun recomputeActiveSessionAfterTerminal() {
+        val nextActive = activePhaseBySession.keys.maxOrNull() ?: 0L
+        lastActiveSessionId.set(nextActive)
+        updateStats { it.copy(activeSessionId = nextActive) }
     }
 
     private fun updateStats(transform: (StreamStats) -> StreamStats) {
-        _stats.value = transform(_stats.value)
+        _stats.update(transform)
     }
 }
