@@ -58,7 +58,7 @@ internal fun rememberSurveyNavEntries(
     rootCompileStateState: State<WarmupController.CompileState>,
 ): (NavKey) -> NavEntry<NavKey> {
     val surveyFlow = remember(surveyConfig) {
-        SurveyFlowPlan.from(surveyConfig)
+        SurveyRootEntriesSupport.SurveyFlowPlan.from(surveyConfig)
     }
 
     return remember(
@@ -93,7 +93,7 @@ internal fun rememberSurveyNavEntries(
                     SurveyStartScreen(
                         onBegin = {
                             SafeLog.i(
-                                TAG,
+                                SurveyRootEntriesSupport.TAG,
                                 "beginSurvey: no question nodes in graph -> review",
                             )
                             nav.goReview()
@@ -130,7 +130,7 @@ internal fun rememberSurveyNavEntries(
                                         nav.beginQuestions(firstQuestionId)
                                     } else {
                                         SafeLog.w(
-                                            TAG,
+                                            SurveyRootEntriesSupport.TAG,
                                             "beginSurvey: question flow expected but unresolved -> review",
                                         )
                                         nav.goReview()
@@ -198,133 +198,142 @@ internal fun rememberSurveyNavEntries(
     }
 }
 
-private data class SurveyFlowPlan(
-    val startQuestionId: String?,
-    val questionCount: Int,
-    private val nodeById: Map<String, NodeDTO>,
-    private val nextQuestionIdByQuestionId: Map<String, String?>,
-) {
-    fun promptFor(questionIdRaw: String): String {
-        val questionId = questionIdRaw.trim()
-        val node = nodeById[questionId]
-        return if (node != null) {
-            buildQuestionPrompt(node)
-        } else {
-            "Question: $questionId"
+/**
+ * File-local support types and helpers for root navigation entry construction.
+ */
+private object SurveyRootEntriesSupport {
+    const val TAG: String = "SurveyRootEntries"
+
+    data class SurveyFlowPlan(
+        val startQuestionId: String?,
+        val questionCount: Int,
+        private val nodeById: Map<String, NodeDTO>,
+        private val nextQuestionIdByQuestionId: Map<String, String?>,
+    ) {
+        fun promptFor(questionIdRaw: String): String {
+            val questionId = questionIdRaw.trim()
+            val node = nodeById[questionId]
+            return if (node != null) {
+                buildQuestionPrompt(node)
+            } else {
+                "Question: $questionId"
+            }
         }
-    }
 
-    fun nextQuestionAfter(questionIdRaw: String): String? {
-        val questionId = questionIdRaw.trim()
-        val cached = nextQuestionIdByQuestionId[questionId]
-        if (questionId in nextQuestionIdByQuestionId) return cached
+        fun nextQuestionAfter(questionIdRaw: String): String? {
+            val questionId = questionIdRaw.trim()
+            val cached = nextQuestionIdByQuestionId[questionId]
+            if (questionId in nextQuestionIdByQuestionId) return cached
 
-        val nextId = nodeById[questionId]?.nextId
-        return resolveFirstQuestionId(nextId, nodeById)
-    }
+            val nextId = nodeById[questionId]?.nextId
+            return resolveFirstQuestionId(nextId, nodeById)
+        }
 
-    companion object {
-        private const val MAX_GRAPH_HOPS: Int = 256
+        companion object {
+            const val MAX_GRAPH_HOPS: Int = 256
 
-        fun from(surveyConfig: SurveyConfig?): SurveyFlowPlan {
-            if (surveyConfig == null) {
+            fun from(surveyConfig: SurveyConfig?): SurveyFlowPlan {
+                if (surveyConfig == null) {
+                    return SurveyFlowPlan(
+                        startQuestionId = null,
+                        questionCount = 0,
+                        nodeById = emptyMap(),
+                        nextQuestionIdByQuestionId = emptyMap(),
+                    )
+                }
+
+                val nodes = LinkedHashMap<String, NodeDTO>()
+                surveyConfig.graph.nodes.forEach { node ->
+                    val nodeId = node.id.trim()
+                    if (nodeId.isNotBlank() && !nodes.containsKey(nodeId)) {
+                        nodes[nodeId] = node
+                    }
+                }
+
+                val resolvedStartId =
+                    surveyConfig.graph.startId
+                        .trim()
+                        .takeIf { it.isNotBlank() }
+                        ?: nodes.values.firstOrNull { node ->
+                            node.nodeType() == NodeType.START
+                        }?.id?.trim()
+
+                val questionIds = nodes
+                    .filterValues { node -> isQuestionNode(node) }
+                    .keys
+
+                val nextQuestionIdByQuestionId = LinkedHashMap<String, String?>()
+                nodes.forEach { (nodeId, node) ->
+                    if (isQuestionNode(node)) {
+                        nextQuestionIdByQuestionId[nodeId] =
+                            resolveFirstQuestionId(node.nextId, nodes)
+                    }
+                }
+
+                val startQuestionId = resolveFirstQuestionId(resolvedStartId, nodes)
+                SafeLog.i(
+                    TAG,
+                    "surveyFlow: nodes=${nodes.size} questions=${questionIds.size} startQuestionId=${startQuestionId ?: "none"}",
+                )
+
                 return SurveyFlowPlan(
-                    startQuestionId = null,
-                    questionCount = 0,
-                    nodeById = emptyMap(),
-                    nextQuestionIdByQuestionId = emptyMap(),
+                    startQuestionId = startQuestionId,
+                    questionCount = questionIds.size,
+                    nodeById = nodes,
+                    nextQuestionIdByQuestionId = nextQuestionIdByQuestionId,
                 )
             }
-
-            val nodes = LinkedHashMap<String, NodeDTO>()
-            surveyConfig.graph.nodes.forEach { node ->
-                val nodeId = node.id.trim()
-                if (nodeId.isNotBlank() && !nodes.containsKey(nodeId)) {
-                    nodes[nodeId] = node
-                }
-            }
-
-            val resolvedStartId = surveyConfig.graph.startId
-                .trim()
-                .takeIf { it.isNotBlank() }
-                ?: nodes.values.firstOrNull { it.nodeType() == NodeType.START }?.id?.trim()
-
-            val questionIds = nodes
-                .filterValues { it.isQuestionNode() }
-                .keys
-
-            val nextQuestionIdByQuestionId = LinkedHashMap<String, String?>()
-            nodes.forEach { (nodeId, node) ->
-                if (node.isQuestionNode()) {
-                    nextQuestionIdByQuestionId[nodeId] = resolveFirstQuestionId(node.nextId, nodes)
-                }
-            }
-
-            val startQuestionId = resolveFirstQuestionId(resolvedStartId, nodes)
-            SafeLog.i(
-                TAG,
-                "surveyFlow: nodes=${nodes.size} questions=${questionIds.size} startQuestionId=${startQuestionId ?: "none"}",
-            )
-
-            return SurveyFlowPlan(
-                startQuestionId = startQuestionId,
-                questionCount = questionIds.size,
-                nodeById = nodes,
-                nextQuestionIdByQuestionId = nextQuestionIdByQuestionId,
-            )
-        }
-
-        private fun resolveFirstQuestionId(
-            startIdRaw: String?,
-            nodeById: Map<String, NodeDTO>,
-        ): String? {
-            var cursor = startIdRaw?.trim()?.takeIf { it.isNotBlank() } ?: return null
-            val visited = LinkedHashSet<String>()
-            var hops = 0
-
-            while (hops < MAX_GRAPH_HOPS && visited.add(cursor)) {
-                val node = nodeById[cursor] ?: return null
-                if (node.isQuestionNode()) {
-                    return cursor
-                }
-                cursor = node.nextId?.trim()?.takeIf { it.isNotBlank() } ?: return null
-                hops += 1
-            }
-
-            return null
         }
     }
-}
 
-private fun NodeDTO.isQuestionNode(): Boolean {
-    return when (nodeType()) {
-        NodeType.START,
-        NodeType.REVIEW,
-        NodeType.DONE,
-        NodeType.UNKNOWN -> false
+    private fun resolveFirstQuestionId(
+        startIdRaw: String?,
+        nodeById: Map<String, NodeDTO>,
+    ): String? {
+        var cursor = startIdRaw?.trim()?.takeIf { it.isNotBlank() } ?: return null
+        val visited = LinkedHashSet<String>()
+        var hops = 0
 
-        NodeType.TEXT,
-        NodeType.SINGLE_CHOICE,
-        NodeType.MULTI_CHOICE,
-        NodeType.AI -> true
+        while (hops < SurveyFlowPlan.MAX_GRAPH_HOPS && visited.add(cursor)) {
+            val node = nodeById[cursor] ?: return null
+            if (isQuestionNode(node)) {
+                return cursor
+            }
+            cursor = node.nextId?.trim()?.takeIf { it.isNotBlank() } ?: return null
+            hops += 1
+        }
+
+        return null
+    }
+
+    private fun isQuestionNode(node: NodeDTO): Boolean {
+        return when (node.nodeType()) {
+            NodeType.START,
+            NodeType.REVIEW,
+            NodeType.DONE,
+            NodeType.UNKNOWN -> false
+
+            NodeType.TEXT,
+            NodeType.SINGLE_CHOICE,
+            NodeType.MULTI_CHOICE,
+            NodeType.AI -> true
+        }
+    }
+
+    private fun buildQuestionPrompt(node: NodeDTO): String {
+        val body = node.question.trim()
+            .ifBlank { node.title.trim() }
+            .ifBlank { "Question: ${node.id.trim()}" }
+
+        val options = node.options
+            .mapNotNull { option -> option.trim().takeIf { it.isNotBlank() } }
+
+        if (options.isEmpty()) return body
+
+        val renderedOptions = options
+            .mapIndexed { index, option -> "${index + 1}. $option" }
+            .joinToString(separator = "\n")
+
+        return "$body\n$renderedOptions"
     }
 }
-
-private fun buildQuestionPrompt(node: NodeDTO): String {
-    val body = node.question.trim()
-        .ifBlank { node.title.trim() }
-        .ifBlank { "Question: ${node.id.trim()}" }
-
-    val options = node.options
-        .mapNotNull { option -> option.trim().takeIf { it.isNotBlank() } }
-
-    if (options.isEmpty()) return body
-
-    val renderedOptions = options
-        .mapIndexed { index, option -> "${index + 1}. $option" }
-        .joinToString(separator = "\n")
-
-    return "$body\n$renderedOptions"
-}
-
-private const val TAG: String = "SurveyRootEntries"

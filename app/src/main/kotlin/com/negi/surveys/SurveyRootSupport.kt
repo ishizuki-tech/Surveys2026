@@ -85,7 +85,7 @@ internal fun GateOrContent(
         return
     }
 
-    val isBlocking = shouldGateBlock(
+    val isBlocking = SurveyRootSupportUiSupport.shouldGateBlock(
         policy = policy,
         modelState = modelState,
         prefetchState = prefetchState,
@@ -131,7 +131,7 @@ internal fun GateOrLatchedContent(
         return
     }
 
-    val isBlocking = shouldGateBlock(
+    val isBlocking = SurveyRootSupportUiSupport.shouldGateBlock(
         policy = policy,
         modelState = modelState,
         prefetchState = prefetchState,
@@ -160,24 +160,6 @@ internal fun GateOrLatchedContent(
     }
 }
 
-private fun shouldGateBlock(
-    policy: GatePolicy,
-    modelState: ModelDownloadController.ModelState,
-    prefetchState: WarmupController.PrefetchState,
-    compileState: WarmupController.CompileState,
-): Boolean {
-    val modelBlocking = modelState !is ModelDownloadController.ModelState.Ready
-    val prefetchBusy = isPrefetchInProgress(prefetchState)
-    val compileBusy =
-        compileState is WarmupController.CompileState.WaitingForPrefetch ||
-                compileState is WarmupController.CompileState.Compiling
-
-    return when (policy) {
-        GatePolicy.MODEL_ONLY -> modelBlocking
-        GatePolicy.MODEL_PREFETCH_COMPILE -> modelBlocking || prefetchBusy || compileBusy
-    }
-}
-
 @Composable
 internal fun SlmGateScreen(
     modelState: ModelDownloadController.ModelState,
@@ -186,25 +168,21 @@ internal fun SlmGateScreen(
     onBack: () -> Unit,
     onRetryAll: () -> Unit,
 ) {
-    val prefetchInProgress = isPrefetchInProgress(prefetchState)
-    val compileInProgress =
-        compileState is WarmupController.CompileState.WaitingForPrefetch ||
-                compileState is WarmupController.CompileState.Compiling
-    val modelInProgress =
-        modelState is ModelDownloadController.ModelState.Checking ||
-                modelState is ModelDownloadController.ModelState.Downloading
+    val prefetchInProgress = SurveyRootSupportUiSupport.isPrefetchInProgress(prefetchState)
+    val compileInProgress = SurveyRootSupportUiSupport.isCompileInProgress(compileState)
+    val modelInProgress = SurveyRootSupportUiSupport.isModelInProgress(modelState)
 
-    val nowMs = rememberWarmupUiNowMs(
+    val nowMs = SurveyRootSupportUiSupport.rememberWarmupUiNowMs(
         inProgress = modelInProgress || prefetchInProgress || compileInProgress,
         tickIntervalMs = 50L,
     )
 
-    val prefetchElapsedMs = rememberDynamicElapsedMs(
+    val prefetchElapsedMs = SurveyRootSupportUiSupport.rememberDynamicElapsedMs(
         reportedElapsedMs = prefetchState.elapsedMs,
         inProgress = prefetchInProgress,
         nowMs = nowMs,
     )
-    val compileElapsedMs = rememberDynamicElapsedMs(
+    val compileElapsedMs = SurveyRootSupportUiSupport.rememberDynamicElapsedMs(
         reportedElapsedMs = compileState.elapsedMs,
         inProgress = compileInProgress,
         nowMs = nowMs,
@@ -218,23 +196,18 @@ internal fun SlmGateScreen(
         compileElapsedMs,
     ) {
         when {
-            modelState !is ModelDownloadController.ModelState.Ready -> modelLabelForUi(modelState)
+            modelState !is ModelDownloadController.ModelState.Ready ->
+                SurveyRootSupportUiSupport.modelLabelForUi(modelState)
+
             prefetchInProgress ->
-                prefetchLabelForUi(
+                SurveyRootSupportUiSupport.prefetchLabelForUi(
                     state = prefetchState,
                     elapsedMs = prefetchElapsedMs,
                     format = WARMUP_UI_FORMAT_GATE,
                 )
 
-            compileState is WarmupController.CompileState.WaitingForPrefetch ->
-                compileLabelForUi(
-                    state = compileState,
-                    elapsedMs = compileElapsedMs,
-                    format = WARMUP_UI_FORMAT_GATE,
-                )
-
-            compileState is WarmupController.CompileState.Compiling ->
-                compileLabelForUi(
+            compileInProgress ->
+                SurveyRootSupportUiSupport.compileLabelForUi(
                     state = compileState,
                     elapsedMs = compileElapsedMs,
                     format = WARMUP_UI_FORMAT_GATE,
@@ -375,102 +348,8 @@ internal fun LogStateTransitions(
     }
 }
 
-internal fun isPrefetchInProgress(state: WarmupController.PrefetchState): Boolean {
-    return state is WarmupController.PrefetchState.Running
-}
-
 internal fun modelLabelForUi(state: ModelDownloadController.ModelState): String {
-    return when (state) {
-        is ModelDownloadController.ModelState.NotConfigured -> "Model not configured"
-        is ModelDownloadController.ModelState.Idle -> "Idle"
-        is ModelDownloadController.ModelState.Checking -> "Checking… ${formatElapsed(state.elapsedMs)}"
-        is ModelDownloadController.ModelState.Downloading -> {
-            val total = state.total
-            if (total != null && total > 0L) {
-                val pct = ((state.downloaded.toDouble() / total.toDouble()) * 100.0)
-                    .toInt()
-                    .coerceIn(0, 100)
-                "Downloading ${pct}% ${formatElapsed(state.elapsedMs)}"
-            } else {
-                "Downloading ${formatElapsed(state.elapsedMs)}"
-            }
-        }
-
-        is ModelDownloadController.ModelState.Ready -> "Ready"
-        is ModelDownloadController.ModelState.Failed -> "Failed"
-        is ModelDownloadController.ModelState.Cancelled -> "Cancelled"
-    }
-}
-
-internal fun prefetchLabelForUi(
-    state: WarmupController.PrefetchState,
-    elapsedMs: Long,
-    format: WarmupUiFormat,
-): String {
-    val name = state.javaClass.simpleName
-    val elapsed = formatElapsed(elapsedMs)
-    return when {
-        isPrefetchInProgress(state) -> "${format.prefetchRunningPrefix} ($name) $elapsed"
-        name.equals("Idle", ignoreCase = true) -> format.idleLabel
-        else -> "$name $elapsed"
-    }
-}
-
-internal fun compileLabelForUi(
-    state: WarmupController.CompileState,
-    elapsedMs: Long,
-    format: WarmupUiFormat,
-): String {
-    val elapsed = formatElapsed(elapsedMs)
-    return when (state) {
-        is WarmupController.CompileState.WaitingForPrefetch -> "${format.compileWaitingPrefix} $elapsed"
-        is WarmupController.CompileState.Compiling -> "${format.compileCompilingPrefix} $elapsed"
-        is WarmupController.CompileState.Idle -> format.idleLabel
-        else -> "${state.javaClass.simpleName} $elapsed"
-    }
-}
-
-@Composable
-internal fun rememberWarmupUiNowMs(
-    inProgress: Boolean,
-    tickIntervalMs: Long,
-): Long {
-    var uiNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-
-    LaunchedEffect(inProgress, tickIntervalMs) {
-        if (!inProgress) return@LaunchedEffect
-        while (isActive) {
-            uiNowMs = SystemClock.elapsedRealtime()
-            delay(tickIntervalMs)
-        }
-    }
-
-    return uiNowMs
-}
-
-/**
- * Produces a smoothly increasing elapsedMs for UI even if the underlying state updates are sparse.
- */
-@Composable
-internal fun rememberDynamicElapsedMs(
-    reportedElapsedMs: Long,
-    inProgress: Boolean,
-    nowMs: Long,
-): Long {
-    var baseElapsedMs by remember { mutableLongStateOf(reportedElapsedMs) }
-    var baseNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
-
-    LaunchedEffect(reportedElapsedMs, inProgress) {
-        baseElapsedMs = reportedElapsedMs
-        baseNowMs = SystemClock.elapsedRealtime()
-    }
-
-    return if (!inProgress) {
-        reportedElapsedMs
-    } else {
-        val live = baseElapsedMs + (nowMs - baseNowMs)
-        if (live < 0L) 0L else live
-    }
+    return SurveyRootSupportUiSupport.modelLabelForUi(state)
 }
 
 @Composable
@@ -480,37 +359,35 @@ internal fun rememberWarmupUiLabels(
     tickIntervalMs: Long,
     format: WarmupUiFormat,
 ): Pair<String, String> {
-    val prefetchInProgress = isPrefetchInProgress(prefetchState)
-    val compileInProgress =
-        compileState is WarmupController.CompileState.WaitingForPrefetch ||
-                compileState is WarmupController.CompileState.Compiling
+    val prefetchInProgress = SurveyRootSupportUiSupport.isPrefetchInProgress(prefetchState)
+    val compileInProgress = SurveyRootSupportUiSupport.isCompileInProgress(compileState)
 
     val inProgress = prefetchInProgress || compileInProgress
-    val nowMs = rememberWarmupUiNowMs(
+    val nowMs = SurveyRootSupportUiSupport.rememberWarmupUiNowMs(
         inProgress = inProgress,
         tickIntervalMs = tickIntervalMs,
     )
 
-    val prefetchElapsedMs = rememberDynamicElapsedMs(
+    val prefetchElapsedMs = SurveyRootSupportUiSupport.rememberDynamicElapsedMs(
         reportedElapsedMs = prefetchState.elapsedMs,
         inProgress = prefetchInProgress,
         nowMs = nowMs,
     )
-    val compileElapsedMs = rememberDynamicElapsedMs(
+    val compileElapsedMs = SurveyRootSupportUiSupport.rememberDynamicElapsedMs(
         reportedElapsedMs = compileState.elapsedMs,
         inProgress = compileInProgress,
         nowMs = nowMs,
     )
 
     val prefetchLabel = remember(prefetchState, prefetchElapsedMs, format) {
-        prefetchLabelForUi(
+        SurveyRootSupportUiSupport.prefetchLabelForUi(
             state = prefetchState,
             elapsedMs = prefetchElapsedMs,
             format = format,
         )
     }
     val compileLabel = remember(compileState, compileElapsedMs, format) {
-        compileLabelForUi(
+        SurveyRootSupportUiSupport.compileLabelForUi(
             state = compileState,
             elapsedMs = compileElapsedMs,
             format = format,
@@ -520,27 +397,165 @@ internal fun rememberWarmupUiLabels(
     return prefetchLabel to compileLabel
 }
 
-internal fun formatElapsed(ms: Long): String {
-    if (ms < 1_000L) return "${ms}ms"
-    val sec = ms / 1_000.0
-    if (sec < 60.0) return String.format(Locale.US, "%.1fs", sec)
-    val m = ms / 60_000L
-    val s = (ms / 1_000L) % 60
-    return String.format(Locale.US, "%dm %02ds", m, s)
+internal fun sanitizeLabel(raw: String): String {
+    return SurveyRootSupportUiSupport.sanitizeLabel(raw)
 }
 
-internal fun sanitizeLabel(raw: String): String {
-    val trimmed = raw.trim()
-    if (trimmed.isEmpty()) return "unknown"
+/**
+ * File-local support helpers for root support UI.
+ */
+private object SurveyRootSupportUiSupport {
 
-    val safe = buildString {
-        for (c in trimmed) {
-            if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') {
-                append(c)
-            }
-            if (length >= 32) break
+    fun shouldGateBlock(
+        policy: GatePolicy,
+        modelState: ModelDownloadController.ModelState,
+        prefetchState: WarmupController.PrefetchState,
+        compileState: WarmupController.CompileState,
+    ): Boolean {
+        val modelBlocking = modelState !is ModelDownloadController.ModelState.Ready
+        val prefetchBusy = isPrefetchInProgress(prefetchState)
+        val compileBusy = isCompileInProgress(compileState)
+
+        return when (policy) {
+            GatePolicy.MODEL_ONLY -> modelBlocking
+            GatePolicy.MODEL_PREFETCH_COMPILE -> modelBlocking || prefetchBusy || compileBusy
         }
     }
 
-    return safe.ifBlank { "unknown" }
+    fun isPrefetchInProgress(state: WarmupController.PrefetchState): Boolean {
+        return state is WarmupController.PrefetchState.Running
+    }
+
+    fun isCompileInProgress(state: WarmupController.CompileState): Boolean {
+        return state is WarmupController.CompileState.WaitingForPrefetch ||
+                state is WarmupController.CompileState.Compiling
+    }
+
+    fun isModelInProgress(state: ModelDownloadController.ModelState): Boolean {
+        return state is ModelDownloadController.ModelState.Checking ||
+                state is ModelDownloadController.ModelState.Downloading
+    }
+
+    fun modelLabelForUi(state: ModelDownloadController.ModelState): String {
+        return when (state) {
+            is ModelDownloadController.ModelState.NotConfigured -> "Model not configured"
+            is ModelDownloadController.ModelState.Idle -> "Idle"
+            is ModelDownloadController.ModelState.Checking -> "Checking… ${formatElapsed(state.elapsedMs)}"
+            is ModelDownloadController.ModelState.Downloading -> {
+                val total = state.total
+                if (total != null && total > 0L) {
+                    val pct = ((state.downloaded.toDouble() / total.toDouble()) * 100.0)
+                        .toInt()
+                        .coerceIn(0, 100)
+                    "Downloading ${pct}% ${formatElapsed(state.elapsedMs)}"
+                } else {
+                    "Downloading ${formatElapsed(state.elapsedMs)}"
+                }
+            }
+
+            is ModelDownloadController.ModelState.Ready -> "Ready"
+            is ModelDownloadController.ModelState.Failed -> "Failed"
+            is ModelDownloadController.ModelState.Cancelled -> "Cancelled"
+        }
+    }
+
+    fun prefetchLabelForUi(
+        state: WarmupController.PrefetchState,
+        elapsedMs: Long,
+        format: WarmupUiFormat,
+    ): String {
+        val name = state.javaClass.simpleName
+        val elapsed = formatElapsed(elapsedMs)
+        return when {
+            isPrefetchInProgress(state) -> "${format.prefetchRunningPrefix} ($name) $elapsed"
+            name.equals("Idle", ignoreCase = true) -> format.idleLabel
+            else -> "$name $elapsed"
+        }
+    }
+
+    fun compileLabelForUi(
+        state: WarmupController.CompileState,
+        elapsedMs: Long,
+        format: WarmupUiFormat,
+    ): String {
+        val elapsed = formatElapsed(elapsedMs)
+        return when (state) {
+            is WarmupController.CompileState.WaitingForPrefetch ->
+                "${format.compileWaitingPrefix} $elapsed"
+
+            is WarmupController.CompileState.Compiling ->
+                "${format.compileCompilingPrefix} $elapsed"
+
+            is WarmupController.CompileState.Idle -> format.idleLabel
+            else -> "${state.javaClass.simpleName} $elapsed"
+        }
+    }
+
+    @Composable
+    fun rememberWarmupUiNowMs(
+        inProgress: Boolean,
+        tickIntervalMs: Long,
+    ): Long {
+        var uiNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+
+        LaunchedEffect(inProgress, tickIntervalMs) {
+            if (!inProgress) return@LaunchedEffect
+            while (isActive) {
+                uiNowMs = SystemClock.elapsedRealtime()
+                delay(tickIntervalMs)
+            }
+        }
+
+        return uiNowMs
+    }
+
+    /**
+     * Produces a smoothly increasing elapsedMs for UI even if the underlying state updates are sparse.
+     */
+    @Composable
+    fun rememberDynamicElapsedMs(
+        reportedElapsedMs: Long,
+        inProgress: Boolean,
+        nowMs: Long,
+    ): Long {
+        var baseElapsedMs by remember { mutableLongStateOf(reportedElapsedMs) }
+        var baseNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+
+        LaunchedEffect(reportedElapsedMs, inProgress) {
+            baseElapsedMs = reportedElapsedMs
+            baseNowMs = SystemClock.elapsedRealtime()
+        }
+
+        return if (!inProgress) {
+            reportedElapsedMs
+        } else {
+            val live = baseElapsedMs + (nowMs - baseNowMs)
+            if (live < 0L) 0L else live
+        }
+    }
+
+    fun formatElapsed(ms: Long): String {
+        if (ms < 1_000L) return "${ms}ms"
+        val sec = ms / 1_000.0
+        if (sec < 60.0) return String.format(Locale.US, "%.1fs", sec)
+        val m = ms / 60_000L
+        val s = (ms / 1_000L) % 60
+        return String.format(Locale.US, "%dm %02ds", m, s)
+    }
+
+    fun sanitizeLabel(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return "unknown"
+
+        val safe = buildString {
+            for (c in trimmed) {
+                if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') {
+                    append(c)
+                }
+                if (length >= 32) break
+            }
+        }
+
+        return safe.ifBlank { "unknown" }
+    }
 }

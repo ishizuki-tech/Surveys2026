@@ -31,6 +31,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.navigation3.runtime.rememberNavBackStack
 import com.negi.surveys.chat.ChatStreamBridge
 import com.negi.surveys.chat.ChatValidation
+import com.negi.surveys.config.StartupConfigState
 import com.negi.surveys.config.SurveyConfig
 import com.negi.surveys.logging.GitHubLogUploadManager
 import com.negi.surveys.logging.SafeLog
