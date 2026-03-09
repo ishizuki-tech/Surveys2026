@@ -14,6 +14,7 @@ package com.negi.surveys.utils
 import android.content.Context
 import android.os.Process
 import android.os.SystemClock
+import com.negi.surveys.AppProcessServices
 import com.negi.surveys.logging.AppLog
 import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
@@ -29,7 +30,6 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
 
 /**
  * Controller responsible for ensuring a model file exists locally.
@@ -136,7 +136,7 @@ class ModelDownloadController(
         if (url.isBlank() || name.isBlank()) {
             _state.value = ModelState.NotConfigured(
                 reason = "modelUrl/fileName is blank",
-                elapsedMs = 0L
+                elapsedMs = 0L,
             )
             AppLog.w(TAG, "ensureModelOnce: NotConfigured (urlBlank=${url.isBlank()} nameBlank=${name.isBlank()})")
             return
@@ -161,7 +161,7 @@ class ModelDownloadController(
         _state.value = ModelState.Checking(
             file = dst,
             startedAtMs = startedAt,
-            elapsedMs = 0L
+            elapsedMs = 0L,
         )
 
         lastUiAtMs.set(0L)
@@ -175,22 +175,29 @@ class ModelDownloadController(
             TAG,
             "ensureModelOnce: begin pid=${Process.myPid()} reason='${sanitizeLabel(reason)}' " +
                     "urlHost='${safeHost(url)}' fileName='${dst.name}' " +
-                    "uiThrottleMs=$uiThrottleMs uiMinDeltaBytes=$uiMinDeltaBytes timeoutMs=$timeoutMs forceFresh=$forceFresh"
+                    "uiThrottleMs=$uiThrottleMs uiMinDeltaBytes=$uiMinDeltaBytes timeoutMs=$timeoutMs forceFresh=$forceFresh",
         )
 
         val job = scope.launch(Dispatchers.Default) {
             try {
-                // Fast-path: local file already ready.
-                if (!forceFresh && dst.exists() && dst.isFile && dst.length() > 0L) {
+                // Fast-path: local file already ready under the shared process-wide validation rules.
+                if (!forceFresh && AppProcessServices.isUsableLocalModelFile(dst)) {
                     val end = SystemClock.elapsedRealtime()
                     _state.value = ModelState.Ready(
                         file = dst,
                         sizeBytes = dst.length(),
                         startedAtMs = startedAt,
-                        elapsedMs = end - startedAt
+                        elapsedMs = end - startedAt,
                     )
                     AppLog.i(TAG, "ensureModelOnce: local ready size=${dst.length()}B elapsedMs=${end - startedAt}")
                     return@launch
+                }
+
+                if (!forceFresh && dst.exists() && dst.isFile) {
+                    AppLog.w(
+                        TAG,
+                        "ensureModelOnce: local file present but unusable; redownload required size=${safeLength(dst)}B",
+                    )
                 }
 
                 val token = hfTokenProvider().takeIf { !it.isNullOrBlank() }
@@ -217,9 +224,9 @@ class ModelDownloadController(
                             startedAtMs = startedAt,
                             downloaded = downloaded,
                             total = total,
-                            elapsedMs = now - startedAt
+                            elapsedMs = now - startedAt,
                         )
-                    }
+                    },
                 )
 
                 handleRef.set(op.handle)
@@ -228,18 +235,31 @@ class ModelDownloadController(
                 val end = SystemClock.elapsedRealtime()
 
                 result.onSuccess { file ->
+                    if (!AppProcessServices.isUsableLocalModelFile(file)) {
+                        _state.value = ModelState.Failed(
+                            safeReason = DOWNLOADED_FILE_NOT_USABLE,
+                            startedAtMs = startedAt,
+                            elapsedMs = end - startedAt,
+                        )
+                        AppLog.w(
+                            TAG,
+                            "ensureModelOnce: downloaded file unusable elapsedMs=${end - startedAt} size=${safeLength(file)}B",
+                        )
+                        return@onSuccess
+                    }
+
                     _state.value = ModelState.Ready(
                         file = file,
                         sizeBytes = file.length(),
                         startedAtMs = startedAt,
-                        elapsedMs = end - startedAt
+                        elapsedMs = end - startedAt,
                     )
                     AppLog.i(TAG, "ensureModelOnce: success elapsedMs=${end - startedAt} size=${file.length()}B")
                 }.onFailure { t ->
                     _state.value = ModelState.Failed(
                         safeReason = safeFailureReason(t),
                         startedAtMs = startedAt,
-                        elapsedMs = end - startedAt
+                        elapsedMs = end - startedAt,
                     )
                     // Do not log exception.message; it may contain sensitive info.
                     AppLog.w(TAG, "ensureModelOnce: failed elapsedMs=${end - startedAt} type=${t::class.java.simpleName}")
@@ -248,7 +268,7 @@ class ModelDownloadController(
                 val end = SystemClock.elapsedRealtime()
                 _state.value = ModelState.Cancelled(
                     startedAtMs = startedAt,
-                    elapsedMs = end - startedAt
+                    elapsedMs = end - startedAt,
                 )
                 AppLog.w(TAG, "ensureModelOnce: cancelled elapsedMs=${end - startedAt} type=${ce::class.java.simpleName}")
                 throw ce
@@ -257,7 +277,7 @@ class ModelDownloadController(
                 _state.value = ModelState.Failed(
                     safeReason = safeFailureReason(t),
                     startedAtMs = startedAt,
-                    elapsedMs = end - startedAt
+                    elapsedMs = end - startedAt,
                 )
                 AppLog.w(TAG, "ensureModelOnce: crashed type=${t::class.java.simpleName}")
             } finally {
@@ -349,6 +369,10 @@ class ModelDownloadController(
         return t::class.java.simpleName.ifBlank { "Error" }
     }
 
+    private fun safeLength(file: File?): Long {
+        return runCatching { file?.length() ?: -1L }.getOrDefault(-1L)
+    }
+
     private fun sanitizeLabel(raw: String): String {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) return "unknown"
@@ -363,5 +387,6 @@ class ModelDownloadController(
 
     companion object {
         private const val TAG = "ModelDownloader"
+        private const val DOWNLOADED_FILE_NOT_USABLE = "DownloadedFileNotUsable"
     }
 }

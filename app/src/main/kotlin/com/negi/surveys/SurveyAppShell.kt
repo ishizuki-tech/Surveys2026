@@ -334,15 +334,15 @@ object SurveyAppShell {
             }
         }
     }
+    /**
+     * Shell blocking placeholder spec.
+     */
+    private data class ShellBlockingSpec(
+        val visible: Boolean,
+        val title: String,
+        val detail: String,
+        val showSpinner: Boolean,
+        val showRetry: Boolean,
+    )
 }
 
-/**
- * Shell blocking placeholder spec.
- */
-private data class ShellBlockingSpec(
-    val visible: Boolean,
-    val title: String,
-    val detail: String,
-    val showSpinner: Boolean,
-    val showRetry: Boolean,
-)
