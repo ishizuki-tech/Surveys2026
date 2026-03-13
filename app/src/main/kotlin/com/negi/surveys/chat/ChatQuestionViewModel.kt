@@ -61,6 +61,8 @@ import kotlinx.coroutines.withContext
  * - Live UI may contain one ephemeral streaming MODEL bubble.
  * - Final step-1 / step-2 JSON is persisted as stable MODEL messages.
  * - Legacy assistant-side raw fields are migrated into stable MODEL messages on restore.
+ * - Related transcript/state mutations are persisted as one logical transaction
+ *   whenever possible to avoid restoring mixed intermediate states.
  *
  * Robustness policy:
  * - Show TTFT by creating a placeholder MODEL bubble immediately on submit.
@@ -241,6 +243,18 @@ class ChatQuestionViewModel(
     private var inputPersistJob: Job? = null
 
     /**
+     * Draft persistence transaction guard.
+     *
+     * Why:
+     * - Several submit/stream paths perform multiple transcript and state mutations.
+     * - Persisting after every small mutation can save inconsistent intermediate states.
+     * - This batches persistence requests until the outer logical mutation completes.
+     */
+    private val draftPersistLock = Any()
+    private var draftMutationDepth: Int = 0
+    private var deferredPersistReason: String? = null
+
+    /**
      * Active or most recently retained MODEL bubble.
      */
     @Volatile
@@ -326,16 +340,18 @@ class ChatQuestionViewModel(
         activeAttemptId = attemptId
         resetCommittedModelStateForNewAttempt()
 
-        _input.value = ""
-        schedulePersistDraftForInput("submit.clearInput")
+        var submittedUserMessageId = ""
+        runDraftMutation("submit.prepare") {
+            _input.value = ""
+            schedulePersistDraftForInput("submit.clearInput")
+            submittedUserMessageId = appendUser(text)
 
-        val submittedUserMessageId = appendUser(text)
+            validationJob?.cancel()
+            validationJob = null
 
-        validationJob?.cancel()
-        validationJob = null
-
-        openStreamWindow("submit")
-        ensureStreamingPlaceholder("submit")
+            openStreamWindow("submit")
+            ensureStreamingPlaceholder("submit")
+        }
 
         validationJob = viewModelScope.launch {
             _isBusy.value = true
@@ -383,8 +399,9 @@ class ChatQuestionViewModel(
         closeStreamWindow("cancelValidation")
 
         val cleanup: () -> Unit = {
-            clearActiveStreamUi("cancelValidation")
-            safePersistDraft("cancelValidation")
+            runDraftMutation("cancelValidation") {
+                clearActiveStreamUi("cancelValidation")
+            }
         }
 
         if (Looper.getMainLooper().thread === Thread.currentThread()) {
@@ -422,16 +439,17 @@ class ChatQuestionViewModel(
         withContext(Dispatchers.Main.immediate) {
             if (activeAttemptId != attemptId) return@withContext
 
-            restoreRollbackSnapshot(rollbackSnapshot)
-            clearActiveStreamUi("validationFailure")
+            runDraftMutation("validationFailure") {
+                restoreRollbackSnapshot(rollbackSnapshot)
+                clearActiveStreamUi("validationFailure")
 
-            if (containsMessage(submittedUserMessageId)) {
-                removeMessage(submittedUserMessageId)
+                if (containsMessage(submittedUserMessageId)) {
+                    removeMessage(submittedUserMessageId)
+                }
+
+                _input.value = submittedText
+                appendAssistantText(buildValidationFailureMessage(error, rollbackSnapshot.stage))
             }
-
-            _input.value = submittedText
-            appendAssistantText(buildValidationFailureMessage(error, rollbackSnapshot.stage))
-            safePersistDraft("validationFailure")
         }
     }
 
@@ -465,6 +483,7 @@ class ChatQuestionViewModel(
         activeStreamSessionId = 0L
 
         AppLog.d(TAG, "clearActiveStreamUi reason=$reason")
+        persistOrDeferDraft("clearActiveStreamUi:$reason")
     }
 
     // ---------------------------------------------------------------------
@@ -488,29 +507,30 @@ class ChatQuestionViewModel(
             null
         }
 
-        appendModelOutcome(
-            step1Raw = out.step1Raw,
-            step2Raw = out.step2Raw,
-            attemptId = attemptId,
-        )
+        runDraftMutation("handleMain.result") {
+            appendModelOutcome(
+                step1Raw = out.step1Raw,
+                step2Raw = out.step2Raw,
+                attemptId = attemptId,
+            )
 
-        appendAssistantOutcome(
-            assistantMessage = out.assistantMessage,
-            followUpQuestion = followUp,
-        )
+            appendAssistantOutcome(
+                assistantMessage = out.assistantMessage,
+                followUpQuestion = followUp,
+            )
 
-        if (!isAttemptActive(attemptId)) return
-
-        if (out.status == ChatModels.ValidationStatus.NEED_FOLLOW_UP) {
-            withStateLock {
-                currentFollowUpQuestion = followUp.orEmpty()
-                stage = ChatDrafts.ChatStage.AWAIT_FOLLOW_UP
+            if (out.status == ChatModels.ValidationStatus.NEED_FOLLOW_UP) {
+                withStateLock {
+                    currentFollowUpQuestion = followUp.orEmpty()
+                    stage = ChatDrafts.ChatStage.AWAIT_FOLLOW_UP
+                }
+                persistOrDeferDraft("handleMain.need_follow_up")
+            } else {
+                completeDoneAndPersist("handleMain.done")
             }
-            safePersistDraft("handleMain.need_follow_up")
-        } else {
-            completeDoneAndPersist("handleMain.done")
         }
 
+        if (!isAttemptActive(attemptId)) return
         tryCloseStreamWindowIfIdle("handleMain.after")
     }
 
@@ -519,26 +539,28 @@ class ChatQuestionViewModel(
 
         val localFollowUpsSize = withStateLock { followUps.size }
         if (localFollowUpsSize >= maxFollowUps) {
-            appendAssistantText("I have enough details. Let's move on.")
-            completeDoneAndPersist("handleFollowUp.max_followups")
+            runDraftMutation("handleFollowUp.max_followups") {
+                appendAssistantText("I have enough details. Let's move on.")
+                completeDoneAndPersist("handleFollowUp.max_followups")
+            }
             tryCloseStreamWindowIfIdle("handleFollowUp.max_followups.after")
             return
         }
 
         val q = withStateLock { currentFollowUpQuestion }.ifEmpty { "(follow-up)" }
+        val priorTurns = withStateLock { followUps.toList() }
 
         withStateLock {
             followUps += ChatDrafts.FollowUpTurn(question = q, answer = userAnswer)
         }
         logAnswerDigest("followup#${withStateLock { followUps.size }}", userAnswer)
 
-        val followUpPayloadForValidator = withStateLock {
+        val followUpPayloadForValidator =
             buildFollowUpContextForValidator(
                 currentQuestion = q,
                 currentAnswer = userAnswer,
-                turns = followUps,
+                previousTurns = priorTurns,
             )
-        }
         logFollowUpPayloadDigest(
             turns = withStateLock { followUps.size },
             payload = followUpPayloadForValidator,
@@ -557,29 +579,30 @@ class ChatQuestionViewModel(
             null
         }
 
-        appendModelOutcome(
-            step1Raw = out.step1Raw,
-            step2Raw = out.step2Raw,
-            attemptId = attemptId,
-        )
+        runDraftMutation("handleFollowUp.result") {
+            appendModelOutcome(
+                step1Raw = out.step1Raw,
+                step2Raw = out.step2Raw,
+                attemptId = attemptId,
+            )
 
-        appendAssistantOutcome(
-            assistantMessage = out.assistantMessage,
-            followUpQuestion = followUp,
-        )
+            appendAssistantOutcome(
+                assistantMessage = out.assistantMessage,
+                followUpQuestion = followUp,
+            )
 
-        if (!isAttemptActive(attemptId)) return
-
-        if (out.status == ChatModels.ValidationStatus.NEED_FOLLOW_UP) {
-            withStateLock {
-                currentFollowUpQuestion = followUp.orEmpty()
-                stage = ChatDrafts.ChatStage.AWAIT_FOLLOW_UP
+            if (out.status == ChatModels.ValidationStatus.NEED_FOLLOW_UP) {
+                withStateLock {
+                    currentFollowUpQuestion = followUp.orEmpty()
+                    stage = ChatDrafts.ChatStage.AWAIT_FOLLOW_UP
+                }
+                persistOrDeferDraft("handleFollowUp.need_follow_up")
+            } else {
+                completeDoneAndPersist("handleFollowUp.done")
             }
-            safePersistDraft("handleFollowUp.need_follow_up")
-        } else {
-            completeDoneAndPersist("handleFollowUp.done")
         }
 
+        if (!isAttemptActive(attemptId)) return
         tryCloseStreamWindowIfIdle("handleFollowUp.after")
     }
 
@@ -590,19 +613,21 @@ class ChatQuestionViewModel(
         }
         _completionPayload.value = payload
         _completion.tryEmit(payload)
-        safePersistDraft(reason)
+        persistOrDeferDraft(reason)
     }
 
     private fun reopenForEdit() {
-        appendAssistantText("Re-opening this question for editing. Please submit your revised answer.")
-        withStateLock {
-            stage = ChatDrafts.ChatStage.AWAIT_MAIN
-            mainAnswer = ""
-            currentFollowUpQuestion = ""
-            followUps.clear()
+        runDraftMutation("reopenForEdit") {
+            appendAssistantText("Re-opening this question for editing. Please submit your revised answer.")
+            withStateLock {
+                stage = ChatDrafts.ChatStage.AWAIT_MAIN
+                mainAnswer = ""
+                currentFollowUpQuestion = ""
+                followUps.clear()
+            }
+            _completionPayload.value = null
+            persistOrDeferDraft("reopenForEdit")
         }
-        _completionPayload.value = null
-        safePersistDraft("reopenForEdit")
     }
 
     private suspend fun isAttemptActive(attemptId: Long): Boolean {
@@ -650,7 +675,7 @@ class ChatQuestionViewModel(
 
         activeStreamSessionId = 0L
         closeStreamWindow(reason)
-        safePersistDraft("stream.window.close:$reason")
+        persistOrDeferDraft("stream.window.close:$reason")
     }
 
     private fun ensureStreamingPlaceholder(reason: String) {
@@ -670,7 +695,7 @@ class ChatQuestionViewModel(
         )
 
         appendMessageInternal(bubble, "stream.placeholder:$reason")
-        safePersistDraft("stream.placeholder:$reason")
+        persistOrDeferDraft("stream.placeholder:$reason")
     }
 
     private fun phasePlaceholderText(phase: ChatStreamEvent.Phase): String {
@@ -721,14 +746,21 @@ class ChatQuestionViewModel(
         }.trim()
     }
 
+    /**
+     * Builds validator context for the current follow-up turn.
+     *
+     * Notes:
+     * - [previousTurns] must exclude the current follow-up turn.
+     * - The current turn is represented only by CURRENT_FOLLOW_UP_Q/A.
+     */
     private fun buildFollowUpContextForValidator(
         currentQuestion: String,
         currentAnswer: String,
-        turns: List<ChatDrafts.FollowUpTurn>,
+        previousTurns: List<ChatDrafts.FollowUpTurn>,
     ): String {
         val q = currentQuestion.trim()
         val a = currentAnswer.trim()
-        val history = buildFollowUpContext(turns)
+        val history = buildFollowUpContext(previousTurns)
 
         return buildString {
             append("CURRENT_FOLLOW_UP_Q: ").append(q).append('\n')
@@ -760,24 +792,26 @@ class ChatQuestionViewModel(
 
     private fun appendUser(text: String): String {
         val id = UUID.randomUUID().toString()
-        val msg = ChatMessage.user(
-            id = id,
-            text = text,
-        )
+        val msg =
+            ChatMessage.user(
+                id = id,
+                text = text,
+            )
         appendMessageInternal(msg, "appendUser")
-        safePersistDraft("appendUser")
+        persistOrDeferDraft("appendUser")
         return id
     }
 
     private fun appendAssistantText(text: String) {
-        val msg = ChatMessage.assistant(
-            id = UUID.randomUUID().toString(),
-            assistantMessage = text,
-            followUpQuestion = null,
-            textFallback = text,
-        )
+        val msg =
+            ChatMessage.assistant(
+                id = UUID.randomUUID().toString(),
+                assistantMessage = text,
+                followUpQuestion = null,
+                textFallback = text,
+            )
         appendMessageInternal(msg, "appendAssistantText")
-        safePersistDraft("appendAssistantText")
+        persistOrDeferDraft("appendAssistantText")
     }
 
     private fun appendAssistantOutcome(
@@ -792,25 +826,27 @@ class ChatQuestionViewModel(
             return
         }
 
-        val composite = buildString {
-            if (a.isNotEmpty()) append(a)
-            if (!q.isNullOrEmpty()) {
-                if (isNotEmpty()) append("\n\n")
-                append(q)
-            }
-        }.trim()
+        val composite =
+            buildString {
+                if (a.isNotEmpty()) append(a)
+                if (!q.isNullOrEmpty()) {
+                    if (isNotEmpty()) append("\n\n")
+                    append(q)
+                }
+            }.trim()
 
         val id = UUID.randomUUID().toString()
 
-        val msg = ChatMessage.assistant(
-            id = id,
-            assistantMessage = a,
-            followUpQuestion = q,
-            textFallback = composite,
-        )
+        val msg =
+            ChatMessage.assistant(
+                id = id,
+                assistantMessage = a,
+                followUpQuestion = q,
+                textFallback = composite,
+            )
 
         appendMessageInternal(msg, "appendAssistantOutcome")
-        safePersistDraft("appendAssistantOutcome")
+        persistOrDeferDraft("appendAssistantOutcome")
     }
 
     private fun resetCommittedModelStateForNewAttempt() {
@@ -887,7 +923,7 @@ class ChatQuestionViewModel(
             )
         }
 
-        safePersistDraft("appendModelOutcome")
+        persistOrDeferDraft("appendModelOutcome")
     }
 
     private fun removeMessage(id: String) {
@@ -987,15 +1023,17 @@ class ChatQuestionViewModel(
 
             if (isCancelledSession(sessionId)) {
                 withContext(Dispatchers.Main.immediate) {
-                    suppressNextCancelledError.set(false)
+                    runDraftMutation("stream.end.cancelled") {
+                        suppressNextCancelledError.set(false)
 
-                    localStreamMsgId?.let { removeMessage(it) }
+                        localStreamMsgId?.let { removeMessage(it) }
 
-                    resetLocalState()
-                    clearVmStreamState("stream.end_ignored_cancelled")
+                        resetLocalState()
+                        clearVmStreamState("stream.end_ignored_cancelled")
 
-                    lastCancelledStreamSessionId = 0L
-                    safePersistDraft("stream.end_ignored_cancelled")
+                        lastCancelledStreamSessionId = 0L
+                        persistOrDeferDraft("stream.end_ignored_cancelled")
+                    }
                 }
                 return
             }
@@ -1004,39 +1042,41 @@ class ChatQuestionViewModel(
             val rendered = renderPhaseText(phase = phase, body = buf.toString())
 
             withContext(Dispatchers.Main.immediate) {
-                val id = localStreamMsgId
+                runDraftMutation("stream.end") {
+                    val id = localStreamMsgId
 
-                if (phase == ChatStreamEvent.Phase.STEP1_EVAL && id != null && streamedRaw != null) {
-                    updateMessage(id) {
-                        ChatMessage.modelFinal(
-                            id = id,
-                            phase = ModelPhase.STEP1_EVAL,
-                            text = streamedRaw,
-                        )
+                    if (phase == ChatStreamEvent.Phase.STEP1_EVAL && id != null && streamedRaw != null) {
+                        updateMessage(id) {
+                            ChatMessage.modelFinal(
+                                id = id,
+                                phase = ModelPhase.STEP1_EVAL,
+                                text = streamedRaw,
+                            )
+                        }
+                        markStep1CommittedForActiveAttempt(streamedRaw)
+                        activeStreamMsgId = null
+                        activeStreamSessionId = 0L
+                        AppLog.d(TAG, "stream step1 finalized immediately len=${streamedRaw.length}")
+                    } else if (id != null) {
+                        updateMessage(id) { m ->
+                            m.copy(
+                                role = ChatRole.MODEL,
+                                text = rendered,
+                                modelPhase = phaseToModelPhase(phase),
+                                streamText = rendered,
+                                streamState = ChatStreamState.ENDED,
+                                streamCollapsed = false,
+                                streamSessionId = null,
+                            )
+                        }
+                        clearVmStreamSessionAfterTerminal("stream.end")
+                    } else {
+                        clearVmStreamSessionAfterTerminal("stream.end")
                     }
-                    markStep1CommittedForActiveAttempt(streamedRaw)
-                    activeStreamMsgId = null
-                    activeStreamSessionId = 0L
-                    AppLog.d(TAG, "stream step1 finalized immediately len=${streamedRaw.length}")
-                } else if (id != null) {
-                    updateMessage(id) { m ->
-                        m.copy(
-                            role = ChatRole.MODEL,
-                            text = rendered,
-                            modelPhase = phaseToModelPhase(phase),
-                            streamText = rendered,
-                            streamState = ChatStreamState.ENDED,
-                            streamCollapsed = false,
-                            streamSessionId = null,
-                        )
-                    }
-                    clearVmStreamSessionAfterTerminal("stream.end")
-                } else {
-                    clearVmStreamSessionAfterTerminal("stream.end")
+
+                    resetLocalState()
+                    persistOrDeferDraft("stream.end")
                 }
-
-                resetLocalState()
-                safePersistDraft("stream.end")
             }
         }
 
@@ -1064,20 +1104,22 @@ class ChatQuestionViewModel(
             val cancelledSession = isCancelledSession(sessionId)
 
             withContext(Dispatchers.Main.immediate) {
-                if (suppressedCancel || cancelledSession || isReplaced) {
-                    localStreamMsgId?.let { removeMessage(it) }
+                runDraftMutation("stream.error") {
+                    if (suppressedCancel || cancelledSession || isReplaced) {
+                        localStreamMsgId?.let { removeMessage(it) }
 
-                    if (cancelledSession) {
-                        lastCancelledStreamSessionId = 0L
+                        if (cancelledSession) {
+                            lastCancelledStreamSessionId = 0L
+                        }
+                        suppressNextCancelledError.set(false)
+                    } else {
+                        localStreamMsgId?.let { removeMessage(it) }
                     }
-                    suppressNextCancelledError.set(false)
-                } else {
-                    localStreamMsgId?.let { removeMessage(it) }
-                }
 
-                resetLocalState()
-                clearVmStreamState("stream.error")
-                safePersistDraft("stream.error")
+                    resetLocalState()
+                    clearVmStreamState("stream.error")
+                    persistOrDeferDraft("stream.error")
+                }
             }
         }
 
@@ -1134,7 +1176,7 @@ class ChatQuestionViewModel(
                     )
                 }
 
-                safePersistDraft("stream.begin")
+                persistOrDeferDraft("stream.begin")
             }
         }
 
@@ -1151,10 +1193,11 @@ class ChatQuestionViewModel(
 
             if (!shouldUpdate) return
 
-            val rendered = renderPhaseText(
-                phase = localPhase,
-                body = buf.toString(),
-            )
+            val rendered =
+                renderPhaseText(
+                    phase = localPhase,
+                    body = buf.toString(),
+                )
 
             withContext(Dispatchers.Main.immediate) {
                 updateMessage(id) { m ->
@@ -1252,12 +1295,13 @@ class ChatQuestionViewModel(
             return
         }
 
-        val seeded = ChatMessage.assistant(
-            id = UUID.randomUUID().toString(),
-            assistantMessage = "Question: $qid",
-            followUpQuestion = prompt,
-            textFallback = "Question: $qid\n$prompt",
-        )
+        val seeded =
+            ChatMessage.assistant(
+                id = UUID.randomUUID().toString(),
+                assistantMessage = "Question: $qid",
+                followUpQuestion = prompt,
+                textFallback = "Question: $qid\n$prompt",
+            )
 
         setMessagesInternal(listOf(seeded), "seed")
 
@@ -1354,39 +1398,43 @@ class ChatQuestionViewModel(
         val out = ArrayList<ChatMessage>(3)
 
         if (normalizedStep1Raw != null) {
-            out += ChatMessage.modelFinal(
-                id = message.id + "#step1",
-                phase = ModelPhase.STEP1_EVAL,
-                text = normalizedStep1Raw,
-            )
+            out +=
+                ChatMessage.modelFinal(
+                    id = message.id + "#step1",
+                    phase = ModelPhase.STEP1_EVAL,
+                    text = normalizedStep1Raw,
+                )
         }
 
         if (normalizedStep2Raw != null) {
-            out += ChatMessage.modelFinal(
-                id = message.id + "#step2",
-                phase = ModelPhase.STEP2_FOLLOW_UP,
-                text = normalizedStep2Raw,
-            )
+            out +=
+                ChatMessage.modelFinal(
+                    id = message.id + "#step2",
+                    phase = ModelPhase.STEP2_FOLLOW_UP,
+                    text = normalizedStep2Raw,
+                )
         }
 
-        val assistant = message.copy(
-            assistantMessage = normalizedAssistantMessage,
-            followUpQuestion = normalizedFollowUpQuestion,
-            evalStatus = null,
-            evalScore = null,
-            evalReason = normalizedEvalReason,
-            step1Raw = null,
-            step2Raw = null,
-            streamText = null,
-            streamState = ChatStreamState.NONE,
-            streamCollapsed = true,
-            streamSessionId = null,
-            modelPhase = null,
-        )
+        val assistant =
+            message.copy(
+                assistantMessage = normalizedAssistantMessage,
+                followUpQuestion = normalizedFollowUpQuestion,
+                evalStatus = null,
+                evalScore = null,
+                evalReason = normalizedEvalReason,
+                step1Raw = null,
+                step2Raw = null,
+                streamText = null,
+                streamState = ChatStreamState.NONE,
+                streamCollapsed = true,
+                streamSessionId = null,
+                modelPhase = null,
+            )
 
-        val hasAssistantPayload = !assistant.assistantMessage.isNullOrBlank() ||
-                !assistant.followUpQuestion.isNullOrBlank() ||
-                assistant.text.isNotBlank()
+        val hasAssistantPayload =
+            !assistant.assistantMessage.isNullOrBlank() ||
+                    !assistant.followUpQuestion.isNullOrBlank() ||
+                    assistant.text.isNotBlank()
 
         if (hasAssistantPayload) {
             out += assistant
@@ -1396,9 +1444,10 @@ class ChatQuestionViewModel(
     }
 
     private fun normalizeModelMessages(message: ChatMessage): List<ChatMessage> {
-        val normalizedText = (message.text.takeIf { it.isNotBlank() } ?: message.streamText)
-            .normalizedOptionalText()
-            ?: return emptyList()
+        val normalizedText =
+            (message.text.takeIf { it.isNotBlank() } ?: message.streamText)
+                .normalizedOptionalText()
+                ?: return emptyList()
 
         val phase = message.modelPhase ?: inferModelPhaseFromText(normalizedText) ?: return emptyList()
 
@@ -1415,7 +1464,7 @@ class ChatQuestionViewModel(
                 id = message.id,
                 phase = phase,
                 text = normalizedText,
-            )
+            ),
         )
     }
 
@@ -1437,18 +1486,74 @@ class ChatQuestionViewModel(
 
     private fun persistDraftOnMain() {
         val messagesSnapshot = buildPersistableMessagesSnapshot()
-        val snapshot = synchronized(stateLock) {
-            ChatDrafts.ChatDraft(
-                stage = stage,
-                messages = messagesSnapshot,
-                mainAnswer = mainAnswer,
-                followUps = followUps.toList(),
-                currentFollowUpQuestion = currentFollowUpQuestion,
-                completionPayload = _completionPayload.value,
-                inputDraft = _input.value,
-            )
-        }
+        val snapshot =
+            synchronized(stateLock) {
+                ChatDrafts.ChatDraft(
+                    stage = stage,
+                    messages = messagesSnapshot,
+                    mainAnswer = mainAnswer,
+                    followUps = followUps.toList(),
+                    currentFollowUpQuestion = currentFollowUpQuestion,
+                    completionPayload = _completionPayload.value,
+                    inputDraft = _input.value,
+                )
+            }
         draftStore.save(draftKey, snapshot)
+    }
+
+    /**
+     * Runs a logical draft mutation as one persistence unit.
+     *
+     * Notes:
+     * - Nested transactions are supported.
+     * - The outermost transaction performs at most one deferred save.
+     */
+    private inline fun runDraftMutation(
+        reason: String,
+        block: () -> Unit,
+    ) {
+        synchronized(draftPersistLock) {
+            draftMutationDepth += 1
+        }
+
+        try {
+            block()
+        } finally {
+            val persistReason =
+                synchronized(draftPersistLock) {
+                    draftMutationDepth = (draftMutationDepth - 1).coerceAtLeast(0)
+                    if (draftMutationDepth == 0) {
+                        val deferred = deferredPersistReason
+                        deferredPersistReason = null
+                        deferred
+                    } else {
+                        null
+                    }
+                }
+
+            if (persistReason != null) {
+                safePersistDraft("txn:$reason/$persistReason")
+            }
+        }
+    }
+
+    /**
+     * Requests draft persistence immediately, or defers it until the outer logical mutation ends.
+     */
+    private fun persistOrDeferDraft(reason: String) {
+        val shouldPersistImmediately =
+            synchronized(draftPersistLock) {
+                if (draftMutationDepth > 0) {
+                    deferredPersistReason = reason
+                    false
+                } else {
+                    true
+                }
+            }
+
+        if (shouldPersistImmediately) {
+            safePersistDraft(reason)
+        }
     }
 
     private fun safePersistDraft(reason: String) {
@@ -1533,16 +1638,18 @@ class ChatQuestionViewModel(
         error: Throwable,
         failedStage: ChatDrafts.ChatStage,
     ): String {
-        val stageLabel = when (failedStage) {
-            ChatDrafts.ChatStage.AWAIT_MAIN -> "The answer could not be validated."
-            ChatDrafts.ChatStage.AWAIT_FOLLOW_UP -> "The follow-up answer could not be validated."
-            ChatDrafts.ChatStage.DONE -> "The answer could not be re-validated."
-        }
+        val stageLabel =
+            when (failedStage) {
+                ChatDrafts.ChatStage.AWAIT_MAIN -> "The answer could not be validated."
+                ChatDrafts.ChatStage.AWAIT_FOLLOW_UP -> "The follow-up answer could not be validated."
+                ChatDrafts.ChatStage.DONE -> "The answer could not be re-validated."
+            }
 
-        val detail = when (error.javaClass.simpleName) {
-            "ModelNotReadyException" -> "The AI model is not ready yet. Please retry in a moment."
-            else -> "Your input was restored. Please retry."
-        }
+        val detail =
+            when (error.javaClass.simpleName) {
+                "ModelNotReadyException" -> "The AI model is not ready yet. Please retry in a moment."
+                else -> "Your input was restored. Please retry."
+            }
 
         return "$stageLabel $detail"
     }

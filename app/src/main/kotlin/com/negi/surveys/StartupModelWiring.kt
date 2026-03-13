@@ -52,15 +52,19 @@ internal class StartupModelWiring(
      * Notes:
      * - This key is only for remote-download capable startup.
      * - Local-only startup should not fail just because this key is absent.
+     * - File name resolution tolerates configuration drift by accepting either:
+     *   - explicit fileName
+     *   - modelUrl basename
      */
     fun buildModelSpecKey(modelSpec: ModelDownloadSpec?): ModelSpecKey? {
         val s = modelSpec ?: return null
         val url = s.modelUrl?.trim().orEmpty()
-        val name = s.fileName.trim().orEmpty()
-        if (url.isBlank() || name.isBlank()) return null
+        val fileName = resolveDownloaderFileNameOrNull(s)
+        if (url.isBlank() || fileName == null) return null
+
         return ModelSpecKey(
             url = url,
-            fileName = name,
+            fileName = fileName,
             timeoutMs = s.timeoutMs,
             forceFreshOnStart = false,
             uiThrottleMs = s.uiThrottleMs,
@@ -98,11 +102,14 @@ internal class StartupModelWiring(
     }
 
     /**
-     * Derives whether startup services are truly ready for the current mode.
+     * Derives whether startup services are ready for the current mode.
      *
-     * Notes:
-     * - Remote on-device mode is ready once the downloader exists.
-     * - Local-only on-device mode is ready only after warmup wiring succeeds.
+     * Important:
+     * - "services ready" does NOT mean "model ready for inference".
+     * - Remote on-device mode is service-ready once the downloader graph exists.
+     *   Actual download / prefetch / compile progress is tracked elsewhere.
+     * - Local-only on-device mode is service-ready only after warmup wiring succeeds,
+     *   because there is no downloader graph to represent model preparation.
      * - Non-on-device mode is ready once the repository graph is built.
      */
     fun deriveServicesReady(
@@ -134,19 +141,20 @@ internal class StartupModelWiring(
         lastReadyFingerprintRef: AtomicReference<ModelReadyFingerprint?>,
     ): Boolean {
         if (repoMode != AppProcessServices.RepoMode.ON_DEVICE) return false
+        if (!AppProcessServices.isUsableLocalModelFile(file)) {
+            SafeLog.w(TAG, "Warmup: model file not usable; wiring skipped")
+            return false
+        }
 
         val fingerprint = ModelReadyFingerprint.from(file)
         val previous = lastReadyFingerprintRef.get()
         if (previous == fingerprint) return true
 
+        val inputs = resolveWarmupInputsOrNull(repoMode = repoMode, file = file) ?: return false
+
         val inputsUpdated =
             runCatching {
-                AppProcessServices.updateWarmupInputsBestEffort(
-                    context = app,
-                    mode = repoMode,
-                    modelFile = file,
-                    options = WarmupController.Options(),
-                )
+                AppProcessServices.updateWarmupInputs(inputs)
             }.onFailure { t ->
                 SafeLog.e(
                     TAG,
@@ -171,6 +179,93 @@ internal class StartupModelWiring(
         }
 
         return compileRequested
+    }
+
+    /**
+     * Resolves a downloader file name from configured hints.
+     *
+     * Resolution order:
+     * - explicit fileName
+     * - modelUrl basename
+     */
+    private fun resolveDownloaderFileNameOrNull(spec: ModelDownloadSpec): String? {
+        return sanitizeSimpleFileName(spec.fileName)
+            ?: sanitizeUrlBasename(spec.modelUrl)
+    }
+
+    /**
+     * Builds explicit warmup inputs for the current process-scoped repository.
+     *
+     * Why:
+     * - Best-effort helpers are useful at call sites, but startup wiring needs a
+     *   definitive success/failure boundary.
+     * - This method only succeeds when the current repo is explicitly warmup-capable.
+     */
+    private fun resolveWarmupInputsOrNull(
+        repoMode: AppProcessServices.RepoMode,
+        file: File,
+    ): WarmupController.Inputs? {
+        if (repoMode != AppProcessServices.RepoMode.ON_DEVICE) return null
+        if (!AppProcessServices.isUsableLocalModelFile(file)) return null
+
+        val repo =
+            runCatching {
+                AppProcessServices.repository(
+                    context = app,
+                    mode = repoMode,
+                )
+            }.onFailure { t ->
+                SafeLog.e(
+                    TAG,
+                    "Warmup: repository lookup failed (non-fatal) type=${t::class.java.simpleName}",
+                )
+            }.getOrNull() ?: return null
+
+        val warmupRepo = repo as? WarmupController.WarmupCapableRepository
+        if (warmupRepo == null) {
+            SafeLog.w(
+                TAG,
+                "Warmup: repository is not WarmupCapableRepository type=${repo.javaClass.simpleName}",
+            )
+            return null
+        }
+
+        return WarmupController.Inputs(
+            file = file,
+            repository = warmupRepo,
+            options = WarmupController.Options(),
+        )
+    }
+
+    /**
+     * Sanitizes a basename extracted from a configured URL.
+     *
+     * Notes:
+     * - Query strings and fragments are removed first.
+     * - Only a simple leaf file name is accepted.
+     */
+    private fun sanitizeUrlBasename(url: String?): String? {
+        val raw = url?.trim().orEmpty()
+        if (raw.isBlank()) return null
+
+        val noFragment = raw.substringBefore('#')
+        val noQuery = noFragment.substringBefore('?')
+        val basename = noQuery.substringAfterLast('/')
+
+        return sanitizeSimpleFileName(basename)
+    }
+
+    /**
+     * Sanitizes a simple file name to avoid traversal-like inputs.
+     */
+    private fun sanitizeSimpleFileName(name: String?): String? {
+        val n = name?.trim().orEmpty()
+        if (n.isBlank()) return null
+        if (n.contains('/')) return null
+        if (n.contains('\\')) return null
+        if (n.contains("..")) return null
+        if (n.length > 200) return null
+        return n
     }
 
     /**

@@ -26,12 +26,12 @@ import com.negi.surveys.warmup.SLMWarmupEngine
 import com.negi.surveys.warmup.WarmupController
 import java.io.Closeable
 import java.io.File
+import java.lang.reflect.Method
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import java.lang.reflect.Method
 
 /**
  * Process-scoped service holder.
@@ -80,7 +80,7 @@ object AppProcessServices {
         }
     }
 
-    private const val MIN_LOCAL_MODEL_BYTES: Long = 128L * 1024L * 1024L
+    private const val DEFAULT_MIN_LOCAL_MODEL_BYTES: Long = 128L * 1024L * 1024L
 
     private val allowedModelExtensions = setOf(
         ".litertlm",
@@ -90,17 +90,21 @@ object AppProcessServices {
     )
 
     /**
-     * Resolves a local model file using configured file names only.
+     * Resolves a local model file using configured artifact hints only.
      *
      * Resolution order:
      * - Explicit [spec].fileName when provided
+     * - Explicit [spec].modelUrl basename when provided
      * - Installed config resolved model spec file name
+     * - Installed config resolved model spec URL basename
      * - Installed config modelDefaults.defaultFileName
      *
      * Notes:
      * - Never scans arbitrary files.
      * - Never falls back to "largest file wins".
-     * - Never logs file paths or file names.
+     * - Never logs file paths, file names, or URLs.
+     * - URL basename fallback exists to tolerate configuration drift between
+     *   remote artifact names and persisted local file names.
      */
     fun resolveConfiguredLocalModelFileOrNull(
         context: Context,
@@ -108,27 +112,20 @@ object AppProcessServices {
     ): File? {
         val appCtx = context.applicationContext
         val installed = InstalledSurveyConfigStore.getOrNull()
+        val installedSpec = installed?.resolveModelDownloadSpec()
 
-        val candidateNames = LinkedHashSet<String>()
-
-        spec?.fileName
-            ?.let(::sanitizeSimpleFileName)
-            ?.let(candidateNames::add)
-
-        installed?.resolveModelDownloadSpec()
-            ?.fileName
-            ?.let(::sanitizeSimpleFileName)
-            ?.let(candidateNames::add)
-
-        installed?.modelDefaults
-            ?.defaultFileName
-            ?.let(::sanitizeSimpleFileName)
-            ?.let(candidateNames::add)
+        val candidateNames =
+            collectConfiguredLocalModelNames(
+                explicitSpec = spec,
+                installedSpec = installedSpec,
+                installedDefaultFileName = installed?.modelDefaults?.defaultFileName,
+            )
 
         if (candidateNames.isEmpty()) return null
 
+        val roots = candidateModelRoots(appCtx)
         for (safeName in candidateNames) {
-            for (root in candidateModelRoots(appCtx)) {
+            for (root in roots) {
                 val candidate = File(root, safeName)
                 if (isUsableLocalModelFile(candidate)) {
                     return candidate
@@ -146,7 +143,7 @@ object AppProcessServices {
      * - file exists
      * - file is regular
      * - extension is explicitly allowed
-     * - size meets the shared minimum threshold
+     * - size meets the threshold for that extension
      */
     fun isUsableLocalModelFile(file: File?): Boolean {
         if (file == null) return false
@@ -154,12 +151,10 @@ object AppProcessServices {
         return runCatching {
             if (!file.exists() || !file.isFile) return@runCatching false
 
-            val lowerName = file.name.lowercase()
-            if (allowedModelExtensions.none { lowerName.endsWith(it) }) {
-                return@runCatching false
-            }
+            val extension = allowedModelExtensionOrNull(file.name) ?: return@runCatching false
+            val minimumBytes = minimumLocalModelBytesForExtension(extension)
 
-            file.length() >= MIN_LOCAL_MODEL_BYTES
+            file.length() >= minimumBytes
         }.getOrDefault(false)
     }
 
@@ -176,6 +171,62 @@ object AppProcessServices {
     }
 
     /**
+     * Collects sanitized local model file name hints from explicit and installed configuration.
+     *
+     * Why:
+     * - Some configurations persist a local artifact using an explicit file name.
+     * - Others implicitly reuse the remote artifact basename.
+     * - Startup should tolerate either style without scanning unrelated files.
+     */
+    private fun collectConfiguredLocalModelNames(
+        explicitSpec: ModelDownloadSpec?,
+        installedSpec: ModelDownloadSpec?,
+        installedDefaultFileName: String?,
+    ): List<String> {
+        val names = LinkedHashSet<String>()
+
+        explicitSpec?.fileName
+            ?.let(::sanitizeSimpleFileName)
+            ?.let(names::add)
+
+        explicitSpec?.modelUrl
+            ?.let(::sanitizeUrlBasename)
+            ?.let(names::add)
+
+        installedSpec?.fileName
+            ?.let(::sanitizeSimpleFileName)
+            ?.let(names::add)
+
+        installedSpec?.modelUrl
+            ?.let(::sanitizeUrlBasename)
+            ?.let(names::add)
+
+        installedDefaultFileName
+            ?.let(::sanitizeSimpleFileName)
+            ?.let(names::add)
+
+        return names.toList()
+    }
+
+    /**
+     * Sanitizes a basename extracted from a configured URL.
+     *
+     * Notes:
+     * - Query strings and fragments are removed first.
+     * - Only a simple leaf file name is accepted.
+     */
+    private fun sanitizeUrlBasename(url: String?): String? {
+        val raw = url?.trim().orEmpty()
+        if (raw.isBlank()) return null
+
+        val noFragment = raw.substringBefore('#')
+        val noQuery = noFragment.substringBefore('?')
+        val basename = noQuery.substringAfterLast('/')
+
+        return sanitizeSimpleFileName(basename)
+    }
+
+    /**
      * Sanitizes a simple file name to avoid traversal-like inputs.
      */
     private fun sanitizeSimpleFileName(name: String?): String? {
@@ -186,6 +237,32 @@ object AppProcessServices {
         if (n.contains("..")) return null
         if (n.length > 200) return null
         return n
+    }
+
+    /**
+     * Returns the allowed extension for the provided file name, or null when unsupported.
+     */
+    private fun allowedModelExtensionOrNull(fileName: String): String? {
+        val lowerName = fileName.lowercase()
+        return allowedModelExtensions.firstOrNull { lowerName.endsWith(it) }
+    }
+
+    /**
+     * Returns the minimum usable size for the given allowed model extension.
+     *
+     * Notes:
+     * - Keep the current behavior conservative.
+     * - Centralizing the threshold here allows future extension-specific tuning
+     *   without rewriting the file validation contract.
+     */
+    private fun minimumLocalModelBytesForExtension(extension: String): Long {
+        return when (extension) {
+            ".litertlm",
+            ".bin",
+            ".task",
+            ".gguf" -> DEFAULT_MIN_LOCAL_MODEL_BYTES
+            else -> DEFAULT_MIN_LOCAL_MODEL_BYTES
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -275,10 +352,12 @@ object AppProcessServices {
                 val created: ChatValidation.RepositoryI =
                     when (mode) {
                         RepoMode.ON_DEVICE -> {
-                            // IMPORTANT:
-                            // - Avoid logging raw model outputs in production.
-                            // - Step-1 Assessment streaming stays OFF by default unless
-                            //   an explicit config or dev override enables it.
+                            /**
+                             * IMPORTANT:
+                             * - Avoid logging raw model outputs in production.
+                             * - Step-1 Assessment streaming stays OFF by default unless
+                             *   an explicit config or dev override enables it.
+                             */
                             val twoStepAssessmentEnabled = true
                             val debugOptions = resolveRepoDebugOptions()
 
@@ -318,18 +397,13 @@ object AppProcessServices {
                 created
             }
 
-        // Close outside lock (best-effort).
         toClose?.let { closeIfSupportedSafely(it) }
 
         createdNow?.let { created ->
             SafeLog.i(TAG, "repository: created mode=$mode type=${created.javaClass.simpleName}")
 
-            // Rebind cached warmup inputs to the current repository when possible.
             if (mode == RepoMode.ON_DEVICE) {
-                rebindWarmupInputsToCurrentRepoBestEffort(
-                    context = appCtx,
-                    repo = created,
-                )
+                rebindWarmupInputsToCurrentRepoBestEffort(repo = created)
             }
         }
 
@@ -344,7 +418,6 @@ object AppProcessServices {
     private val warmupModeRef = AtomicReference<RepoMode?>(null)
     private val warmupLock = Any()
 
-    // External scope for warmup engine work (never use Main).
     private val warmupEngineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
 
     /**
@@ -387,14 +460,8 @@ object AppProcessServices {
                 warmupRef.set(created)
                 warmupModeRef.set(mode)
 
-                // Restore cached inputs only when they can be safely rebound
-                // to the current ON_DEVICE repository.
                 if (mode == RepoMode.ON_DEVICE) {
-                    created.updateInputs(
-                        resolveWarmupInputsForCurrentRepoOrNull(
-                            context = appCtx,
-                        ),
-                    )
+                    created.updateInputs(resolveWarmupInputsForCurrentRepoOrNull())
                 } else {
                     created.updateInputs(null)
                 }
@@ -402,11 +469,13 @@ object AppProcessServices {
                 created
             }
 
-        // Close outside lock (best-effort).
         toClose?.let { closeIfSupportedSafely(it) }
 
         createdNow?.let { created ->
-            SafeLog.i(TAG, "warmupController: (re)created mode=$mode type=${created.javaClass.simpleName}")
+            SafeLog.i(
+                TAG,
+                "warmupController: (re)created mode=$mode type=${created.javaClass.simpleName}",
+            )
         }
 
         return installed
@@ -424,7 +493,6 @@ object AppProcessServices {
     fun updateWarmupInputs(inputs: WarmupController.Inputs?) {
         warmupInputsRef.set(inputs)
 
-        // Update existing controller if it exists and is ON_DEVICE.
         val controller = warmupRef.get()
         val mode = warmupModeRef.get()
         if (controller != null && mode == RepoMode.ON_DEVICE) {
@@ -464,7 +532,10 @@ object AppProcessServices {
         val repo = repository(context, mode)
         val warmupRepo = repo as? WarmupController.WarmupCapableRepository
         if (warmupRepo == null) {
-            SafeLog.w(TAG, "warmupInputs: repo is not WarmupCapableRepository type=${repo.javaClass.simpleName}")
+            SafeLog.w(
+                TAG,
+                "warmupInputs: repo is not WarmupCapableRepository type=${repo.javaClass.simpleName}",
+            )
             return
         }
 
@@ -492,7 +563,6 @@ object AppProcessServices {
         mode: RepoMode,
     ): WarmupController {
         val warmupLogger: (String) -> Unit = { msg ->
-            // Sanitize any engine message to avoid leaking URLs / paths / tokens / filenames.
             SafeLog.d(TAG_WARMUP_LOG, sanitizeWarmupLog(msg))
         }
 
@@ -544,9 +614,7 @@ object AppProcessServices {
      * Privacy:
      * - Never logs file paths or names.
      */
-    private fun resolveWarmupInputsForCurrentRepoOrNull(
-        context: Context,
-    ): WarmupController.Inputs? {
+    private fun resolveWarmupInputsForCurrentRepoOrNull(): WarmupController.Inputs? {
         val cached = warmupInputsRef.get() ?: return null
         val file = cached.file
 
@@ -580,7 +648,6 @@ object AppProcessServices {
      * - If rebinding fails, previous cached inputs are left untouched.
      */
     private fun rebindWarmupInputsToCurrentRepoBestEffort(
-        context: Context,
         repo: ChatValidation.RepositoryI,
     ) {
         val cached = warmupInputsRef.get() ?: return
@@ -623,8 +690,6 @@ object AppProcessServices {
     private var downloaderConfig: DownloaderConfig? = null
     private var downloader: ModelDownloadController? = null
 
-    // Token can change independently; keep it dynamic.
-    // IMPORTANT: Never log this token.
     private val hfTokenRef = AtomicReference<String?>(null)
 
     /**
@@ -793,19 +858,11 @@ object AppProcessServices {
     private fun sanitizeWarmupLog(raw: String): String {
         var s = raw
 
-        // Redact common Hugging Face token pattern.
         s = s.replace(Regex("""\bhf_[A-Za-z0-9]{10,}\b"""), "<token>")
-
-        // Redact URLs.
         s = s.replace(Regex("""https?://\S+"""), "<url>")
-
-        // Redact Windows paths.
         s = s.replace(Regex("""[A-Za-z]:\\[^\s]+"""), "<path>")
-
-        // Redact Unix-like absolute paths.
         s = s.replace(Regex("""(/[A-Za-z0-9._-]+)+"""), "<path>")
 
-        // Redact common model/config filenames.
         s = s.replace(
             Regex(
                 """\b[\w.-]+\.(bin|tflite|task|gguf|onnx|json|yaml|yml|zip)\b""",
@@ -814,7 +871,6 @@ object AppProcessServices {
             "<file>",
         )
 
-        // Keep logs short and stable.
         val trimmed = s.trim()
         return if (trimmed.length <= 220) trimmed else trimmed.take(220) + "…"
     }

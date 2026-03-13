@@ -41,6 +41,17 @@ internal class StartupCoordinator(
 
     /**
      * Prepares the startup inputs needed by the root ViewModel.
+     *
+     * Branch contract:
+     * - Non-on-device:
+     *   - no model requirement
+     * - On-device + remote-capable:
+     *   - startup may use downloader
+     *   - existing local model is still surfaced for eager warmup wiring
+     * - On-device + local-only:
+     *   - startup requires an existing local model
+     * - On-device + neither remote nor local:
+     *   - fail with ModelUnavailable
      */
     suspend fun prepareStartup(
         repoModeProvider: () -> AppProcessServices.RepoMode,
@@ -73,17 +84,32 @@ internal class StartupCoordinator(
         val repoMode = repoModeProvider()
         val onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE
 
+        /**
+         * Always probe the configured local model for on-device mode.
+         *
+         * Why:
+         * - A remote-capable startup may still already have a usable local artifact.
+         * - Surfacing it here allows eager warmup wiring without waiting for downloader state.
+         */
         val initialLocalModelFile =
-            if (onDeviceEnabled && modelSpecKey == null) {
+            if (onDeviceEnabled) {
                 modelWiring.resolveExistingLocalModelFileOrNull(modelSpec)
             } else {
                 null
             }
 
-        if (onDeviceEnabled && modelSpecKey == null && initialLocalModelFile == null) {
+        val remoteCapable = hasRemoteDownloadCapability(modelSpec, modelSpecKey)
+        val localPresent = initialLocalModelFile != null
+
+        SafeLog.i(
+            TAG,
+            "Config: startup branch onDevice=$onDeviceEnabled remoteCapable=$remoteCapable localPresent=$localPresent",
+        )
+
+        if (onDeviceEnabled && !remoteCapable && !localPresent) {
             SafeLog.e(
                 TAG,
-                "Config: on-device model unavailable (no download URL and no local file)",
+                "Config: on-device model unavailable (no remote-capable downloader and no local model)",
             )
             return StartupPreparationResult.Failed(
                 safeReason = "ModelUnavailable",
@@ -122,17 +148,25 @@ internal class StartupCoordinator(
             val repo = AppProcessServices.repository(app, repoMode)
             val warmup = AppProcessServices.warmupController(app, repoMode)
 
+            val downloaderEnabled =
+                repoMode == AppProcessServices.RepoMode.ON_DEVICE &&
+                        hasRemoteDownloadCapability(modelSpec, modelSpecKey)
+
             val downloader =
-                if (
-                    repoMode == AppProcessServices.RepoMode.ON_DEVICE &&
-                    modelSpec != null &&
-                    modelSpecKey != null
-                ) {
-                    AppProcessServices.modelDownloader(app, spec = modelSpec)
+                if (downloaderEnabled) {
+                    AppProcessServices.modelDownloader(
+                        context = app,
+                        spec = requireNotNull(modelSpec),
+                    )
                 } else {
                     AppProcessServices.clearModelDownloader()
                     null
                 }
+
+            SafeLog.i(
+                TAG,
+                "Services: built mode=$repoMode downloaderEnabled=$downloaderEnabled",
+            )
 
             StartupBuiltServices(
                 repository = repo,
@@ -145,6 +179,16 @@ internal class StartupCoordinator(
                 "Services: build failed type=${t::class.java.simpleName}",
             )
         }.getOrNull()
+    }
+
+    /**
+     * Returns true when startup has enough information to create a downloader.
+     */
+    private fun hasRemoteDownloadCapability(
+        modelSpec: ModelDownloadSpec?,
+        modelSpecKey: ModelSpecKey?,
+    ): Boolean {
+        return modelSpec != null && modelSpecKey != null
     }
 
     /**
@@ -203,6 +247,10 @@ internal class StartupCoordinator(
 
     /**
      * Prepared startup inputs derived from process config + startup policy.
+     *
+     * Notes:
+     * - [initialLocalModelFile] may be present even when [modelSpecKey] is also present.
+     * - This allows eager warmup wiring from an already-available local artifact.
      */
     data class StartupPreparedConfig(
         val installedConfig: SurveyConfig,
@@ -229,4 +277,3 @@ internal class StartupCoordinator(
         private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
     }
 }
-

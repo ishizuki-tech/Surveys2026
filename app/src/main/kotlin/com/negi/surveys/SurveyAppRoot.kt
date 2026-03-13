@@ -191,6 +191,45 @@ object SurveyAppRoot {
         val repoIdLabel = remember(repo) { repo?.let { System.identityHashCode(it).toString() } ?: "null" }
         val repoTypeLabel = remember(repo) { repo?.javaClass?.simpleName ?: "null" }
 
+        val startupBlockingUi =
+            remember(startupUi) {
+                startupUi.toStartupBlockingUi()
+            }
+
+        /**
+         * Detects a post-config startup service hole.
+         *
+         * Why:
+         * - Once config is ready and the blocking UI is no longer in spinner mode,
+         *   missing essential services are anomalous rather than "still loading".
+         * - Root-level retry becomes meaningful in this state.
+         */
+        val startupServiceHole =
+            remember(
+                startupUi.configState,
+                startupBlockingUi.showSpinner,
+                onDeviceEnabled,
+                startupServicesReady,
+                repo,
+                warmup,
+            ) {
+                detectStartupServiceHole(
+                    configState = startupUi.configState,
+                    showSpinner = startupBlockingUi.showSpinner,
+                    onDeviceEnabled = onDeviceEnabled,
+                    servicesReady = startupServicesReady,
+                    repositoryPresent = repo != null,
+                    warmupPresent = warmup != null,
+                )
+            }
+
+        LaunchedEffect(startupServiceHole) {
+            val hole = startupServiceHole ?: return@LaunchedEffect
+            SafeLog.w(TAG, "StartupServiceHole detected reason=$hole")
+        }
+
+        val startupHoleLabel = remember(startupServiceHole) { startupServiceHole ?: "none" }
+
         val debugInfo =
             remember(
                 currentKey,
@@ -213,6 +252,7 @@ object SurveyAppRoot {
                 startupServicesReady,
                 repoIdLabel,
                 repoTypeLabel,
+                startupHoleLabel,
             ) {
                 val ignoredTotal =
                     streamStats.ignoredDelta +
@@ -232,6 +272,7 @@ object SurveyAppRoot {
                             DebugRow("RepoMode", repoMode.name),
                             DebugRow("OnDevice", onDeviceEnabled.toString()),
                             DebugRow("StartupReady", startupServicesReady.toString()),
+                            DebugRow("StartupHole", startupHoleLabel),
                             DebugRow("Logs", logs.size.toString()),
                             DebugRow("ExportLen", exportText.length.toString()),
                             DebugRow("StreamActive", streamStats.activeSessionId.toString()),
@@ -267,7 +308,7 @@ object SurveyAppRoot {
                             }.onFailure { t ->
                                 SafeLog.e(
                                     TAG,
-                                    "manual upload failed (non-fatal) type=${t.javaClass.simpleName}",
+                                    "manual upload failed (non-fatal) type=${t::class.java.simpleName}",
                                 )
                             }.getOrNull()
 
@@ -300,32 +341,19 @@ object SurveyAppRoot {
                 rootCompileStateState = rootCompileStateState,
             )
 
-        val startupBlockingUi =
-            remember(startupUi) {
-                startupUi.toStartupBlockingUi()
-            }
-
         /**
-         * Offer retry only for safe failure states or for a post-startup service hole.
+         * Offer retry only for safe failure states or for a detected startup service hole.
          *
          * Notes:
          * - During normal loading we intentionally do not surface retry.
-         * - When startup claims services are ready but repository is still null,
-         *   the app is in an anomalous blocking state and retry is meaningful.
+         * - Once config is ready and spinner is gone, missing essential services
+         *   are treated as anomalous and retry becomes meaningful.
          */
         val shouldOfferBlockingRetry =
-            remember(
-                startupUi.configState,
-                startupServicesReady,
-                repo,
-                startupBlockingUi.showSpinner,
-            ) {
+            remember(startupUi.configState, startupServiceHole) {
                 when {
                     startupUi.configState is StartupConfigState.Failed -> true
-                    startupUi.configState is StartupConfigState.Ready &&
-                            startupServicesReady &&
-                            repo == null &&
-                            !startupBlockingUi.showSpinner -> true
+                    startupServiceHole != null -> true
                     else -> false
                 }
             }
@@ -361,6 +389,32 @@ object SurveyAppRoot {
             is Review -> "Review"
             is Export -> "Export"
             else -> "Survey App"
+        }
+    }
+
+    /**
+     * Detects root-level startup anomalies after config is already ready.
+     *
+     * Returns:
+     * - null when no anomaly is detected
+     * - a short stable reason label when retry should be offered
+     */
+    private fun detectStartupServiceHole(
+        configState: StartupConfigState,
+        showSpinner: Boolean,
+        onDeviceEnabled: Boolean,
+        servicesReady: Boolean,
+        repositoryPresent: Boolean,
+        warmupPresent: Boolean,
+    ): String? {
+        if (configState !is StartupConfigState.Ready) return null
+        if (showSpinner) return null
+
+        return when {
+            !repositoryPresent -> "RepositoryMissing"
+            onDeviceEnabled && !warmupPresent -> "WarmupMissing"
+            onDeviceEnabled && !servicesReady -> "OnDeviceServicesNotReady"
+            else -> null
         }
     }
 

@@ -40,9 +40,11 @@ object ChatDrafts {
         fun normalized(): DraftKey = copy(questionId = normalizeQuestionId(questionId))
 
         private fun normalizeQuestionId(id: String): String {
-            // NOTE:
-            // - Align with validator-style normalization: trim + uppercase.
-            // - If you intentionally use case-sensitive IDs, remove uppercase.
+            /**
+             * NOTE:
+             * - Align with validator-style normalization: trim + uppercase.
+             * - If you intentionally use case-sensitive IDs, remove uppercase.
+             */
             return id.trim().uppercase(Locale.US)
         }
     }
@@ -75,8 +77,10 @@ object ChatDrafts {
          * - Keep ChatMessage immutable to preserve safety guarantees.
          */
         fun freeze(): ChatDraft {
-            // Freeze only the top-level lists (defensive copy).
-            // Keep element types immutable for stronger safety.
+            /**
+             * Freeze only the top-level lists (defensive copy).
+             * Keep element types immutable for stronger safety.
+             */
             return copy(
                 messages = messages.toList(),
                 followUps = followUps.toList(),
@@ -290,52 +294,56 @@ object ChatDrafts {
 
         override fun load(key: DraftKey): ChatDraft? {
             if (cfg.maxKeys <= 0) {
-                // Storage disabled.
                 synchronized(lock) { loads += 1 }
                 return null
             }
 
             val k = key.normalized()
 
-            // Keep lock hold time minimal: only touch the LRU map and stats under lock.
             val raw: ChatDraft = synchronized(lock) {
                 loads += 1
                 lru[k]
             } ?: return null
 
-            // Heavy work outside lock: defensive copy + caps.
-            return raw.freeze().applyCaps(cfg)
+            return raw.freeze().normalizeForStorage(cfg)
         }
 
         override fun save(key: DraftKey, draft: ChatDraft) {
             if (cfg.maxKeys <= 0) {
-                // Storage disabled. No-op by design.
                 synchronized(lock) { saves += 1 }
                 return
             }
 
             val k = key.normalized()
+            val normalized = draft.freeze().normalizeForStorage(cfg)
 
-            // Heavy work outside lock: defensive copy + caps.
-            val capped = draft.freeze().applyCaps(cfg)
-
-            // Lock only for map mutation + eviction + stats.
             val (evictedCount, keysNow) = synchronized(lock) {
                 saves += 1
-                lru[k] = capped
+                lru[k] = normalized
                 val evicted = evictIfNeededLocked(cfg.maxKeys)
                 evicted to lru.size
             }
 
             if (evictedCount > 0) {
-                logger?.invoke("InMemoryChatDraftStore: evicted=$evictedCount keysNow=$keysNow maxKeys=${cfg.maxKeys}")
+                logger?.invoke(
+                    "InMemoryChatDraftStore: evicted=$evictedCount keysNow=$keysNow maxKeys=${cfg.maxKeys}",
+                )
             }
         }
 
-        override fun clear(key: DraftKey): ChatDraft? = synchronized(lock) {
-            clears += 1
-            val k = key.normalized()
-            lru.remove(k)
+        override fun clear(key: DraftKey): ChatDraft? {
+            if (cfg.maxKeys <= 0) {
+                synchronized(lock) { clears += 1 }
+                return null
+            }
+
+            val removed: ChatDraft? = synchronized(lock) {
+                clears += 1
+                val k = key.normalized()
+                lru.remove(k)
+            }
+
+            return removed?.freeze()?.normalizeForStorage(cfg)
         }
 
         // ---------------------------------------------------------------------
@@ -368,13 +376,15 @@ object ChatDrafts {
         }
 
         /**
-         * Apply size caps to reduce the risk of unbounded memory growth.
+         * Normalizes a draft for storage/return:
+         * - applies size caps
+         * - repairs stage-dependent fields
          *
-         * Important:
-         * - This does NOT redact sensitive data; it only bounds size.
-         * - If you need redaction, do it at the ViewModel layer based on UI policy.
+         * Why:
+         * - Size caps protect memory.
+         * - Stage-dependent repair avoids restoring logically impossible states.
          */
-        private fun ChatDraft.applyCaps(cfg: Config): ChatDraft {
+        private fun ChatDraft.normalizeForStorage(cfg: Config): ChatDraft {
             val trimmedMessages: List<ChatModels.ChatMessage> = when {
                 cfg.maxMessages <= 0 -> emptyList()
                 messages.size <= cfg.maxMessages -> messages
@@ -387,14 +397,57 @@ object ChatDrafts {
                 else -> followUps.takeLast(cfg.maxFollowUps)
             }.map { it.capStrings(cfg) }
 
-            return copy(
-                messages = trimmedMessages,
-                followUps = trimmedFollowUps,
-                mainAnswer = mainAnswer.takeSafeChars(cfg.maxMainAnswerChars),
-                currentFollowUpQuestion = currentFollowUpQuestion.takeSafeChars(cfg.maxCurrentFollowUpQuestionChars),
-                completionPayload = completionPayload?.takeSafeChars(cfg.maxCompletionPayloadChars),
-                inputDraft = inputDraft.takeSafeChars(cfg.maxInputDraftChars),
-            )
+            val capped =
+                copy(
+                    messages = trimmedMessages,
+                    followUps = trimmedFollowUps,
+                    mainAnswer = mainAnswer.takeSafeChars(cfg.maxMainAnswerChars),
+                    currentFollowUpQuestion =
+                        currentFollowUpQuestion.takeSafeChars(cfg.maxCurrentFollowUpQuestionChars),
+                    completionPayload = completionPayload?.takeSafeChars(cfg.maxCompletionPayloadChars),
+                    inputDraft = inputDraft.takeSafeChars(cfg.maxInputDraftChars),
+                )
+
+            return capped.repairStageDependentFields()
+        }
+
+        /**
+         * Repairs stage-dependent fields to keep restored drafts semantically consistent.
+         *
+         * Rules:
+         * - AWAIT_MAIN:
+         *   - no outstanding follow-up question
+         *   - no completion payload
+         * - AWAIT_FOLLOW_UP:
+         *   - completion payload must be absent
+         * - DONE:
+         *   - no outstanding follow-up question
+         *
+         * Notes:
+         * - This intentionally avoids rewriting [messages].
+         * - Transcript normalization belongs at the ViewModel layer.
+         */
+        private fun ChatDraft.repairStageDependentFields(): ChatDraft {
+            return when (stage) {
+                ChatStage.AWAIT_MAIN -> {
+                    copy(
+                        currentFollowUpQuestion = "",
+                        completionPayload = null,
+                    )
+                }
+
+                ChatStage.AWAIT_FOLLOW_UP -> {
+                    copy(
+                        completionPayload = null,
+                    )
+                }
+
+                ChatStage.DONE -> {
+                    copy(
+                        currentFollowUpQuestion = "",
+                    )
+                }
+            }
         }
 
         /**
@@ -408,7 +461,8 @@ object ChatDrafts {
             return copy(
                 text = text.takeSafeChars(cfg.maxMessageTextChars),
                 assistantMessage = assistantMessage?.takeSafeChars(cfg.maxMessageAssistantChars),
-                followUpQuestion = followUpQuestion?.takeSafeChars(cfg.maxMessageFollowUpQuestionChars),
+                followUpQuestion =
+                    followUpQuestion?.takeSafeChars(cfg.maxMessageFollowUpQuestionChars),
                 streamText = streamText?.takeSafeChars(cfg.maxMessageStreamTextChars),
                 step1Raw = step1Raw?.takeSafeChars(cfg.maxMessageStep1RawChars),
                 step2Raw = step2Raw?.takeSafeChars(cfg.maxMessageStep2RawChars),
