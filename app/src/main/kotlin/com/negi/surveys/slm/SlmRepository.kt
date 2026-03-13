@@ -192,11 +192,10 @@ class SlmRepository(
             ?: throw ModelNotReadyException("Configured local model is missing or unusable")
 
         val model = getOrCreateModel(cfg = cfg, file = file)
-        withContext(Dispatchers.Default) {
-            awaitInitializedModelOnce(model = model, initOptions = InitOptions.defaultForRepo())
-        }
 
         return withModelGate(model) {
+            awaitInitializedModelOnce(model = model, initOptions = InitOptions.defaultForRepo())
+
             val questionId = request.questionId.trim().ifBlank { "AUTO-${UUID.randomUUID().toString().take(8)}" }
             val promptContext = resolveNodePromptContext(cfg = cfg, questionId = questionId)
             dbgLogNodePromptContext(promptContext)
@@ -349,7 +348,9 @@ class SlmRepository(
 
         return runCatching {
             val model = getOrCreateModel(cfg = cfg, file = modelFile)
-            awaitInitializedModelOnce(model = model, initOptions = InitOptions.fromWarmupOptions(options))
+            withModelGate(model) {
+                awaitInitializedModelOnce(model = model, initOptions = InitOptions.fromWarmupOptions(options))
+            }
             true
         }.getOrElse { t ->
             AppLog.w(TAG, "warmup: failed type=${t.javaClass.simpleName}")
@@ -619,11 +620,20 @@ class SlmRepository(
         block: suspend () -> T,
     ): T {
         val gate = gateFor(model)
+        if (dbg.enabled) {
+            AppLog.d(TAG, "gate wait: model=${model.name}")
+        }
         gate.acquire()
         try {
+            if (dbg.enabled) {
+                AppLog.d(TAG, "gate acquired: model=${model.name}")
+            }
             return block()
         } finally {
             runCatching { gate.release() }
+            if (dbg.enabled) {
+                AppLog.d(TAG, "gate released: model=${model.name}")
+            }
         }
     }
 

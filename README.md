@@ -1,126 +1,128 @@
-# Surveys2026 (LiteRT branch)
+# Surveys2026
 
-An Android (Jetpack Compose) **survey runner** prototype that embeds an on-device Small Language Model (SLM) via
-**Google AI Edge LiteRT-LM**, with a **warmup pipeline** (prefetch + compile) and a **YAML-driven survey graph**.
+Surveys2026 is an Android survey runner built with Jetpack Compose that combines a YAML-driven survey definition with an on-device Small Language Model (SLM) workflow based on Google AI Edge LiteRT-LM.
 
-> Branch: `LiteRT` (this README is written to match the implementation on that branch).
+The `main` branch currently focuses on four things:
 
----
+* process-scoped configuration installation
+* local model resolution, download, and warmup orchestration
+* structured two-step answer validation and follow-up generation
+* chat-style UI, review, and export flows
 
-## Review notes (what was fixed in this pass)
-
-* Removed duplicate intro paragraphs.
-* Standardized names to match the branch:
-
-    * `SurveyConfig.resolveModelDownloadSpec()`
-    * `ModelDownloadController.ensureModelOnce(...)`
-    * `ModelDownloadController.ModelState.*`
-    * `PrefetchState` / `CompileState` (from `utils/WarmupController.kt`)
-    * `GatePolicy.MODEL_ONLY` / `GatePolicy.MODEL_PREFETCH_COMPILE`
-* Replaced conceptual “ensureDownloaded” language with the actual controller API (`ensureModelOnce`).
-* Kept “conceptual” labels only where the definitive type lives elsewhere.
+This README is written for the **current `main` branch**, not for the older `LiteRT` branch notes.
 
 ---
 
-## Reading Index (start here)
+## What the app does
 
-If you want to understand the whole app quickly, read in this order:
+At a high level, the app:
 
-1. **Process bootstrap & config single-source rule**
+1. installs a validated survey configuration at process startup
+2. resolves a local model file from the installed config
+3. warms the model so first-use latency is lower
+4. runs a chat-style question flow
+5. validates answers with a structured two-step pipeline
+6. asks follow-up questions when the answer is not yet sufficient
+7. preserves transcript state and supports review/export flows
 
-    * `app/src/main/kotlin/com/negi/surveys/SurveyApplication.kt`
-    * What to look for:
-
-        * `SurveyConfigLoader.fromAssetsValidated(...)`
-        * `SurveyConfigLoader.installProcessConfig(cfg)`
-        * Main-process-only install (secondary processes must not install)
-
-2. **UI root + orchestration hub (model → warmup → UI wiring)**
-
-    * `app/src/main/kotlin/com/negi/surveys/SurveyAppRoot.kt`
-    * What to look for:
-
-        * config gate: `SurveyConfigLoader.getInstalledConfigOrNull()`
-        * model spec: `SurveyConfig.resolveModelDownloadSpec()`
-        * model downloader recreation key: `ModelSpecKey`
-        * warmup wiring: `WarmupController` / `SlmWarmupController`
-        * gate policy: `GatePolicy.MODEL_ONLY` vs `GatePolicy.MODEL_PREFETCH_COMPILE`
-        * `ensureModelOnce(...)` and `requestCompileAfterPrefetch(...)`
-        * Navigation3 setup + screens
-
-3. **Warmup implementation (prefetch/compile split + waiting policy)**
-
-    * `app/src/main/kotlin/com/negi/surveys/slm/SlmWarmupController.kt`
-    * `app/src/main/kotlin/com/negi/surveys/slm/SlmWarmup.kt`
-    * `app/src/main/kotlin/com/negi/surveys/utils/WarmupController.kt`
-    * What to look for:
-
-        * `prefetchOnce()` / `compileOnce()` / `warmupOnce()`
-        * `ensureCompiled(timeoutMs, reason)`
-        * `requestCompileAfterPrefetch(reason)`
-        * terminal rules: `PrefetchState.isTerminal()` / `CompileState.isTerminal()`
-
-4. **SLM repository (2-step Eval → FollowUp + streaming boundary)**
-
-    * `app/src/main/kotlin/com/negi/surveys/slm/SlmRepository.kt`
-    * What to look for:
-
-        * `buildPrompt(userPrompt)` must be I/O-free (non-suspend)
-        * `request(prompt): Flow<String>` (streaming)
-        * `enableTwoStepEval` + JSON contract + `acceptScoreThreshold`
-
-5. **SLM facade + LiteRT runtime wrappers**
-
-    * `app/src/main/kotlin/com/negi/surveys/slm/SLM.kt`
-    * `app/src/main/kotlin/com/negi/surveys/slm/liteRT/` (session/run/delta)
-    * What to look for:
-
-        * initialization boundary
-        * streaming termination / watchdog behavior (SDK drift tolerance)
-
-6. **Export pipeline (binder-safe sharing)**
-
-    * `app/src/main/kotlin/com/negi/surveys/ui/ExportScreen.kt`
-    * What to look for:
-
-        * SHA-256 + byte count calculation (off main thread)
-        * preview vs full copy/share behavior
-        * FileProvider share path + large payload handling
+The project is designed around a **single source of truth** for survey configuration and a **process-scoped** runtime setup.
 
 ---
 
-## What this project is
+## Main branch architecture
 
-* **Survey runtime** driven by `app/src/main/assets/survey.yaml`.
-* **On-device SLM** using LiteRT-LM (`com.google.ai.edge.litertlm`).
-* **Warmup orchestration** to reduce first-token latency:
+### 1. Application bootstrap
 
-    * Prefetch = OS page-cache warming / I/O warming.
-    * Compile  = heavier runtime initialization / delegate compilation (optionally OpenCL).
-* **Developer-friendly config** with optional tokens (e.g., Hugging Face download, GitHub upload).
+`SurveyApplication.kt` is the process entry point.
+
+Its responsibilities include:
+
+* initializing bootstrap helpers
+* installing `SurveyConfig` once per process
+* skipping redundant work in non-main processes
+* attempting best-effort early warmup input injection
+
+The important design rule is simple:
+
+> the app should install configuration once at process level, and the rest of the app should read that installed config instead of reparsing YAML in random places.
+
+### 2. UI orchestration
+
+The app uses a Compose-based UI root that coordinates:
+
+* configuration readiness
+* model availability
+* warmup state
+* chat / survey flow
+* review / export flow
+
+### 3. Model runtime
+
+The project uses a repository-centered model runtime.
+
+`SlmRepository.kt` is the core orchestration layer for:
+
+* prompt building
+* streaming generation
+* structured two-step validation
+* phase-separated conversation resets
+* model gating so sync and streaming requests do not trample each other
+
+### 4. Validation pipeline
+
+The validation flow is intentionally structured:
+
+* **Step 1**: score and classify the answer
+* **Step 2**: generate the next follow-up question only when needed
+
+The final accept / follow-up decision is owned by **Step 1**, not by free-form model text.
+
+### 5. Streaming bridge and ViewModel
+
+The chat pipeline is split cleanly:
+
+* `ChatStreamBridge.kt` forwards low-level phase-tagged stream events
+* `AnswerValidator.kt` maps repository results into UI-facing outcomes
+* `ChatQuestionViewModel.kt` manages transcript state, rollback, follow-up turns, draft persistence, and ephemeral vs stable model bubbles
 
 ---
 
-## Tech stack
+## Core runtime flow
 
-* Kotlin / Android
-* Jetpack Compose (Material 3)
-* Navigation3 (alpha)
-* Kotlinx Serialization + KAML
-* LiteRT-LM (`com.google.ai.edge.litertlm`)
+```text
+SurveyApplication
+  -> install process config
+  -> bootstrap app services
+  -> best-effort warmup input injection
 
-Build targets (from Gradle):
+UI root
+  -> wait for installed config
+  -> resolve model spec / local model file
+  -> ensure model availability
+  -> trigger warmup
+  -> enter chat / survey flow
 
-* `compileSdk = 36`
-* `minSdk = 26`
-* `targetSdk = 36`
-
----
-
-## Repository layout (LiteRT branch)
-
+ChatQuestionViewModel
+  -> submit answer
+  -> open stream window
+  -> call AnswerValidator
+  -> repository runs two-step assessment
+  -> Step 1 JSON result
+  -> optional Step 2 follow-up JSON
+  -> UI stores stable model messages + assistant outcome
 ```
+
+---
+
+## Repository layout
+
+This is a single-module Android project centered on `:app`.
+
+```text
 Surveys2026/
+  .github/
+    workflows/
+      AndroidBuild.yml
   app/
     src/main/
       AndroidManifest.xml
@@ -129,417 +131,268 @@ Surveys2026/
       kotlin/com/negi/surveys/
         SurveyApplication.kt
         MainActivity.kt
+        AppProcessServices.kt
         SurveyAppRoot.kt
+        chat/
+          AnswerValidator.kt
+          ChatQuestionViewModel.kt
+          ChatStreamBridge.kt
+          ChatModels.kt
+          ChatDrafts.kt
         config/
-          SurveyConfigModelDownloadSpec.kt
           ...
         slm/
           SLM.kt
           SlmRepository.kt
           SlmWarmup.kt
           SlmWarmupController.kt
-          liteRT/
-            ...
         ui/
           ...
         utils/
           ModelDownloadController.kt
           WarmupController.kt
-          HeavyInitializer.kt
+  README.md
+  build.gradle.kts
+  settings.gradle.kts
 ```
 
-Single-module build on this branch:
+---
 
-* `include(":app")` (see `settings.gradle.kts`).
+## Main branch highlights
+
+### YAML-driven survey definition
+
+The survey graph lives in:
+
+* `app/src/main/assets/survey.yaml`
+
+This configuration is expected to provide survey structure plus model defaults used by the runtime.
+
+### Process-scoped config installation
+
+The installed config is intended to be the app-wide source of truth during runtime.
+
+### On-device LiteRT-LM integration
+
+The app depends on `com.google.ai.edge.litertlm` and is built around an on-device model workflow.
+
+### Warmup support
+
+Warmup is split conceptually into phases such as:
+
+* model availability
+* prefetch / I/O warming
+* compile / runtime initialization
+
+### Structured follow-up logic
+
+The follow-up system is not a single raw generation call. It uses a two-step path so the app can separate:
+
+* evaluation logic
+* assistant-facing follow-up wording
+
+### Chat persistence
+
+Drafts and chat transcript state are designed to survive navigation and restoration.
+
+---
+
+## Build targets and stack
+
+### Android targets
+
+From the current Gradle configuration:
+
+* `compileSdk = 36`
+* `minSdk = 26`
+* `targetSdk = 36`
+* application id: `com.negi.surveys`
+
+### Main technologies
+
+* Kotlin
+* Android Gradle Plugin
+* Jetpack Compose
+* Material 3
+* Navigation 3 alpha
+* Kotlinx Serialization
+* KAML
+* Google AI Edge LiteRT-LM
+* Android DataStore
 
 ---
 
 ## Configuration
 
-### 1) `survey.yaml` (survey graph + model defaults)
+### Survey configuration
 
-File: `app/src/main/assets/survey.yaml`
+Main survey configuration lives in:
 
-Contains (conceptually):
+* `app/src/main/assets/survey.yaml`
 
-* `graph`: a node graph (currently minimal START → DONE)
-* `model_defaults`: default LiteRT-LM model source + UI/timeout parameters
+This is expected to define the survey graph and model defaults used by the app.
 
-The model download parameters are resolved via:
+### Model resolution
 
-* `SurveyConfig.resolveModelDownloadSpec()` in
-  `app/src/main/kotlin/com/negi/surveys/config/SurveyConfigModelDownloadSpec.kt`
+The main branch resolves the runtime model from installed configuration and local storage through app services rather than hardcoding a fixed file path in the UI layer.
 
-That resolver:
+### Optional secrets / local settings
 
-* accepts only http(s) URLs (rejects whitespace / non-http(s))
-* sanitizes the file name to avoid traversal / separators
-* loads Hugging Face token from `BuildConfig` via reflection (best-effort)
-* applies safe minimums:
-
-    * `timeoutMs >= 1`
-    * `uiThrottleMs >= 0`
-    * `uiMinDeltaBytes >= 0`
-
-### 2) Tokens / secrets (Hugging Face)
-
-Hugging Face token is resolved from `BuildConfig` via reflection.
-Supported field names (first match wins):
+The Gradle configuration supports optional values such as:
 
 * `HF_TOKEN`
-* `HUGGINGFACE_TOKEN`
-* `HUGGING_FACE_TOKEN`
-* `HUGGING_FACE_API_TOKEN`
+* `GH_TOKEN`
+* `GITHUB_TOKEN`
+* GitHub owner / repo / branch related fields
+* version name / version code overrides
 
-Recommendations:
+These are intended for local development or CI use and should not be committed into the repository.
 
-* Keep secrets out of git.
-* Prefer local-only injection and/or runtime secrets.
+A practical setup is to keep local-only values in one of these places:
 
----
-
-## OpenCL / GPU (AndroidManifest)
-
-The app declares optional native libraries to enable GPU (OpenCL) access on `targetSdk 31+`.
-These are marked `android:required="false"`, so the app should still run on devices without them.
-
-Practical guidance:
-
-* Treat OpenCL as best-effort.
-* Validate stability per device family.
-* Keep a CPU fallback path.
+* `~/.gradle/gradle.properties`
+* `local.properties`
+* CI secrets / environment variables
 
 ---
 
-## Warmup pipeline (why it exists)
-
-Cold-starting an on-device model often has two distinct kinds of “first time pain”:
-
-1. **I/O pain**: reading a large model file from storage.
-2. **Compile/delegate pain**: initializing runtime, compiling kernels, loading delegates.
-
-This project separates them:
-
-* **Prefetch warmup** warms the OS page cache (I/O warming).
-* **Compile warmup** performs heavyweight runtime initialization.
-
-The public API and state model are intentionally SDK-agnostic and live in:
-
-* `app/src/main/kotlin/com/negi/surveys/utils/WarmupController.kt`
-
----
-
-## Warmup states (exact names)
-
-Defined in `utils/WarmupController.kt`.
-
-### `PrefetchState`
-
-* `PrefetchState.Idle`
-* `PrefetchState.Running(file, startedAtMs, downloaded, total, elapsedMs)`
-* `PrefetchState.Prefetched(file, sizeBytes, startedAtMs, elapsedMs)`
-* `PrefetchState.Failed(message, startedAtMs, elapsedMs)`
-* `PrefetchState.Cancelled(startedAtMs, elapsedMs)`
-* `PrefetchState.SkippedNotConfigured(reason, elapsedMs)`
-
-### `CompileState`
-
-* `CompileState.Idle`
-* `CompileState.WaitingForPrefetch(file, requestedAtMs, elapsedMs)`
-* `CompileState.Compiling(file, startedAtMs, elapsedMs)`
-* `CompileState.Compiled(file, startedAtMs, elapsedMs)`
-* `CompileState.Failed(message, startedAtMs, elapsedMs)`
-* `CompileState.Cancelled(startedAtMs, elapsedMs)`
-* `CompileState.SkippedNotConfigured(reason, elapsedMs)`
-
-Terminal states:
-
-* Prefetch terminal: `Prefetched`, `Failed`, `Cancelled`, `SkippedNotConfigured`
-* Compile terminal: `Compiled`, `Failed`, `Cancelled`, `SkippedNotConfigured`
-
----
-
-## App lifecycle & single-source config (important)
-
-### Process bootstrap (`SurveyApplication`)
-
-File: `app/src/main/kotlin/com/negi/surveys/SurveyApplication.kt`
-
-On process start (conceptually):
-
-1. Logs early breadcrumbs (pid/process/build).
-2. Initializes bootstrap helpers best-effort.
-3. Installs **SurveyConfig exactly once per process** (main process only):
-
-    * Loads config from assets via `SurveyConfigLoader.fromAssetsValidated(...)`.
-    * Stores it via `SurveyConfigLoader.installProcessConfig(cfg)`.
-    * Secondary processes must skip install to avoid redundant I/O.
-
-Single source of truth rule:
-
-* Everything else must read config via `SurveyConfigLoader.getInstalledConfigOrNull()`.
-* UI must not re-parse YAML directly.
-
-### UI root waits for installed config (`SurveyAppRoot`)
-
-File: `app/src/main/kotlin/com/negi/surveys/SurveyAppRoot.kt`
-
-* `SurveyAppRoot()` does not load YAML directly.
-* It waits briefly for `SurveyApplication` to install config:
-
-    * `INSTALLED_CONFIG_WAIT_MS = 1500`
-    * `INSTALLED_CONFIG_POLL_MS = 25`
-
-If config is still missing after the deadline:
-
-* `ConfigState.Failed("InstalledConfigMissing")`
-
----
-
-## Model download (exact controller + state names)
-
-File: `app/src/main/kotlin/com/negi/surveys/utils/ModelDownloadController.kt`
-
-The root uses `ModelDownloadController` to ensure a local model file exists.
-
-Start/ensure call:
-
-* `ensureModelOnce(timeoutMs, forceFresh, reason)`
-
-State machine (exact names):
-
-* `ModelState.Idle(elapsedMs)`
-* `ModelState.NotConfigured(reason, elapsedMs)`
-* `ModelState.Checking(file, startedAtMs, elapsedMs)`
-* `ModelState.Downloading(file, startedAtMs, downloaded, total, elapsedMs)`
-* `ModelState.Ready(file, sizeBytes, startedAtMs, elapsedMs)`
-* `ModelState.Failed(safeReason, startedAtMs, elapsedMs)`
-* `ModelState.Cancelled(startedAtMs, elapsedMs)`
-
-Safety note:
-
-* Failure messages must be safe (avoid raw URLs, tokens, file paths, or exception dumps).
-
----
-
-## How “model DL → warmup → repository → UI” is wired (implementation-aligned)
-
-Primary orchestration lives in:
-
-* `app/src/main/kotlin/com/negi/surveys/SurveyAppRoot.kt`
-
-### 0) Config gate (installed-only)
-
-```
-SurveyAppRoot()
-  └─ produceState: wait for installed config
-     ├─ SurveyConfigLoader.getInstalledConfigOrNull()
-     ├─ INSTALLED_CONFIG_WAIT_MS = 1500
-     └─ INSTALLED_CONFIG_POLL_MS = 25
-
-ConfigState:
-  - Loading
-  - Ready(cfg)
-  - Failed("InstalledConfigMissing")
-```
-
-### 1) Resolve model spec from config
-
-```
-ConfigState.Ready(cfg)
-  └─ cfg.resolveModelDownloadSpec()
-      -> ModelDownloadSpec(modelUrl, fileName, timeoutMs, uiThrottleMs, uiMinDeltaBytes, hfToken)
-```
-
-### 2) Downloader lifecycle (recreate on effective spec changes)
-
-`SurveyAppRoot` computes a stable `ModelSpecKey` and recreates the downloader when it changes.
-
-Downloader entry:
-
-* `modelDownloader.ensureModelOnce(timeoutMs, forceFresh, reason)`
-
-### 3) Warmup orchestration
-
-Warmup is surfaced via `WarmupController`:
-
-* `prefetchState: StateFlow<PrefetchState>`
-* `compileState: StateFlow<CompileState>`
-
-Root policy used on this branch:
-
-* download model once after first frame (startup)
-* once model becomes ready, start warmup
-* optionally block via `ensureCompiled()` when entering gated UI
-
-Key calls:
-
-* `warmup.requestCompileAfterPrefetch(reason = "startupAfterModelReady")`
-* `warmup.ensureCompiled(timeoutMs, reason)`
-
-### 4) Repository streaming boundary
-
-SLM repository interface:
-
-* `buildPrompt(userPrompt: String): String` (no I/O)
-* `request(prompt: String): Flow<String>` (streaming)
-
-In this branch the concrete repository is:
-
-* `app/src/main/kotlin/com/negi/surveys/slm/SlmRepository.kt`
-
-It implements a **2-step flow** by default:
-
-1. Eval (internal, strict JSON score)
-2. Follow-up question generation (strict JSON)
-
-### 5) UI gating
-
-`SurveyAppRoot` gates screen entry via `GatePolicy`:
-
-* `GatePolicy.MODEL_ONLY`
-* `GatePolicy.MODEL_PREFETCH_COMPILE`
-
-Screens (conceptually):
-
-* Setup / Download status (ModelState)
-* Warmup status (PrefetchState / CompileState)
-* Chat / Survey runner (collects Flow deltas)
-* Review / Export
-
-### End-to-end ASCII flow
-
-```
-[SurveyApplication]
-  └─ installProcessConfig(from assets/survey.yaml)
-
-[MainActivity]
-  └─ setContent { SurveyAppRoot() }
-
-[SurveyAppRoot]
-  ├─ wait installed cfg (polling, bounded)
-  ├─ cfg.resolveModelDownloadSpec()
-  ├─ modelDownloader.ensureModelOnce(...)
-  ├─ warmup.requestCompileAfterPrefetch(...)
-  ├─ (optional) warmup.ensureCompiled(...)
-  ├─ repo.request(prompt) : Flow<String>
-  └─ UI collects Flow → renders deltas → Export
-```
-
----
-
-## SlmWarmupController (public operations)
-
-File: `app/src/main/kotlin/com/negi/surveys/slm/SlmWarmupController.kt`
-
-Operations:
-
-* `prefetchOnce()`
-* `compileOnce()`
-* `warmupOnce()` (prefetch then compile-after-prefetch)
-* `requestCompileAfterPrefetch(reason)`
-* `ensureCompiled(timeoutMs, reason)`
-* `cancelAll(reason)`
-* `resetForRetry(reason)`
-
-SDK boundary rule:
-
-* Public API uses `SystemPrompt` (SDK-agnostic).
-* Internally it attempts to build a LiteRT `Message` best-effort (tolerates SDK drift).
-
----
-
-## SlmRepository (2-step Eval → FollowUp)
-
-File: `app/src/main/kotlin/com/negi/surveys/slm/SlmRepository.kt`
-
-Key behavior:
-
-* `buildPrompt()` is non-suspend and must not do I/O.
-* `request()` is suspend and may load config best-effort depending on `allowAssetConfigFallback`
-  (but must never install process config; `SurveyApplication` is the owner).
-
-2-step mode:
-
-* controlled by `enableTwoStepEval` (default `true`)
-* acceptance threshold: `acceptScoreThreshold` (default `70`)
-
----
-
-## Export & sharing (binder-safe)
-
-Why:
-
-* Huge intent extras can crash (`TransactionTooLarge`).
-* Clipboard may fail or behave inconsistently for very large payloads.
-
-Implementation:
-
-* `app/src/main/kotlin/com/negi/surveys/ui/ExportScreen.kt`
-
-Behavior:
-
-* SHA-256 + UTF-8 byte count computed off main thread
-* preview vs full copy/share decisions
-* large payload share uses a file + `FileProvider` best-effort
-
----
-
-## Build & Run
+## Build and run
 
 ### Prerequisites
 
-* Android Studio (AGP 9+ compatible)
+* Android Studio with modern AGP support
 * JDK 17
-* Android SDK (compileSdk 36)
-* Device/emulator: Android 8.0+ (`minSdk 26`)
+* Android SDK for API 36
+* an Android 8.0+ device or emulator
 
-### Quick start
+### Open in Android Studio
 
 ```bash
 git clone https://github.com/ishizuki-tech/Surveys2026.git
 cd Surveys2026
-git checkout LiteRT
 ```
 
-Open in Android Studio and run the `app` configuration.
+Open the project and run the `app` configuration.
+
+### Build from the command line
+
+Debug build:
+
+```bash
+./gradlew :app:assembleDebug
+```
+
+Release artifacts:
+
+```bash
+./gradlew :app:assembleRelease :app:bundleRelease
+```
+
+### Version overrides
+
+The build supports overriding app version values via Gradle properties, for example:
+
+```bash
+./gradlew :app:assembleRelease -Papp.versionName=v0.0.1-test -Papp.versionCode=123
+```
+
+---
+
+## GitHub Actions
+
+The repository includes a manual workflow:
+
+* `.github/workflows/AndroidBuild.yml`
+
+It is currently set up as an **Android CI & Release** workflow with `workflow_dispatch` inputs for things like:
+
+* module
+* release publishing toggle
+* base version
+* version name override
+* version code override
+* tag prefix / suffix format
+
+In other words, the current workflow is oriented toward **manual build / release runs**, not just push-triggered CI.
+
+---
+
+## Important implementation notes
+
+### Validation streaming is phase-based
+
+The app distinguishes streaming phases instead of treating all model output as one undifferentiated blob.
+
+Key phases include:
+
+* `STEP1_EVAL`
+* `STEP2_FOLLOW_UP`
+
+### Stable vs ephemeral model messages
+
+The UI keeps a distinction between:
+
+* transient streaming model bubbles
+* persisted final model messages
+
+That split is important for both user experience and draft restoration.
+
+### Step 1 owns the decision
+
+The repository and validator are designed so that acceptance or follow-up status is determined from structured Step 1 evaluation, not from whatever Step 2 happens to say.
+
+### Main branch is still an actively evolving prototype
+
+This branch is clearly being used as an active development branch, not as a frozen product release. Expect implementation details, build workflow details, and runtime boundaries to continue evolving.
+
+---
+
+## Suggested reading order
+
+If you are trying to understand the app quickly, read files in roughly this order:
+
+1. `app/src/main/kotlin/com/negi/surveys/SurveyApplication.kt`
+2. `app/src/main/kotlin/com/negi/surveys/SurveyAppRoot.kt`
+3. `app/src/main/kotlin/com/negi/surveys/AppProcessServices.kt`
+4. `app/src/main/kotlin/com/negi/surveys/slm/SlmRepository.kt`
+5. `app/src/main/kotlin/com/negi/surveys/chat/AnswerValidator.kt`
+6. `app/src/main/kotlin/com/negi/surveys/chat/ChatStreamBridge.kt`
+7. `app/src/main/kotlin/com/negi/surveys/chat/ChatQuestionViewModel.kt`
+8. `app/src/main/kotlin/com/negi/surveys/utils/WarmupController.kt`
+9. `app/src/main/kotlin/com/negi/surveys/slm/SlmWarmupController.kt`
+10. `app/src/main/assets/survey.yaml`
 
 ---
 
 ## Troubleshooting
 
-### UI shows `InstalledConfigMissing`
+### The app cannot find a model
 
-* Ensure `SurveyApplication` is registered in `AndroidManifest.xml`.
-* Confirm `assets/survey.yaml` exists and is valid.
-* Watch logcat for success breadcrumbs from `SurveyApplication`.
+Check:
 
-### Model download never reaches `Ready`
+* installed configuration is present
+* model resolution points to a usable local file
+* warmup and runtime services were created successfully
 
-* Inspect `ModelState` transitions (Idle → Checking → Downloading → Ready/Failed).
-* Verify `model_defaults.default_model_url` is http(s) and contains no whitespace.
-* Ensure file name is valid (sanitization may change it).
+### Validation is stuck or inconsistent
 
-### Warmup never reaches terminal
+Check:
 
-* Treat warmup as best-effort.
-* Use bounded waits: `ensureCompiled(timeoutMs, reason)`.
-* Timeout returns the current state snapshot (it does not throw).
+* Step 1 / Step 2 stream events
+* repository reset boundaries
+* model gate behavior
+* whether the model is still warming up
 
-### Export share fails
+### Config appears missing
 
-* Some share targets reject large payloads.
-* Prefer file-based sharing (ExportScreen should auto-switch when large).
-* Confirm FileProvider authority matches `${applicationId}.fileprovider`.
+Check:
 
-### OpenCL crashes on certain devices
-
-* Treat GPU as best-effort.
-* Validate per device family; disable GPU path if unstable.
-* Keep CPU fallback.
+* `SurveyApplication` is registered and running
+* `survey.yaml` exists and is valid
+* the main process completed config installation
 
 ---
 
 ## License
 
-MIT License (see repository license and file headers).
+MIT License.
