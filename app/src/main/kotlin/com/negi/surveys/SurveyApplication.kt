@@ -26,7 +26,6 @@ import java.util.concurrent.atomic.AtomicReference
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 /**
@@ -88,6 +87,7 @@ class SurveyApplication : Application() {
         // - Do not use reflection to guess warmup entrypoints.
         // - Trust only config-named local model files that pass shared validation.
         // - Never blocks the main thread.
+        // - Skip quietly when startup is remote-capable but no usable local model exists yet.
         WarmupInputsBootstrap.tryInjectOnceBestEffort(appContext)
 
         SafeLog.i(TAG, "startup: done in ${SystemClock.elapsedRealtime() - t0}ms")
@@ -149,6 +149,11 @@ class SurveyApplication : Application() {
      * - Never blocks the caller.
      * - Never logs file paths/names.
      * - Never clears existing Inputs; only installs when confident.
+     *
+     * Policy:
+     * - This path exists only to accelerate local-existing-model startup.
+     * - It must not retry/warn during normal remote-download startup when no usable
+     *   local model exists yet.
      */
     private object WarmupInputsBootstrap {
 
@@ -158,10 +163,6 @@ class SurveyApplication : Application() {
 
         private val scope =
             CoroutineScope(SupervisorJob() + Dispatchers.Default)
-
-        private const val INITIAL_DELAY_MS: Long = 150L
-        private const val RETRY_INTERVAL_MS: Long = 250L
-        private const val MAX_TOTAL_RETRY_MS: Long = 5_000L
 
         fun tryInjectOnceBestEffort(appContext: Context) {
             if (!attemptedOnce.compareAndSet(false, true)) return
@@ -176,72 +177,64 @@ class SurveyApplication : Application() {
                     return@launch
                 }
 
-                // Small delay so process bootstrap/config install can settle.
-                delay(INITIAL_DELAY_MS)
+                val file =
+                    AppProcessServices.resolveConfiguredLocalModelFileOrNull(
+                        appContext.applicationContext,
+                    )
 
-                val deadlineAt = SystemClock.elapsedRealtime() + MAX_TOTAL_RETRY_MS
-                var attempts = 0
-                var loggedRepoNotCapable = false
-
-                while (SystemClock.elapsedRealtime() < deadlineAt) {
-                    attempts += 1
-
-                    val file =
-                        AppProcessServices.resolveConfiguredLocalModelFileOrNull(
-                            appContext.applicationContext,
-                        )
-                    if (!AppProcessServices.isUsableLocalModelFile(file)) {
-                        delay(RETRY_INTERVAL_MS)
-                        continue
-                    }
-
-                    val repo =
-                        runCatching {
-                            AppProcessServices.repository(
-                                appContext.applicationContext,
-                                repoMode,
-                            )
-                        }.getOrNull()
-
-                    val warmupRepo = repo as? WarmupController.WarmupCapableRepository
-                    if (warmupRepo == null) {
-                        if (!loggedRepoNotCapable) {
-                            loggedRepoNotCapable = true
-                            SafeLog.w(
-                                TAG,
-                                "warmupInputs: earlyInject retry " +
-                                        "(repo not WarmupCapableRepository) " +
-                                        "repoType=${repo?.javaClass?.simpleName ?: "null"} " +
-                                        "pid=${Process.myPid()}",
-                            )
-                        }
-                        delay(RETRY_INTERVAL_MS)
-                        continue
-                    }
-
-                    val inputs =
-                        WarmupController.Inputs(
-                            file = file,
-                            repository = warmupRepo,
-                            options = WarmupController.Options(),
-                        )
-
-                    AppProcessServices.updateWarmupInputs(inputs)
-
+                if (!AppProcessServices.isUsableLocalModelFile(file)) {
                     SafeLog.i(
                         TAG,
-                        "warmupInputs: earlyInject installed hasInputs=true " +
-                                "pid=${Process.myPid()} repoType=${repo.javaClass.simpleName} " +
-                                "attempts=$attempts",
+                        "warmupInputs: earlyInject skipped (no usable local model) pid=${Process.myPid()}",
                     )
                     return@launch
                 }
 
-                SafeLog.w(
-                    TAG,
-                    "warmupInputs: earlyInject gave up (best-effort) " +
-                            "pid=${Process.myPid()} attempts=$attempts",
-                )
+                val repo =
+                    runCatching {
+                        AppProcessServices.repository(
+                            appContext.applicationContext,
+                            repoMode,
+                        )
+                    }.onFailure { t ->
+                        SafeLog.e(
+                            TAG,
+                            "warmupInputs: earlyInject repo lookup failed (non-fatal)",
+                        )
+                    }.getOrNull() ?: return@launch
+
+                val warmupRepo = repo as? WarmupController.WarmupCapableRepository
+                if (warmupRepo == null) {
+                    SafeLog.i(
+                        TAG,
+                        "warmupInputs: earlyInject skipped (repo not warmup-capable) " +
+                                "repoType=${repo.javaClass.simpleName} pid=${Process.myPid()}",
+                    )
+                    return@launch
+                }
+
+                val inputs =
+                    WarmupController.Inputs(
+                        file = file,
+                        repository = warmupRepo,
+                        options = WarmupController.Options(),
+                    )
+
+                runCatching {
+                    AppProcessServices.updateWarmupInputs(inputs)
+                }.onSuccess {
+                    SafeLog.i(
+                        TAG,
+                        "warmupInputs: earlyInject installed hasInputs=true " +
+                                "pid=${Process.myPid()} repoType=${repo.javaClass.simpleName}",
+                    )
+                }.onFailure { t ->
+                    SafeLog.e(
+                        TAG,
+                        "warmupInputs: earlyInject install failed (non-fatal) " +
+                                "pid=${Process.myPid()} repoType=${repo.javaClass.simpleName}",
+                    )
+                }
             }
         }
     }

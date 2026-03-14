@@ -19,6 +19,7 @@ import com.negi.surveys.logging.AppLog
 import java.io.File
 import java.util.concurrent.atomic.AtomicLong
 import kotlinx.coroutines.TimeoutCancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.withTimeout
@@ -27,16 +28,19 @@ import kotlinx.coroutines.withTimeout
  * Warmup controller used by UI / process services.
  *
  * Design goals:
- * - UI depends only on this controller (engine is injected).
+ * - UI depends only on this controller.
  * - Engine can be swapped (real vs fake) without changing UI code.
  * - Privacy-safe logs: never log tokens/urls/file names/raw content.
+ * - Keep compile readiness separate from runtime-hot readiness.
  *
  * NOTE:
  * - This controller MUST NOT throw from the constructor.
  * - Environment failures should be represented as SkippedNotReady/Failed states by the engine.
  *
  * Key change:
- * - Removed Dependencies. Callers must provide explicit [Inputs] via [updateInputs].
+ * - Runtime warmup is now represented explicitly via [RuntimeWarmState].
+ * - Backward compatibility is preserved by making runtime support optional through
+ *   [RuntimeAwareEngine].
  */
 class WarmupController(
     context: Context,
@@ -46,6 +50,27 @@ class WarmupController(
 
     private val appContext: Context = context.applicationContext
     private val instanceId: Long = NEXT_INSTANCE_ID.incrementAndGet()
+
+    /**
+     * Optional runtime-aware engine view.
+     *
+     * Why:
+     * - Existing engine implementations may still implement only [Engine].
+     * - This keeps the controller source-compatible while allowing gradual rollout.
+     */
+    private val runtimeAwareEngine: RuntimeAwareEngine? = engine as? RuntimeAwareEngine
+
+    /**
+     * Fallback state used when runtime warmup is not implemented by the engine.
+     *
+     * Notes:
+     * - This is intentionally terminal and non-throwing.
+     * - UI can observe that runtime warmup is unsupported without breaking compile readiness.
+     */
+    private val fallbackRuntimeWarmState =
+        MutableStateFlow<RuntimeWarmState>(
+            RuntimeWarmState.SkippedNotReady(reason = "RuntimeWarmNotSupported"),
+        )
 
     /**
      * Warmup input bundle provided by the app (resolved & explicit).
@@ -60,7 +85,7 @@ class WarmupController(
     )
 
     /**
-     * Stable contract for repositories that can do a deterministic warmup.
+     * Stable contract for repositories that can do a deterministic compile warmup.
      *
      * IMPORTANT:
      * - Implementations must not log file paths or exception messages.
@@ -68,6 +93,25 @@ class WarmupController(
      */
     interface WarmupCapableRepository {
         suspend fun warmup(
+            appContext: Context,
+            modelFile: File,
+            options: Options,
+        ): Boolean
+    }
+
+    /**
+     * Optional repository contract for runtime prewarm.
+     *
+     * Meaning:
+     * - "compile warmup" answers: can the engine avoid first-use compile stalls?
+     * - "runtime warmup" answers: is the live inference runtime already hot?
+     *
+     * IMPORTANT:
+     * - Implementations must not log file paths or raw exception messages.
+     * - Returning false should mean "runtime did not become ready".
+     */
+    interface RuntimeWarmCapableRepository : WarmupCapableRepository {
+        suspend fun prepareRuntime(
             appContext: Context,
             modelFile: File,
             options: Options,
@@ -109,7 +153,7 @@ class WarmupController(
         ) : PrefetchState
 
         /**
-         * Indicates warmup was skipped because [Inputs] were not provided yet or invalid.
+         * Indicates prefetch was skipped because [Inputs] were not provided yet or invalid.
          *
          * IMPORTANT:
          * - This is a "not-ready" condition, not necessarily a permanent error.
@@ -158,7 +202,7 @@ class WarmupController(
         ) : CompileState
 
         /**
-         * Indicates warmup was skipped because [Inputs] were not provided yet or invalid.
+         * Indicates compile was skipped because [Inputs] were not provided yet or invalid.
          *
          * IMPORTANT:
          * - This is a "not-ready" condition, not necessarily a permanent error.
@@ -169,6 +213,62 @@ class WarmupController(
         ) : CompileState
     }
 
+    /**
+     * Public/UI runtime-hot state model.
+     *
+     * Meaning:
+     * - Compile success does not necessarily mean the live runtime is hot.
+     * - This state tracks whether the app already paid the cost of first real inference setup.
+     */
+    sealed interface RuntimeWarmState {
+        val elapsedMs: Long
+
+        data object Idle : RuntimeWarmState {
+            override val elapsedMs: Long = 0L
+        }
+
+        data class WaitingForCompile(
+            val file: File,
+            val requestedAtMs: Long,
+            override val elapsedMs: Long,
+        ) : RuntimeWarmState
+
+        data class Warming(
+            val file: File,
+            val startedAtMs: Long,
+            override val elapsedMs: Long,
+        ) : RuntimeWarmState
+
+        data class Ready(
+            val file: File,
+            val startedAtMs: Long,
+            override val elapsedMs: Long,
+        ) : RuntimeWarmState
+
+        data class Failed(
+            val message: String,
+            val startedAtMs: Long?,
+            override val elapsedMs: Long,
+        ) : RuntimeWarmState
+
+        data class Cancelled(
+            val startedAtMs: Long?,
+            override val elapsedMs: Long,
+        ) : RuntimeWarmState
+
+        /**
+         * Indicates runtime warmup was skipped because the engine/repository/input set
+         * is not ready for runtime prewarm yet.
+         *
+         * IMPORTANT:
+         * - This is intentionally distinct from [CompileState.SkippedNotReady].
+         */
+        data class SkippedNotReady(
+            val reason: String,
+            override val elapsedMs: Long = 0L,
+        ) : RuntimeWarmState
+    }
+
     data class Options(
         val supportImage: Boolean = false,
         val supportAudio: Boolean = false,
@@ -177,7 +277,7 @@ class WarmupController(
     )
 
     /**
-     * Engine contract (public) so implementations can live in separate files.
+     * Base engine contract used by UI and process services.
      *
      * IMPORTANT:
      * - Engine implementation MUST be safe to call multiple times (idempotent).
@@ -204,7 +304,7 @@ class WarmupController(
         fun startCompile(appContext: Context)
 
         /**
-         * Request compile to happen after prefetch completes.
+         * Requests compile to happen after prefetch completes.
          *
          * IMPORTANT:
          * - Must be robust to early calls where [Inputs] are not ready yet.
@@ -216,15 +316,59 @@ class WarmupController(
         fun resetForRetry(reason: String)
     }
 
+    /**
+     * Optional engine extension for runtime-hot preparation.
+     *
+     * Why optional:
+     * - Existing engines can continue implementing only [Engine].
+     * - Real engines can opt into runtime prewarm gradually.
+     */
+    interface RuntimeAwareEngine : Engine {
+        val runtimeWarmState: StateFlow<RuntimeWarmState>
+
+        /**
+         * Starts runtime prewarm immediately.
+         *
+         * IMPORTANT:
+         * - Implementations must not throw.
+         * - When compile is not yet satisfied, implementations should switch to a
+         *   waiting/not-ready state instead of hard failing.
+         */
+        fun startRuntimeWarm(appContext: Context)
+
+        /**
+         * Requests runtime warmup to happen after compile is satisfied.
+         *
+         * IMPORTANT:
+         * - Implementations should behave like a sticky request.
+         * - Calling this repeatedly must be safe.
+         */
+        fun requestRuntimeWarmAfterCompile(appContext: Context, reason: String)
+    }
+
     /** Prefetch warmup state flow (public/UI model). */
     val prefetchState: StateFlow<PrefetchState> = engine.prefetchState
 
     /** Compile warmup state flow (public/UI model). */
     val compileState: StateFlow<CompileState> = engine.compileState
 
+    /**
+     * Runtime-hot state flow (public/UI model).
+     *
+     * Notes:
+     * - When the engine is not runtime-aware, this stays at [RuntimeWarmState.SkippedNotReady].
+     * - This keeps the controller non-throwing and source-compatible.
+     */
+    val runtimeWarmState: StateFlow<RuntimeWarmState> =
+        runtimeAwareEngine?.runtimeWarmState ?: fallbackRuntimeWarmState
+
     init {
         val createdCount = CREATED_COUNT.incrementAndGet()
         log("init: instanceId=$instanceId createdCount=$createdCount pid=${Process.myPid()}")
+        log(
+            "capabilities: instanceId=$instanceId pid=${Process.myPid()} " +
+                    "runtimeWarmSupported=${runtimeAwareEngine != null}",
+        )
     }
 
     /**
@@ -248,10 +392,19 @@ class WarmupController(
         engine.startCompile(appContext)
     }
 
+    /**
+     * Starts the full first-use preparation pipeline.
+     *
+     * Pipeline:
+     * - prefetch
+     * - compile after prefetch
+     * - runtime warm after compile (when supported)
+     */
     fun warmupOnce() {
         log("warmupOnce: request instanceId=$instanceId pid=${Process.myPid()}")
         engine.startPrefetch(appContext)
         engine.requestCompileAfterPrefetch(appContext, reason = "warmupOnce")
+        requestRuntimeWarmAfterCompile(reason = "warmupOnce")
     }
 
     fun requestCompileAfterPrefetch(reason: String = "autoAfterPrefetch") {
@@ -260,6 +413,46 @@ class WarmupController(
                     "reason='${safeReasonForLogs(reason)}'",
         )
         engine.requestCompileAfterPrefetch(appContext, reason = reason)
+    }
+
+    /**
+     * Requests runtime warmup after compile is satisfied.
+     *
+     * Behavior:
+     * - No-op and non-throwing when runtime warmup is not supported by the engine.
+     */
+    fun requestRuntimeWarmAfterCompile(reason: String = "autoAfterCompile") {
+        val safeReason = safeReasonForLogs(reason)
+        log(
+            "requestRuntimeWarmAfterCompile: request instanceId=$instanceId pid=${Process.myPid()} " +
+                    "reason='$safeReason' supported=${runtimeAwareEngine != null}",
+        )
+
+        val runtimeEngine = runtimeAwareEngine
+        if (runtimeEngine == null) {
+            fallbackRuntimeWarmState.value =
+                RuntimeWarmState.SkippedNotReady(reason = "RuntimeWarmNotSupported")
+            return
+        }
+
+        runtimeEngine.requestRuntimeWarmAfterCompile(appContext, reason = reason)
+    }
+
+    /**
+     * Starts runtime warmup immediately.
+     *
+     * Behavior:
+     * - No-op and non-throwing when runtime warmup is not supported by the engine.
+     */
+    fun runtimeWarmOnce() {
+        log("runtimeWarmOnce: request instanceId=$instanceId pid=${Process.myPid()}")
+        val runtimeEngine = runtimeAwareEngine
+        if (runtimeEngine == null) {
+            fallbackRuntimeWarmState.value =
+                RuntimeWarmState.SkippedNotReady(reason = "RuntimeWarmNotSupported")
+            return
+        }
+        runtimeEngine.startRuntimeWarm(appContext)
     }
 
     fun cancelAll(reason: String = "cancelAll") {
@@ -276,6 +469,11 @@ class WarmupController(
                     "reason='${safeReasonForLogs(reason)}'",
         )
         engine.resetForRetry(reason = reason)
+
+        if (runtimeAwareEngine == null) {
+            fallbackRuntimeWarmState.value =
+                RuntimeWarmState.SkippedNotReady(reason = "RuntimeWarmNotSupported")
+        }
     }
 
     suspend fun ensureCompiled(
@@ -297,6 +495,44 @@ class WarmupController(
         return result
     }
 
+    /**
+     * Ensures the runtime-hot state is reached when supported.
+     *
+     * Notes:
+     * - This does not throw when runtime warmup is unsupported.
+     * - Callers should treat [RuntimeWarmState.Ready] as the only strong success signal.
+     */
+    suspend fun ensureRuntimeReady(
+        timeoutMs: Long? = DEFAULT_RUNTIME_ENSURE_TIMEOUT_MS,
+        reason: String = "ensureRuntimeReady",
+    ): RuntimeWarmState {
+        log(
+            "ensureRuntimeReady: begin instanceId=$instanceId pid=${Process.myPid()} " +
+                    "timeoutMs=${timeoutMs ?: -1} reason='${safeReasonForLogs(reason)}' " +
+                    "supported=${runtimeAwareEngine != null}",
+        )
+
+        val runtimeEngine = runtimeAwareEngine
+        if (runtimeEngine == null) {
+            val current = RuntimeWarmState.SkippedNotReady(reason = "RuntimeWarmNotSupported")
+            fallbackRuntimeWarmState.value = current
+            log(
+                "ensureRuntimeReady: end instanceId=$instanceId pid=${Process.myPid()} " +
+                        "state=${current.javaClass.simpleName} elapsedMs=${current.elapsedMs}",
+            )
+            return current
+        }
+
+        runtimeEngine.requestRuntimeWarmAfterCompile(appContext, reason = reason)
+        val result = awaitRuntimeTerminal(timeoutMs = timeoutMs)
+
+        log(
+            "ensureRuntimeReady: end instanceId=$instanceId pid=${Process.myPid()} " +
+                    "state=${result.javaClass.simpleName} elapsedMs=${result.elapsedMs}",
+        )
+        return result
+    }
+
     suspend fun awaitPrefetchTerminal(timeoutMs: Long? = null): PrefetchState {
         val cur0 = prefetchState.value
         if (cur0.isTerminal()) return cur0
@@ -308,7 +544,10 @@ class WarmupController(
             withTimeout(timeoutMs) { prefetchState.first { it.isTerminal() } }
         } catch (_: TimeoutCancellationException) {
             val cur = prefetchState.value
-            log("awaitPrefetchTerminal: timeout returning current instanceId=$instanceId state=${cur.javaClass.simpleName}")
+            log(
+                "awaitPrefetchTerminal: timeout returning current " +
+                        "instanceId=$instanceId state=${cur.javaClass.simpleName}",
+            )
             cur
         }
     }
@@ -324,7 +563,30 @@ class WarmupController(
             withTimeout(timeoutMs) { compileState.first { it.isTerminal() } }
         } catch (_: TimeoutCancellationException) {
             val cur = compileState.value
-            log("awaitCompileTerminal: timeout returning current instanceId=$instanceId state=${cur.javaClass.simpleName}")
+            log(
+                "awaitCompileTerminal: timeout returning current " +
+                        "instanceId=$instanceId state=${cur.javaClass.simpleName}",
+            )
+            cur
+        }
+    }
+
+    suspend fun awaitRuntimeTerminal(timeoutMs: Long? = null): RuntimeWarmState {
+        val flow = runtimeWarmState
+        val cur0 = flow.value
+        if (cur0.isTerminal()) return cur0
+
+        if (timeoutMs == null) return flow.first { it.isTerminal() }
+        if (timeoutMs <= 0L) return flow.value
+
+        return try {
+            withTimeout(timeoutMs) { flow.first { it.isTerminal() } }
+        } catch (_: TimeoutCancellationException) {
+            val cur = flow.value
+            log(
+                "awaitRuntimeTerminal: timeout returning current " +
+                        "instanceId=$instanceId state=${cur.javaClass.simpleName}",
+            )
             cur
         }
     }
@@ -349,6 +611,16 @@ class WarmupController(
         }
     }
 
+    private fun RuntimeWarmState.isTerminal(): Boolean {
+        return when (this) {
+            is RuntimeWarmState.Ready,
+            is RuntimeWarmState.Failed,
+            is RuntimeWarmState.Cancelled,
+            is RuntimeWarmState.SkippedNotReady -> true
+            else -> false
+        }
+    }
+
     private fun log(msg: String) {
         logger(msg)
     }
@@ -368,7 +640,6 @@ class WarmupController(
         val trimmed = raw.trim().take(64)
         val sb = StringBuilder(trimmed.length)
         for (ch in trimmed) {
-            // Allow only a conservative set of characters for log messages.
             if (ch.isLetterOrDigit() || ch == '_' || ch == '-' || ch == ':' || ch == '.') {
                 sb.append(ch)
             } else {
@@ -380,6 +651,7 @@ class WarmupController(
 
     companion object {
         const val DEFAULT_ENSURE_TIMEOUT_MS: Long = 120_000L
+        const val DEFAULT_RUNTIME_ENSURE_TIMEOUT_MS: Long = 120_000L
 
         private const val TAG: String = "WarmupController"
         private val NEXT_INSTANCE_ID = AtomicLong(0L)

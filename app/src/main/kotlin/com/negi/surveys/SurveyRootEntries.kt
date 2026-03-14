@@ -28,6 +28,7 @@ import com.negi.surveys.nav.Question
 import com.negi.surveys.nav.Review
 import com.negi.surveys.nav.SurveyStart
 import com.negi.surveys.ui.DebugInfo
+import com.negi.surveys.ui.DebugRow
 import com.negi.surveys.ui.ExportScreen
 import com.negi.surveys.ui.HomeScreen
 import com.negi.surveys.ui.ReviewQuestionLog
@@ -39,6 +40,12 @@ import com.negi.surveys.warmup.WarmupController
 
 /**
  * Builds the root navigation entries without storing extra flow collectors inside destinations.
+ *
+ * Important:
+ * - Root owns all startup / warmup collectors.
+ * - Destination screens receive snapshot State values only.
+ * - Warmup satisfied hint must be threaded into SurveyStart so the screen can
+ *   skip redundant compile when startup already accepted a reusable stamp.
  */
 @Composable
 internal fun rememberSurveyNavEntries(
@@ -53,6 +60,7 @@ internal fun rememberSurveyNavEntries(
     launchRetryAll: (String) -> Unit,
     uploadStatusState: State<String?>,
     onDeviceEnabled: Boolean,
+    warmupSatisfiedHintState: State<Boolean>,
     rootModelStateState: State<ModelDownloadController.ModelState>,
     rootPrefetchStateState: State<WarmupController.PrefetchState>,
     rootCompileStateState: State<WarmupController.CompileState>,
@@ -73,6 +81,7 @@ internal fun rememberSurveyNavEntries(
         launchRetryAll,
         uploadStatusState,
         onDeviceEnabled,
+        warmupSatisfiedHintState,
         rootModelStateState,
         rootPrefetchStateState,
         rootCompileStateState,
@@ -88,6 +97,7 @@ internal fun rememberSurveyNavEntries(
 
             entry<SurveyStart> {
                 val hasQuestionFlow = surveyFlow.questionCount > 0
+                val warmupSatisfiedHint = warmupSatisfiedHintState.value
 
                 if (!hasQuestionFlow) {
                     SurveyStartScreen(
@@ -101,6 +111,7 @@ internal fun rememberSurveyNavEntries(
                         onBack = { nav.pop() },
                         warmupController = null,
                         requireWarmup = false,
+                        warmupSatisfiedHint = true,
                         debugInfo = debugInfoState.value,
                         descriptionText = "This survey graph has no question nodes. Continuing will open the Review screen.",
                         beginLabel = "Open Review",
@@ -114,6 +125,14 @@ internal fun rememberSurveyNavEntries(
                             showSpinner = true,
                         )
                     } else {
+                        SafeLog.d(
+                            SurveyRootEntriesSupport.TAG,
+                            "surveyStartEntry: requireWarmup=true hint=$warmupSatisfiedHint " +
+                                    "model=${rootModelStateState.value.javaClass.simpleName} " +
+                                    "prefetch=${rootPrefetchStateState.value.javaClass.simpleName} " +
+                                    "compile=${rootCompileStateState.value.javaClass.simpleName}",
+                        )
+
                         GateOrContent(
                             enabled = onDeviceEnabled,
                             policy = GatePolicy.MODEL_ONLY,
@@ -139,6 +158,7 @@ internal fun rememberSurveyNavEntries(
                                 onBack = { nav.pop() },
                                 warmupController = readyWarmup,
                                 requireWarmup = true,
+                                warmupSatisfiedHint = warmupSatisfiedHint,
                                 debugInfo = debugInfoState.value,
                                 descriptionText = "This step prepares the survey session before opening the first question.",
                                 beginLabel = "Begin Survey",

@@ -135,6 +135,7 @@ object SurveyAppRoot {
         val repoMode = startupUi.repoMode
         val onDeviceEnabled = startupUi.onDeviceEnabled
         val startupServicesReady = startupUi.servicesReady
+        val warmupSatisfiedHint = startupUi.warmupSatisfiedHint
 
         val repo: ChatValidation.RepositoryI? = startupUi.repository
         val warmup = startupUi.warmup
@@ -147,6 +148,7 @@ object SurveyAppRoot {
         val rootModelStateState = rememberUpdatedState(rootModelState)
         val rootPrefetchStateState = rememberUpdatedState(rootPrefetchState)
         val rootCompileStateState = rememberUpdatedState(rootCompileState)
+        val warmupSatisfiedHintState = rememberUpdatedState(warmupSatisfiedHint)
 
         val launchRetryAll: (String) -> Unit =
             remember(startupVm) {
@@ -159,11 +161,12 @@ object SurveyAppRoot {
             SafeLog.i(TAG, "RepoMode: $repoMode onDeviceEnabled=$onDeviceEnabled")
         }
 
-        LaunchedEffect(modelDownloader, startupServicesReady, onDeviceEnabled) {
+        LaunchedEffect(modelDownloader, startupServicesReady, onDeviceEnabled, warmupSatisfiedHint) {
             SafeLog.i(
                 TAG,
                 "StartupServices: ready=$startupServicesReady " +
-                        "onDevice=$onDeviceEnabled downloaderPresent=${modelDownloader != null}",
+                        "onDevice=$onDeviceEnabled downloaderPresent=${modelDownloader != null} " +
+                        "warmupHint=$warmupSatisfiedHint",
             )
         }
 
@@ -190,6 +193,7 @@ object SurveyAppRoot {
         val cfgLabel = remember(startupUi.configState) { startupUi.configState.toDebugLabel() }
         val repoIdLabel = remember(repo) { repo?.let { System.identityHashCode(it).toString() } ?: "null" }
         val repoTypeLabel = remember(repo) { repo?.javaClass?.simpleName ?: "null" }
+        val warmupHintLabel = remember(warmupSatisfiedHint) { warmupSatisfiedHint.toString() }
 
         val startupBlockingUi =
             remember(startupUi) {
@@ -228,6 +232,31 @@ object SurveyAppRoot {
             SafeLog.w(TAG, "StartupServiceHole detected reason=$hole")
         }
 
+        /**
+         * Merge explicit startup blocking UI with root-level anomaly details.
+         *
+         * Rules:
+         * - Explicit startup UI from the ViewModel wins.
+         * - If no explicit text exists but a service hole is detected, provide
+         *   deterministic root-owned blocking text so the shell does not need
+         *   to fall back to a generic message.
+         */
+        val mergedBlockingTitle =
+            remember(startupBlockingUi.title, startupServiceHole) {
+                mergeBlockingTitle(
+                    explicitTitle = startupBlockingUi.title,
+                    startupServiceHole = startupServiceHole,
+                )
+            }
+
+        val mergedBlockingDetail =
+            remember(startupBlockingUi.detail, startupServiceHole) {
+                mergeBlockingDetail(
+                    explicitDetail = startupBlockingUi.detail,
+                    startupServiceHole = startupServiceHole,
+                )
+            }
+
         val startupHoleLabel = remember(startupServiceHole) { startupServiceHole ?: "none" }
 
         val debugInfo =
@@ -250,6 +279,7 @@ object SurveyAppRoot {
                 repoMode,
                 onDeviceEnabled,
                 startupServicesReady,
+                warmupHintLabel,
                 repoIdLabel,
                 repoTypeLabel,
                 startupHoleLabel,
@@ -272,6 +302,7 @@ object SurveyAppRoot {
                             DebugRow("RepoMode", repoMode.name),
                             DebugRow("OnDevice", onDeviceEnabled.toString()),
                             DebugRow("StartupReady", startupServicesReady.toString()),
+                            DebugRow("WarmupHint", warmupHintLabel),
                             DebugRow("StartupHole", startupHoleLabel),
                             DebugRow("Logs", logs.size.toString()),
                             DebugRow("ExportLen", exportText.length.toString()),
@@ -308,7 +339,7 @@ object SurveyAppRoot {
                             }.onFailure { t ->
                                 SafeLog.e(
                                     TAG,
-                                    "manual upload failed (non-fatal) type=${t::class.java.simpleName}",
+                                    "manual upload failed (non-fatal) type=${t.javaClass.simpleName}",
                                 )
                             }.getOrNull()
 
@@ -336,6 +367,7 @@ object SurveyAppRoot {
                 launchRetryAll = launchRetryAll,
                 uploadStatusState = uploadStatusState,
                 onDeviceEnabled = onDeviceEnabled,
+                warmupSatisfiedHintState = warmupSatisfiedHintState,
                 rootModelStateState = rootModelStateState,
                 rootPrefetchStateState = rootPrefetchStateState,
                 rootCompileStateState = rootCompileStateState,
@@ -374,8 +406,8 @@ object SurveyAppRoot {
             entryProvider = entries,
             streamBridge = streamBridge,
             repository = repo,
-            blockingTitle = startupBlockingUi.title,
-            blockingDetail = startupBlockingUi.detail,
+            blockingTitle = mergedBlockingTitle,
+            blockingDetail = mergedBlockingDetail,
             showBlockingSpinner = startupBlockingUi.showSpinner,
             onBlockingRetry = onBlockingRetry,
         )
@@ -415,6 +447,81 @@ object SurveyAppRoot {
             onDeviceEnabled && !warmupPresent -> "WarmupMissing"
             onDeviceEnabled && !servicesReady -> "OnDeviceServicesNotReady"
             else -> null
+        }
+    }
+
+    /**
+     * Returns a user-facing blocking title for a detected startup service hole.
+     */
+    private fun startupServiceHoleTitle(reason: String): String {
+        return when (reason) {
+            "RepositoryMissing" -> "Startup needs attention"
+            "WarmupMissing" -> "Model startup needs attention"
+            "OnDeviceServicesNotReady" -> "On-device startup needs attention"
+            else -> "Startup needs attention"
+        }
+    }
+
+    /**
+     * Returns a user-facing blocking detail for a detected startup service hole.
+     *
+     * Notes:
+     * - Keep the text short and non-technical.
+     * - Root debug info already exposes the exact stable reason label.
+     */
+    private fun startupServiceHoleDetail(reason: String): String {
+        return when (reason) {
+            "RepositoryMissing" -> {
+                "Core app services did not finish starting. Retry startup to rebuild them."
+            }
+
+            "WarmupMissing" -> {
+                "The model preparation service is missing. Retry startup to rebuild on-device services."
+            }
+
+            "OnDeviceServicesNotReady" -> {
+                "On-device services are not ready yet. Retry startup to rebuild them."
+            }
+
+            else -> {
+                "Some startup services are not ready. Retry startup to rebuild them."
+            }
+        }
+    }
+
+    /**
+     * Merges an explicit blocking title with a root-owned startup anomaly title.
+     *
+     * Notes:
+     * - Explicit non-blank text wins.
+     * - Null is preserved when nothing should be surfaced here.
+     */
+    private fun mergeBlockingTitle(
+        explicitTitle: String?,
+        startupServiceHole: String?,
+    ): String? {
+        return when {
+            !explicitTitle.isNullOrBlank() -> explicitTitle
+            startupServiceHole != null -> startupServiceHoleTitle(startupServiceHole)
+            else -> explicitTitle
+        }
+    }
+
+    /**
+     * Merges an explicit blocking detail with a root-owned startup anomaly detail.
+     *
+     * Notes:
+     * - Explicit non-blank text wins.
+     * - Null is preserved when nothing should be surfaced here.
+     */
+    private fun mergeBlockingDetail(
+        explicitDetail: String?,
+        startupServiceHole: String?,
+    ): String? {
+        return when {
+            !explicitDetail.isNullOrBlank() -> explicitDetail
+            startupServiceHole != null -> startupServiceHoleDetail(startupServiceHole)
+            else -> explicitDetail
         }
     }
 

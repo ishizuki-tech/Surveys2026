@@ -21,6 +21,7 @@ import com.negi.surveys.config.StartupConfigState
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.utils.ModelDownloadController
 import com.negi.surveys.warmup.WarmupController
+import java.io.File
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
@@ -47,6 +48,14 @@ import kotlinx.coroutines.launch
  * - Config install / recovery policy
  * - Service graph construction details
  * - Local model warmup wiring policy
+ *
+ * Important policy:
+ * - Persisted compile stamps are allowed to influence scheduling decisions.
+ * - Persisted compile stamps must NOT directly mark the current process as warmup-ready.
+ * - The UI-facing warmup satisfied hint is process-local and is granted only after
+ *   this process observes an actual terminal compiled state.
+ * - servicesReady means "startup services exist and can be used by the UI shell".
+ *   It does NOT mean compile warmup has already completed in this process.
  */
 class AppStartupViewModel(
     application: Application,
@@ -105,7 +114,8 @@ class AppStartupViewModel(
      * Runs the unified retry pipeline for model + warmup + startup config.
      *
      * Behavior:
-     * - If startup is currently failed or services are not ready, restart the whole startup pipeline.
+     * - If startup is currently failed or the service graph is incomplete,
+     *   restart the whole startup pipeline.
      * - Otherwise retry downloader / warmup in-place.
      *
      * Safety:
@@ -119,8 +129,7 @@ class AppStartupViewModel(
 
         val needsPipelineRestart =
             snapshot.configState is StartupConfigState.Failed ||
-                    snapshot.repository == null ||
-                    !snapshot.servicesReady
+                    !isServiceGraphReady(snapshot)
 
         if (needsPipelineRestart) {
             SafeLog.w(TAG, "RetryAll: restart startup pipeline from=$from")
@@ -151,17 +160,54 @@ class AppStartupViewModel(
              */
             lastWarmupReadyFingerprint.set(null)
 
+            runCatching {
+                modelWiring.clearCompileSuccessStamp()
+            }.onFailure { t ->
+                SafeLog.w(
+                    TAG,
+                    "RetryAll: clear compile stamp failed (non-fatal) type=${t::class.java.simpleName}",
+                )
+            }
+
+            updateUiIfCurrent(generation) {
+                it.copy(
+                    warmupSatisfiedHint = false,
+                )
+            }
+
+            /**
+             * Local-only path:
+             * - No downloader exists.
+             * - The local file is already present.
+             * - Retry should reset warmup state and re-run wiring, but must keep
+             *   servicesReady tied to the service graph, not to compile completion.
+             */
             if (onDeviceEnabled && key == null) {
                 val localFile = modelWiring.resolveExistingLocalModelFileOrNull(current.modelSpec)
                 if (localFile != null && warmup != null) {
-                    updateUiIfCurrent(generation) {
-                        it.copy(
+                    runCatching { warmup.resetForRetry(reason = "uiRetry") }
+                        .onFailure { t ->
+                            SafeLog.e(
+                                TAG,
+                                "RetryAll: local-only warmup resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
+                            )
+                        }
+
+                    updateUiIfCurrent(generation) { state ->
+                        state.copy(
                             modelState = modelWiring.localReadyModelState(localFile),
-                            servicesReady = false,
+                            servicesReady = computeServicesReady(
+                                onDeviceEnabled = state.onDeviceEnabled,
+                                repositoryPresent = state.repository != null,
+                                warmupPresent = state.warmup != null,
+                            ),
+                            warmupSatisfiedHint = false,
+                            prefetchState = warmup.prefetchState.value,
+                            compileState = warmup.compileState.value,
                         )
                     }
 
-                    val localWarmupReady =
+                    val outcome =
                         modelWiring.onModelReady(
                             repoMode = current.repoMode,
                             warmup = warmup,
@@ -169,20 +215,20 @@ class AppStartupViewModel(
                             lastReadyFingerprintRef = lastWarmupReadyFingerprint,
                         )
 
-                    updateUiIfCurrent(generation) {
-                        it.copy(
-                            servicesReady = modelWiring.deriveServicesReady(
-                                onDeviceEnabled = it.onDeviceEnabled,
-                                downloader = it.modelDownloader,
-                                localWarmupReady = localWarmupReady,
+                    updateUiIfCurrent(generation) { state ->
+                        state.copy(
+                            warmupSatisfiedHint = warmupHintAfterOutcome(
+                                outcome = outcome,
+                                currentHint = state.warmupSatisfiedHint,
+                                currentCompileState = state.compileState,
                             ),
                         )
                     }
 
-                    if (!localWarmupReady) {
-                        SafeLog.w(
+                    if (!isProcessLocalWarmupSatisfied(_uiState.value.compileState)) {
+                        SafeLog.i(
                             TAG,
-                            "RetryAll: local-only warmup wiring did not complete; leaving servicesReady=false",
+                            "RetryAll: local-only wiring completed but process-local compile is still pending",
                         )
                     }
 
@@ -229,6 +275,14 @@ class AppStartupViewModel(
                         )
                     }
 
+                updateUiIfCurrent(generation) { state ->
+                    state.copy(
+                        prefetchState = warmup.prefetchState.value,
+                        compileState = warmup.compileState.value,
+                        warmupSatisfiedHint = isProcessLocalWarmupSatisfied(warmup.compileState.value),
+                    )
+                }
+
                 if (onDeviceEnabled && key != null && isGenerationCurrent(generation)) {
                     runCatching {
                         warmup.requestCompileAfterPrefetch(reason = "uiRetry")
@@ -268,6 +322,7 @@ class AppStartupViewModel(
                 repoMode = repoMode,
                 onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE,
                 servicesReady = false,
+                warmupSatisfiedHint = false,
                 repository = null,
                 warmup = null,
                 modelDownloader = null,
@@ -369,11 +424,12 @@ class AppStartupViewModel(
                 repository = services.repository,
                 warmup = services.warmup,
                 modelDownloader = services.downloader,
-                servicesReady = modelWiring.deriveServicesReady(
+                servicesReady = computeServicesReady(
                     onDeviceEnabled = it.onDeviceEnabled,
-                    downloader = services.downloader,
-                    localWarmupReady = false,
+                    repositoryPresent = true,
+                    warmupPresent = true,
                 ),
+                warmupSatisfiedHint = isProcessLocalWarmupSatisfied(services.warmup.compileState.value),
                 modelState = initialModelState,
                 prefetchState = services.warmup.prefetchState.value,
                 compileState = services.warmup.compileState.value,
@@ -388,7 +444,7 @@ class AppStartupViewModel(
         )
 
         if (prepared.initialLocalModelFile != null) {
-            val localWarmupReady =
+            val outcome =
                 modelWiring.onModelReady(
                     repoMode = prepared.repoMode,
                     warmup = services.warmup,
@@ -396,20 +452,20 @@ class AppStartupViewModel(
                     lastReadyFingerprintRef = lastWarmupReadyFingerprint,
                 )
 
-            updateUiIfCurrent(generation) {
-                it.copy(
-                    servicesReady = modelWiring.deriveServicesReady(
-                        onDeviceEnabled = it.onDeviceEnabled,
-                        downloader = it.modelDownloader,
-                        localWarmupReady = localWarmupReady,
+            updateUiIfCurrent(generation) { state ->
+                state.copy(
+                    warmupSatisfiedHint = warmupHintAfterOutcome(
+                        outcome = outcome,
+                        currentHint = state.warmupSatisfiedHint,
+                        currentCompileState = state.compileState,
                     ),
                 )
             }
 
-            if (!localWarmupReady) {
-                SafeLog.w(
+            if (!isProcessLocalWarmupSatisfied(_uiState.value.compileState)) {
+                SafeLog.i(
                     TAG,
-                    "Services: local model found but warmup wiring did not complete; servicesReady stays false",
+                    "Services: local model wired; waiting for a process-local compiled state",
                 )
             }
         }
@@ -442,12 +498,23 @@ class AppStartupViewModel(
                             }
 
                             if (modelState is ModelDownloadController.ModelState.Ready) {
-                                modelWiring.onModelReady(
-                                    repoMode = repoMode,
-                                    warmup = warmup,
-                                    file = modelState.file,
-                                    lastReadyFingerprintRef = lastWarmupReadyFingerprint,
-                                )
+                                val outcome =
+                                    modelWiring.onModelReady(
+                                        repoMode = repoMode,
+                                        warmup = warmup,
+                                        file = modelState.file,
+                                        lastReadyFingerprintRef = lastWarmupReadyFingerprint,
+                                    )
+
+                                updateUiIfCurrent(generation) { state ->
+                                    state.copy(
+                                        warmupSatisfiedHint = warmupHintAfterOutcome(
+                                            outcome = outcome,
+                                            currentHint = state.warmupSatisfiedHint,
+                                            currentCompileState = state.compileState,
+                                        ),
+                                    )
+                                }
                             }
                         }
                     } catch (t: Throwable) {
@@ -485,8 +552,44 @@ class AppStartupViewModel(
                 try {
                     warmup.compileState.collect { compileState ->
                         if (!isGenerationCurrent(generation)) return@collect
-                        updateUiIfCurrent(generation) {
-                            it.copy(compileState = compileState)
+
+                        updateUiIfCurrent(generation) { state ->
+                            val processWarmSatisfied = isProcessLocalWarmupSatisfied(compileState)
+
+                            state.copy(
+                                compileState = compileState,
+                                warmupSatisfiedHint =
+                                    if (processWarmSatisfied) {
+                                        true
+                                    } else {
+                                        state.warmupSatisfiedHint
+                                    },
+                                /**
+                                 * Keep servicesReady tied to service graph existence.
+                                 * Compile completion must not be required for root readiness.
+                                 */
+                                servicesReady = computeServicesReady(
+                                    onDeviceEnabled = state.onDeviceEnabled,
+                                    repositoryPresent = state.repository != null,
+                                    warmupPresent = state.warmup != null,
+                                ),
+                            )
+                        }
+
+                        if (compileState is WarmupController.CompileState.Compiled) {
+                            val stampFile = resolveCurrentModelFileForStamp(_uiState.value)
+                            if (stampFile != null) {
+                                runCatching {
+                                    modelWiring.saveCompileSuccessStamp(stampFile)
+                                }.onSuccess {
+                                    SafeLog.i(TAG, "Warmup: compile success stamp saved")
+                                }.onFailure { t ->
+                                    SafeLog.w(
+                                        TAG,
+                                        "Warmup: save compile stamp failed (non-fatal) type=${t::class.java.simpleName}",
+                                    )
+                                }
+                            }
                         }
                     }
                 } catch (t: Throwable) {
@@ -600,6 +703,7 @@ class AppStartupViewModel(
                 repoMode = repoMode,
                 onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE,
                 servicesReady = false,
+                warmupSatisfiedHint = false,
                 repository = null,
                 warmup = null,
                 modelDownloader = null,
@@ -654,6 +758,89 @@ class AppStartupViewModel(
                 transform(current)
             }
         }
+    }
+
+    /**
+     * Resolves the UI-facing warmup satisfied hint after model-ready handling.
+     *
+     * Rules:
+     * - Only a process-local compiled state can grant the hint.
+     * - CompileSatisfied from persisted state must NOT directly grant the hint.
+     * - CompileScheduled keeps the hint false.
+     * - AlreadyHandled / NotHandled preserve the current hint unless compile is
+     *   already known to be satisfied in this process.
+     */
+    private fun warmupHintAfterOutcome(
+        outcome: StartupModelWiring.ModelReadyOutcome,
+        currentHint: Boolean,
+        currentCompileState: WarmupController.CompileState,
+    ): Boolean {
+        val processWarmSatisfied = isProcessLocalWarmupSatisfied(currentCompileState)
+        if (processWarmSatisfied) return true
+
+        return when (outcome) {
+            StartupModelWiring.ModelReadyOutcome.NotHandled -> currentHint
+            StartupModelWiring.ModelReadyOutcome.AlreadyHandled -> currentHint
+            StartupModelWiring.ModelReadyOutcome.CompileSatisfied -> currentHint
+            StartupModelWiring.ModelReadyOutcome.CompileScheduled -> false
+        }
+    }
+
+    /**
+     * Returns true only when the current process has observed a compiled terminal state.
+     */
+    private fun isProcessLocalWarmupSatisfied(
+        compileState: WarmupController.CompileState,
+    ): Boolean {
+        return compileState is WarmupController.CompileState.Compiled
+    }
+
+    /**
+     * Computes whether the startup service graph is ready for the UI shell.
+     *
+     * Policy:
+     * - ON_DEVICE requires repository + warmup.
+     * - Non-on-device requires repository only.
+     *
+     * Notes:
+     * - Downloader is optional because local-only startup is valid.
+     * - Compile warmup is intentionally NOT part of this predicate.
+     */
+    private fun computeServicesReady(
+        onDeviceEnabled: Boolean,
+        repositoryPresent: Boolean,
+        warmupPresent: Boolean,
+    ): Boolean {
+        return if (onDeviceEnabled) {
+            repositoryPresent && warmupPresent
+        } else {
+            repositoryPresent
+        }
+    }
+
+    /**
+     * Returns true when the current UI snapshot has a complete service graph.
+     */
+    private fun isServiceGraphReady(
+        state: AppStartupUiState,
+    ): Boolean {
+        return computeServicesReady(
+            onDeviceEnabled = state.onDeviceEnabled,
+            repositoryPresent = state.repository != null,
+            warmupPresent = state.warmup != null,
+        )
+    }
+
+    /**
+     * Resolves the current concrete model file for saving a compile stamp.
+     */
+    private fun resolveCurrentModelFileForStamp(
+        state: AppStartupUiState,
+    ): File? {
+        val readyFile =
+            (state.modelState as? ModelDownloadController.ModelState.Ready)?.file
+        if (readyFile != null) return readyFile
+        return modelWiring.resolveExistingLocalModelFileOrNull(state.modelSpec)
     }
 
     /**

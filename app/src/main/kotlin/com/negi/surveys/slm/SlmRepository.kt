@@ -59,6 +59,7 @@ import org.json.JSONObject
  * Repository that orchestrates LiteRT-LM inference for:
  * - One-step generation
  * - Structured two-step validation
+ * - Warmup / runtime preparation
  *
  * Two-step contract:
  * 1) Step 1: Assessment JSON
@@ -67,6 +68,13 @@ import org.json.JSONObject
  * Important:
  * - Final accept / follow-up decision is derived by code from Step-1 score.
  * - Step-2 output must never override the Step-1 decision.
+ *
+ * Warmup contract:
+ * - [warmup] now performs both engine initialization and conversation preparation.
+ * - [prepareRuntime] performs runtime preparation only after initialization.
+ * - Runtime preparation is tracked per model/signature so first user submit
+ *   does not need to pay the full conversation boot cost again when warmup
+ *   actually ran in the current process.
  *
  * Privacy:
  * - Do not log raw user answers or model paths in normal logs.
@@ -83,7 +91,9 @@ class SlmRepository(
     private val allowAssetConfigFallback: Boolean = false,
     private val promptBuilder: SlmPromptBuilderI = DefaultSlmPromptBuilder,
     debug: DebugConfig = DebugConfig(),
-) : ChatValidation.RepositoryI, WarmupController.WarmupCapableRepository {
+) : ChatValidation.RepositoryI,
+    WarmupController.WarmupCapableRepository,
+    WarmupController.RuntimeWarmCapableRepository {
 
     data class DebugConfig(
         val enabled: Boolean = false,
@@ -335,6 +345,14 @@ class SlmRepository(
         }
     }
 
+    /**
+     * Compile-oriented warmup path.
+     *
+     * Important:
+     * - This now intentionally performs both initialization and conversation preparation.
+     * - That keeps the old compile warmup path useful even before the new runtime-aware
+     *   engine path is fully wired everywhere.
+     */
     override suspend fun warmup(
         appContext: Context,
         modelFile: File,
@@ -348,12 +366,43 @@ class SlmRepository(
 
         return runCatching {
             val model = getOrCreateModel(cfg = cfg, file = modelFile)
+            val initOptions = InitOptions.fromWarmupOptions(options)
             withModelGate(model) {
-                awaitInitializedModelOnce(model = model, initOptions = InitOptions.fromWarmupOptions(options))
+                awaitInitializedModelOnce(model = model, initOptions = initOptions)
+                awaitRuntimePreparedOnce(model = model, initOptions = initOptions)
             }
-            true
         }.getOrElse { t ->
             AppLog.w(TAG, "warmup: failed type=${t.javaClass.simpleName}")
+            false
+        }
+    }
+
+    /**
+     * Runtime warmup path.
+     *
+     * This is expected to be called by the runtime-aware warmup engine after compile warmup
+     * has completed or when the process needs to ensure conversation/runtime readiness.
+     */
+    override suspend fun prepareRuntime(
+        appContext: Context,
+        modelFile: File,
+        options: WarmupController.Options,
+    ): Boolean {
+        val cfg = InstalledSurveyConfigStore.getOrNull() ?: cachedConfig.get()
+        if (!AppProcessServices.isUsableLocalModelFile(modelFile)) {
+            AppLog.w(TAG, "prepareRuntime: skipped (model file missing or unusable)")
+            return false
+        }
+
+        return runCatching {
+            val model = getOrCreateModel(cfg = cfg, file = modelFile)
+            val initOptions = InitOptions.fromWarmupOptions(options)
+            withModelGate(model) {
+                awaitInitializedModelOnce(model = model, initOptions = initOptions)
+                awaitRuntimePreparedOnce(model = model, initOptions = initOptions)
+            }
+        }.getOrElse { t ->
+            AppLog.w(TAG, "prepareRuntime: failed type=${t.javaClass.simpleName}")
             false
         }
     }
@@ -1104,6 +1153,7 @@ class SlmRepository(
                 "false", "0", "no", "n" -> false
                 else -> null
             }
+
             else -> null
         }
     }
@@ -1127,6 +1177,7 @@ class SlmRepository(
             "ModelNotReadyException" -> "Model is still warming up."
             else -> "Validation failed before a reliable score was produced."
         }
+
         collectedReason.startsWith("CANCELLED") -> "Validation was cancelled."
         else -> "Validation result could not be parsed."
     }
@@ -1164,16 +1215,19 @@ class SlmRepository(
                 "What exactly was the problem with that input?",
                 "How did that input problem affect your farming this season?",
             )
+
             "ai_yield_risk" -> listOf(
                 "What specific risk was biggest for your maize this season?",
                 "When does that risk usually happen?",
                 "How does that risk affect your maize crop?",
             )
+
             "ai_support_needed" -> listOf(
                 "What specific support would help you most next season?",
                 "Who should provide that support?",
                 "How would that support improve maize production?",
             )
+
             else -> listOf(
                 "Could you give one specific detail?",
                 "What exactly do you mean?",
@@ -1233,6 +1287,7 @@ class SlmRepository(
                     followUpTurnCount = turnCount,
                 )
             }
+
             isSameFollowUpQuestion(parsed, previous) -> {
                 selectDistinctFallbackFollowUp(
                     questionId = questionId,
@@ -1242,6 +1297,7 @@ class SlmRepository(
                     followUpTurnCount = turnCount,
                 )
             }
+
             else -> parsed
         }
     }
@@ -1775,8 +1831,125 @@ class SlmRepository(
         return file?.takeIf { AppProcessServices.isUsableLocalModelFile(it) }
     }
 
+    /**
+     * Resolves the logical model identity used by:
+     * - Model cache keys
+     * - LiteRT-LM runtime keys
+     * - Serialized compilation directory names
+     *
+     * Resolution order:
+     * 1. Explicit config model name
+     * 2. Configured download/local file name basename
+     * 3. Actual resolved local file basename
+     * 4. Legacy fallback file name basename
+     * 5. Legacy fallback model name
+     *
+     * Notes:
+     * - Prefer artifact-derived identity over legacy display aliases.
+     * - Keep the output stable and path-free.
+     */
+    private fun resolveConfiguredModelName(
+        cfg: SurveyConfig?,
+        file: File,
+    ): String {
+        val explicitConfigName =
+            normalizeModelIdentityCandidate(
+                cfg?.modelDefaults?.modelName,
+            )
+        if (explicitConfigName != null) return explicitConfigName
+
+        val configuredFileName =
+            normalizeModelIdentityCandidate(
+                cfg?.resolveModelDownloadSpec()?.fileName,
+            )
+        if (configuredFileName != null) return configuredFileName
+
+        val actualFileName = normalizeModelIdentityCandidate(file.name)
+        if (actualFileName != null) return actualFileName
+
+        val legacyFallbackFromFileName = normalizeModelIdentityCandidate(fallbackModelFileName)
+        if (legacyFallbackFromFileName != null) return legacyFallbackFromFileName
+
+        return normalizeModelIdentityCandidate(fallbackModelName) ?: "litert_model"
+    }
+
+    /**
+     * Normalizes a model identity candidate into a stable token.
+     *
+     * Behavior:
+     * - strips path-like prefixes
+     * - strips known model file extensions
+     * - keeps letters, digits, dash, underscore, dot, plus
+     * - collapses whitespace/punctuation runs into single dashes
+     *
+     * Examples:
+     * - "gemma-3n-E4B-it-int4.litertlm" -> "gemma-3n-E4B-it-int4"
+     * - " /tmp/Gemma3n4B.litertlm " -> "Gemma3n4B"
+     */
+    private fun normalizeModelIdentityCandidate(raw: String?): String? {
+        val trimmed = raw?.trim().orEmpty()
+        if (trimmed.isBlank()) return null
+
+        val leaf = trimmed
+            .substringAfterLast('/')
+            .substringAfterLast('\\')
+            .trim()
+        if (leaf.isBlank()) return null
+
+        val withoutExtension = stripKnownModelExtension(leaf).trim()
+        if (withoutExtension.isBlank()) return null
+
+        val normalized = buildString(withoutExtension.length) {
+            var lastWasDash = false
+            for (ch in withoutExtension) {
+                when {
+                    ch.isLetterOrDigit() || ch == '-' || ch == '_' || ch == '.' || ch == '+' -> {
+                        append(ch)
+                        lastWasDash = false
+                    }
+                    ch.isWhitespace() -> {
+                        if (!lastWasDash && isNotEmpty()) {
+                            append('-')
+                            lastWasDash = true
+                        }
+                    }
+                    else -> {
+                        if (!lastWasDash && isNotEmpty()) {
+                            append('-')
+                            lastWasDash = true
+                        }
+                    }
+                }
+            }
+        }.trim('-')
+
+        return normalized.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Removes a known model artifact extension if present.
+     */
+    private fun stripKnownModelExtension(name: String): String {
+        val lower = name.lowercase(Locale.US)
+        val knownExtensions = listOf(
+            ".litertlm",
+            ".gguf",
+            ".task",
+            ".bin",
+            ".onnx",
+            ".tflite",
+        )
+
+        for (ext in knownExtensions) {
+            if (lower.endsWith(ext)) {
+                return name.dropLast(ext.length)
+            }
+        }
+        return name
+    }
+
     private fun getOrCreateModel(cfg: SurveyConfig?, file: File): Model {
-        val modelName = cfg?.modelDefaults?.modelName?.trim()?.takeIf { it.isNotBlank() } ?: fallbackModelName
+        val modelName = resolveConfiguredModelName(cfg = cfg, file = file)
         val key = "$modelName::${file.absolutePath}"
         val holder = modelCache.getOrPut(key) {
             val modelConfig: Map<Model.ConfigKey, Any> = Model.buildModelConfigSafe(cfg?.slm)
@@ -1790,8 +1963,11 @@ class SlmRepository(
     private data class ModelHolder(
         val model: Model,
         val initMutex: Mutex = Mutex(),
+        val runtimeMutex: Mutex = Mutex(),
         val initialized: AtomicBoolean = AtomicBoolean(false),
         val initSignatureRef: AtomicReference<String?> = AtomicReference(null),
+        val runtimePrepared: AtomicBoolean = AtomicBoolean(false),
+        val runtimeSignatureRef: AtomicReference<String?> = AtomicReference(null),
     )
 
     private data class InitOptions(
@@ -1842,6 +2018,58 @@ class SlmRepository(
             initializeSdkIfNeeded(model = model, initOptions = initOptions)
             holder.initialized.set(true)
             holder.initSignatureRef.set(desiredSig)
+
+            /**
+             * Runtime-prepared state is only valid for the current init signature.
+             *
+             * If initialization options changed, runtime readiness must be invalidated.
+             */
+            holder.runtimePrepared.set(false)
+            holder.runtimeSignatureRef.set(null)
+        }
+    }
+
+    /**
+     * Ensures runtime preparation has completed once for the current model/signature.
+     *
+     * Runtime preparation currently means:
+     * - engine initialized
+     * - conversation created/reset successfully
+     *
+     * This is intentionally lighter than sending a real user prompt, but enough to move
+     * first-request setup cost out of the first visible submit path when warmup ran.
+     */
+    private suspend fun awaitRuntimePreparedOnce(
+        model: Model,
+        initOptions: InitOptions,
+    ): Boolean {
+        val key = "${model.name}::${model.taskPath}"
+        val holder = modelCache[key]
+        if (holder == null) {
+            return prepareRuntimeUnlocked(model = model, initOptions = initOptions)
+        }
+
+        val desiredSig = initOptions.signature()
+        val existingSig = holder.runtimeSignatureRef.get()
+        if (holder.runtimePrepared.get() && existingSig == desiredSig) {
+            return true
+        }
+
+        return holder.runtimeMutex.withLock {
+            val sigNow = holder.runtimeSignatureRef.get()
+            if (holder.runtimePrepared.get() && sigNow == desiredSig) {
+                return@withLock true
+            }
+
+            val ok = prepareRuntimeUnlocked(model = model, initOptions = initOptions)
+            if (ok) {
+                holder.runtimePrepared.set(true)
+                holder.runtimeSignatureRef.set(desiredSig)
+            } else {
+                holder.runtimePrepared.set(false)
+                holder.runtimeSignatureRef.set(null)
+            }
+            ok
         }
     }
 
@@ -1856,6 +2084,43 @@ class SlmRepository(
             systemMessage = initOptions.systemMessage,
             tools = initOptions.tools,
         )
+    }
+
+    /**
+     * Prepares the runtime conversation without emitting user-visible tokens.
+     *
+     * Notes:
+     * - This does not run a real inference request, so it will not contaminate the
+     *   conversation history with a synthetic prompt.
+     * - The caller is expected to hold the per-model gate.
+     */
+    private suspend fun prepareRuntimeUnlocked(
+        model: Model,
+        initOptions: InitOptions,
+    ): Boolean {
+        val ok = runCatching {
+            SLM.resetConversationAndAwait(
+                model = model,
+                supportImage = initOptions.supportImage,
+                supportAudio = initOptions.supportAudio,
+                systemMessage = initOptions.systemMessage,
+                tools = initOptions.tools,
+                timeoutMs = RUNTIME_PREPARE_TIMEOUT_MS,
+            )
+        }.getOrNull() == true
+
+        if (!ok) {
+            AppLog.w(
+                TAG,
+                "prepareRuntimeUnlocked failed or timed out: model='${model.name}'",
+            )
+        } else {
+            AppLog.d(
+                TAG,
+                "prepareRuntimeUnlocked succeeded: model='${model.name}'",
+            )
+        }
+        return ok
     }
 
     private suspend fun resetConversationBestEffort(model: Model, reason: String) {
@@ -1922,6 +2187,7 @@ class SlmRepository(
     companion object {
         private const val TAG: String = "SlmRepository"
         private const val RESET_CONVERSATION_TIMEOUT_MS: Long = 15_000L
+        private const val RUNTIME_PREPARE_TIMEOUT_MS: Long = 15_000L
         private const val EARLY_STOP_STABILIZE_DELAY_MS: Long = 250L
         private const val ASSESSMENT_TIMEOUT_MS: Long = 60_000L
         private const val ASSESSMENT_MAX_CHARS: Int = 8_192

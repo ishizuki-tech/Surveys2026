@@ -57,11 +57,17 @@ import kotlinx.coroutines.launch
  * Technical goals:
  * - Provide a deterministic pre-flight step before entering the Question flow.
  * - Prevent accidental double navigation caused by rapid taps or recomposition.
- * - Gate "Begin" until compile warmup is in a ready terminal state when warmup is required.
+ * - Gate "Begin" until warmup is semantically ready when warmup is required.
+ *
+ * Readiness model:
+ * - CompileState alone is not always sufficient.
+ * - Startup may already know that warmup is satisfied through a reusable compile stamp.
+ * - This screen therefore accepts [warmupSatisfiedHint] from the caller.
  *
  * Architecture:
  * - UI depends only on [WarmupController] when warmup is actually needed.
  * - For questionless graphs, warmup can be skipped entirely.
+ * - Caller-supplied readiness hint wins over local compile-state inference.
  */
 object SurveyStartScreen {
 
@@ -71,6 +77,7 @@ object SurveyStartScreen {
         onBack: () -> Unit,
         warmupController: WarmupController?,
         requireWarmup: Boolean,
+        warmupSatisfiedHint: Boolean = false,
         debugInfo: DebugInfo? = null,
         descriptionText: String = "This step prepares the survey session before opening the first question.",
         beginLabel: String = "Begin Survey",
@@ -80,6 +87,7 @@ object SurveyStartScreen {
             onBack = onBack,
             warmupController = warmupController,
             requireWarmup = requireWarmup,
+            warmupSatisfiedHint = warmupSatisfiedHint,
             debugInfo = debugInfo,
             descriptionText = descriptionText,
             beginLabel = beginLabel,
@@ -100,6 +108,7 @@ object SurveyStartScreen {
             onBack: () -> Unit,
             warmupController: WarmupController?,
             requireWarmup: Boolean,
+            warmupSatisfiedHint: Boolean,
             debugInfo: DebugInfo?,
             descriptionText: String,
             beginLabel: String,
@@ -108,6 +117,7 @@ object SurveyStartScreen {
             val latestOnBack by rememberUpdatedState(onBack)
             val latestController by rememberUpdatedState(warmupController)
             val latestRequireWarmup by rememberUpdatedState(requireWarmup)
+            val latestWarmupSatisfiedHint by rememberUpdatedState(warmupSatisfiedHint)
             val latestDescriptionText by rememberUpdatedState(descriptionText)
             val latestBeginLabel by rememberUpdatedState(beginLabel)
 
@@ -123,6 +133,15 @@ object SurveyStartScreen {
 
             val latestCompileState by rememberUpdatedState(compileState)
 
+            val effectiveWarmupReady =
+                remember(requireWarmup, warmupSatisfiedHint, compileState) {
+                    isWarmupReady(
+                        requireWarmup = requireWarmup,
+                        warmupSatisfiedHint = warmupSatisfiedHint,
+                        state = compileState,
+                    )
+                }
+
             var beginLocked by remember { mutableStateOf(false) }
             var beginPendingWarmup by remember { mutableStateOf(false) }
 
@@ -130,9 +149,36 @@ object SurveyStartScreen {
             var pendingUiNowMs by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
 
             fun requestCompile(reason: String) {
-                val controller = latestController ?: return
+                val controller = latestController ?: run {
+                    SafeLog.d(TAG, "compile request skipped: controller=null reason=$reason")
+                    return
+                }
+
+                val requireWarmupNow = latestRequireWarmup
+                val satisfiedNow =
+                    isWarmupReady(
+                        requireWarmup = requireWarmupNow,
+                        warmupSatisfiedHint = latestWarmupSatisfiedHint,
+                        state = latestCompileState,
+                    )
+
+                if (!requireWarmupNow) {
+                    SafeLog.d(TAG, "compile request skipped: warmup not required reason=$reason")
+                    return
+                }
+
+                if (satisfiedNow) {
+                    SafeLog.d(
+                        TAG,
+                        "compile request skipped: warmup already satisfied " +
+                                "reason=$reason state=${latestCompileState.javaClass.simpleName} hint=${latestWarmupSatisfiedHint}",
+                    )
+                    return
+                }
+
                 val st = latestCompileState
-                if (st is WarmupController.CompileState.Compiling ||
+                if (
+                    st is WarmupController.CompileState.Compiling ||
                     st is WarmupController.CompileState.WaitingForPrefetch
                 ) {
                     SafeLog.d(
@@ -142,7 +188,11 @@ object SurveyStartScreen {
                     return
                 }
 
-                SafeLog.d(TAG, "compile request: reason=$reason state=${st.javaClass.simpleName}")
+                SafeLog.d(
+                    TAG,
+                    "compile request: reason=$reason state=${st.javaClass.simpleName} hint=${latestWarmupSatisfiedHint}",
+                )
+
                 scope.launch(Dispatchers.IO) {
                     runCatching {
                         controller.requestCompileAfterPrefetch(reason = reason)
@@ -163,7 +213,8 @@ object SurveyStartScreen {
 
                 SafeLog.i(
                     TAG,
-                    "begin proceed: source=$source requireWarmup=$latestRequireWarmup state=${st.javaClass.simpleName} waitedMs=${waitedMs ?: -1}",
+                    "begin proceed: source=$source requireWarmup=$latestRequireWarmup " +
+                            "state=${st.javaClass.simpleName} hint=${latestWarmupSatisfiedHint} waitedMs=${waitedMs ?: -1}",
                 )
 
                 beginPendingWarmup = false
@@ -180,27 +231,40 @@ object SurveyStartScreen {
                     }
             }
 
-            LaunchedEffect(compileState, requireWarmup) {
+            LaunchedEffect(compileState, requireWarmup, warmupSatisfiedHint, effectiveWarmupReady) {
                 SafeLog.d(
                     TAG,
-                    "compileState: ${compileState.javaClass.simpleName} requireWarmup=$requireWarmup elapsedMs=${compileState.elapsedMs}",
+                    "compileState: ${compileState.javaClass.simpleName} " +
+                            "requireWarmup=$requireWarmup hint=$warmupSatisfiedHint " +
+                            "effectiveReady=$effectiveWarmupReady elapsedMs=${compileState.elapsedMs}",
                 )
             }
 
-            LaunchedEffect(Unit, requireWarmup) {
-                SafeLog.d(TAG, "composed requireWarmup=$requireWarmup")
+            LaunchedEffect(Unit, requireWarmup, warmupSatisfiedHint) {
+                SafeLog.d(
+                    TAG,
+                    "composed requireWarmup=$requireWarmup warmupSatisfiedHint=$warmupSatisfiedHint",
+                )
 
                 if (!requireWarmup) return@LaunchedEffect
 
-                withFrameNanos { /* first frame */ }
+                withFrameNanos { /* Wait until the first frame is rendered. */ }
                 delay(COMPILE_REQUEST_DELAY_MS)
 
-                if (!isWarmupReady(latestCompileState)) {
+                val satisfiedNow =
+                    isWarmupReady(
+                        requireWarmup = latestRequireWarmup,
+                        warmupSatisfiedHint = latestWarmupSatisfiedHint,
+                        state = latestCompileState,
+                    )
+
+                if (!satisfiedNow) {
                     requestCompile(reason = "enterScreen")
                 } else {
                     SafeLog.d(
                         TAG,
-                        "enterScreen: warmup already ready state=${latestCompileState.javaClass.simpleName}",
+                        "enterScreen: warmup already satisfied " +
+                                "state=${latestCompileState.javaClass.simpleName} hint=${latestWarmupSatisfiedHint}",
                     )
                 }
             }
@@ -215,12 +279,23 @@ object SurveyStartScreen {
                 }
             }
 
-            LaunchedEffect(beginPendingWarmup, compileState) {
+            LaunchedEffect(beginPendingWarmup, compileState, warmupSatisfiedHint, requireWarmup) {
                 if (!beginPendingWarmup) return@LaunchedEffect
 
-                if (isWarmupReady(compileState)) {
-                    val waitedMs = pendingWarmupStartMs?.let { SystemClock.elapsedRealtime() - it } ?: -1
-                    SafeLog.i(TAG, "warmup became ready while pending (auto proceed) waitedMs=$waitedMs")
+                val satisfiedNow =
+                    isWarmupReady(
+                        requireWarmup = requireWarmup,
+                        warmupSatisfiedHint = warmupSatisfiedHint,
+                        state = compileState,
+                    )
+
+                if (satisfiedNow) {
+                    val waitedMs =
+                        pendingWarmupStartMs?.let { SystemClock.elapsedRealtime() - it } ?: -1
+                    SafeLog.i(
+                        TAG,
+                        "warmup became ready while pending (auto proceed) waitedMs=$waitedMs hint=$warmupSatisfiedHint",
+                    )
                     proceedBegin(source = "autoAfterWarmup")
                 }
             }
@@ -254,23 +329,32 @@ object SurveyStartScreen {
                     DebugPanel(debugInfo = debugInfo)
                 }
 
-                val showWarmupStatus = latestRequireWarmup && (beginPendingWarmup || !isWarmupReady(compileState))
+                val showWarmupStatus =
+                    latestRequireWarmup && (beginPendingWarmup || !effectiveWarmupReady)
+
                 if (showWarmupStatus) {
                     Spacer(Modifier.height(6.dp))
                     WarmupStatusPanel(
                         compileState = compileState,
+                        warmupSatisfiedHint = warmupSatisfiedHint,
                         onRetry = {
                             val controller = latestController ?: return@WarmupStatusPanel
-                            SafeLog.w(TAG, "warmup retry requested (SurveyStart) state=${compileState.javaClass.simpleName}")
+
+                            SafeLog.w(
+                                TAG,
+                                "warmup retry requested (SurveyStart) state=${compileState.javaClass.simpleName}",
+                            )
+
                             scope.launch(Dispatchers.IO) {
-                                runCatching { controller.resetForRetry(reason = "uiRetry") }
-                                    .onFailure { t ->
-                                        SafeLog.w(
-                                            TAG,
-                                            "resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
-                                            t,
-                                        )
-                                    }
+                                runCatching {
+                                    controller.resetForRetry(reason = "uiRetry")
+                                }.onFailure { t ->
+                                    SafeLog.w(
+                                        TAG,
+                                        "resetForRetry failed (non-fatal) type=${t::class.java.simpleName}",
+                                        t,
+                                    )
+                                }
                                 requestCompile(reason = "uiRetry")
                             }
                         },
@@ -315,6 +399,7 @@ object SurveyStartScreen {
                                 SafeLog.w(TAG, "begin ignored (locked)")
                                 return@Button
                             }
+
                             if (beginPendingWarmup) {
                                 SafeLog.w(TAG, "begin ignored (pendingWarmup)")
                                 return@Button
@@ -327,9 +412,20 @@ object SurveyStartScreen {
                             }
 
                             val st = compileState
-                            SafeLog.d(TAG, "click: begin state=${st.javaClass.simpleName} elapsedMs=${st.elapsedMs}")
+                            val satisfiedNow =
+                                isWarmupReady(
+                                    requireWarmup = latestRequireWarmup,
+                                    warmupSatisfiedHint = latestWarmupSatisfiedHint,
+                                    state = st,
+                                )
 
-                            if (isWarmupReady(st)) {
+                            SafeLog.d(
+                                TAG,
+                                "click: begin state=${st.javaClass.simpleName} " +
+                                        "elapsedMs=${st.elapsedMs} hint=${latestWarmupSatisfiedHint} satisfied=$satisfiedNow",
+                            )
+
+                            if (satisfiedNow) {
                                 SafeLog.i(TAG, "click: begin (ready)")
                                 proceedBegin(source = "immediate")
                                 return@Button
@@ -358,7 +454,9 @@ object SurveyStartScreen {
                 if (beginLocked) {
                     Text("Starting…")
                 } else if (beginPendingWarmup) {
-                    val waitedMs = pendingWarmupStartMs?.let { (pendingUiNowMs - it).coerceAtLeast(0L) }
+                    val waitedMs =
+                        pendingWarmupStartMs?.let { (pendingUiNowMs - it).coerceAtLeast(0L) }
+
                     Text(
                         if (waitedMs != null) {
                             "Preparing the AI model… (${waitedMs}ms)"
@@ -373,28 +471,37 @@ object SurveyStartScreen {
         @Composable
         private fun WarmupStatusPanel(
             compileState: WarmupController.CompileState,
+            warmupSatisfiedHint: Boolean,
             onRetry: () -> Unit,
         ) {
-            val label = when (compileState) {
-                is WarmupController.CompileState.Idle -> "Idle"
-                is WarmupController.CompileState.WaitingForPrefetch -> "Waiting for prefetch…"
-                is WarmupController.CompileState.Compiling -> "Compiling…"
-                is WarmupController.CompileState.Compiled -> "Compiled"
-                is WarmupController.CompileState.Cancelled -> "Cancelled"
-                is WarmupController.CompileState.SkippedNotReady -> "Not configured"
-                is WarmupController.CompileState.Failed -> {
-                    val msg = compileState.message.replace('\n', ' ').take(FAILED_MSG_MAX)
-                    "Failed: $msg"
+            val label =
+                when {
+                    warmupSatisfiedHint -> "Ready (reused)"
+                    compileState is WarmupController.CompileState.Idle -> "Idle"
+                    compileState is WarmupController.CompileState.WaitingForPrefetch -> "Waiting for prefetch…"
+                    compileState is WarmupController.CompileState.Compiling -> "Compiling…"
+                    compileState is WarmupController.CompileState.Compiled -> "Compiled"
+                    compileState is WarmupController.CompileState.Cancelled -> "Cancelled"
+                    compileState is WarmupController.CompileState.SkippedNotReady -> "Not configured"
+                    compileState is WarmupController.CompileState.Failed -> {
+                        val msg = compileState.message.replace('\n', ' ').take(FAILED_MSG_MAX)
+                        "Failed: $msg"
+                    }
+                    else -> "Unknown"
                 }
-            }
 
             val elapsed = compileState.elapsedMs
+
             Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
                 Text("$label  (elapsed=${elapsed}ms)")
-                if (compileState is WarmupController.CompileState.Failed ||
+                if (
+                    compileState is WarmupController.CompileState.Failed ||
                     compileState is WarmupController.CompileState.Cancelled
                 ) {
-                    OutlinedButton(onClick = onRetry, modifier = Modifier.testTag("warmup_retry")) {
+                    OutlinedButton(
+                        onClick = onRetry,
+                        modifier = Modifier.testTag("warmup_retry"),
+                    ) {
                         Text("Retry warmup")
                     }
                 }
@@ -405,10 +512,19 @@ object SurveyStartScreen {
          * Defines whether the app can proceed to Question flow without risking first-use stalls.
          *
          * Policy:
-         * - Compiled => ready.
-         * - SkippedNotReady => treat as ready so the UI is not hard-blocked.
+         * - If warmup is not required, proceed.
+         * - Caller-provided readiness hint wins.
+         * - Compiled means ready.
+         * - SkippedNotReady is treated as ready to avoid hard-blocking UI on missing wiring.
          */
-        private fun isWarmupReady(state: WarmupController.CompileState): Boolean {
+        private fun isWarmupReady(
+            requireWarmup: Boolean,
+            warmupSatisfiedHint: Boolean,
+            state: WarmupController.CompileState,
+        ): Boolean {
+            if (!requireWarmup) return true
+            if (warmupSatisfiedHint) return true
+
             return when (state) {
                 is WarmupController.CompileState.Compiled,
                 is WarmupController.CompileState.SkippedNotReady -> true

@@ -39,6 +39,7 @@ data class ModelSpecKey(
  * - Resolve the configured local model file.
  * - Convert a local file into a synthetic ready UI state.
  * - Wire warmup inputs when a concrete model file becomes ready.
+ * - Persist and reuse a compile-success stamp for startup fast-path.
  * - Derive service readiness for local-only vs remote-download startup.
  */
 internal class StartupModelWiring(
@@ -79,7 +80,7 @@ internal class StartupModelWiring(
      * - Trust only config-named local model files.
      * - Reuse the shared process-scoped validation rules.
      * - Never guess by extension, size, or "largest file wins".
-     * - Never logs file paths or file names.
+     * - Never log file paths or file names.
      */
     fun resolveExistingLocalModelFileOrNull(modelSpec: ModelDownloadSpec?): File? {
         return AppProcessServices.resolveConfiguredLocalModelFileOrNull(
@@ -123,34 +124,76 @@ internal class StartupModelWiring(
     }
 
     /**
+     * Result of handling a concrete model file becoming ready.
+     *
+     * Why:
+     * - Boolean is too lossy here.
+     * - We must distinguish "compile already satisfied by reusable stamp"
+     *   from "compile scheduled and still pending".
+     */
+    sealed interface ModelReadyOutcome {
+        /**
+         * Model-ready handling did not complete.
+         */
+        data object NotHandled : ModelReadyOutcome
+
+        /**
+         * The same fingerprint was already processed in this process.
+         * Caller should preserve its current hint/state.
+         */
+        data object AlreadyHandled : ModelReadyOutcome
+
+        /**
+         * Startup discovered a reusable compile stamp for this fingerprint.
+         * Caller may safely expose warmup-satisfied hint immediately.
+         */
+        data object CompileSatisfied : ModelReadyOutcome
+
+        /**
+         * Warmup inputs were wired and compile-after-prefetch was scheduled.
+         * Services are ready, but compile is still pending.
+         */
+        data object CompileScheduled : ModelReadyOutcome
+    }
+
+    /**
      * Wires warmup inputs once a concrete local model file is ready.
      *
      * Returns:
-     * - true when warmup wiring is already satisfied or newly completed.
-     * - false when input injection or compile scheduling did not complete.
+     * - [ModelReadyOutcome.CompileSatisfied] when a reusable compile stamp exists.
+     * - [ModelReadyOutcome.CompileScheduled] when compile was scheduled.
+     * - [ModelReadyOutcome.AlreadyHandled] when this fingerprint was already handled.
+     * - [ModelReadyOutcome.NotHandled] when wiring could not complete.
      *
      * Notes:
      * - This is intentionally idempotent.
      * - The in-memory fingerprint never stores or logs file paths.
-     * - Fingerprint is committed only after warmup wiring succeeds.
+     * - Fingerprint is committed only after warmup handling succeeds.
      */
     fun onModelReady(
         repoMode: AppProcessServices.RepoMode,
         warmup: WarmupController,
         file: File,
         lastReadyFingerprintRef: AtomicReference<ModelReadyFingerprint?>,
-    ): Boolean {
-        if (repoMode != AppProcessServices.RepoMode.ON_DEVICE) return false
+    ): ModelReadyOutcome {
+        if (repoMode != AppProcessServices.RepoMode.ON_DEVICE) {
+            return ModelReadyOutcome.NotHandled
+        }
         if (!AppProcessServices.isUsableLocalModelFile(file)) {
             SafeLog.w(TAG, "Warmup: model file not usable; wiring skipped")
-            return false
+            return ModelReadyOutcome.NotHandled
         }
 
         val fingerprint = ModelReadyFingerprint.from(file)
         val previous = lastReadyFingerprintRef.get()
-        if (previous == fingerprint) return true
+        if (previous == fingerprint) {
+            return ModelReadyOutcome.AlreadyHandled
+        }
 
-        val inputs = resolveWarmupInputsOrNull(repoMode = repoMode, file = file) ?: return false
+        val inputs = resolveWarmupInputsOrNull(
+            repoMode = repoMode,
+            file = file,
+        ) ?: return ModelReadyOutcome.NotHandled
 
         val inputsUpdated =
             runCatching {
@@ -162,7 +205,15 @@ internal class StartupModelWiring(
                 )
             }.isSuccess
 
-        if (!inputsUpdated) return false
+        if (!inputsUpdated) {
+            return ModelReadyOutcome.NotHandled
+        }
+
+        if (hasReusableCompileStamp(file)) {
+            lastReadyFingerprintRef.set(fingerprint)
+            SafeLog.i(TAG, "Warmup: reusable compile stamp detected; startup compile skipped")
+            return ModelReadyOutcome.CompileSatisfied
+        }
 
         val compileRequested =
             runCatching {
@@ -174,11 +225,84 @@ internal class StartupModelWiring(
                 )
             }.isSuccess
 
-        if (compileRequested) {
-            lastReadyFingerprintRef.set(fingerprint)
+        if (!compileRequested) {
+            return ModelReadyOutcome.NotHandled
         }
 
-        return compileRequested
+        lastReadyFingerprintRef.set(fingerprint)
+        return ModelReadyOutcome.CompileScheduled
+    }
+
+    /**
+     * Saves a reusable compile-success stamp for the given model file.
+     *
+     * Notes:
+     * - The stamp is path-free and fingerprint-based.
+     * - This is best-effort and intentionally small.
+     */
+    fun saveCompileSuccessStamp(file: File) {
+        val fingerprint = ModelReadyFingerprint.from(file)
+        val stampFile = compileStampFile()
+        stampFile.parentFile?.mkdirs()
+        val text = listOf(
+            fingerprint.lengthBytes.toString(),
+            fingerprint.lastModifiedMs.toString(),
+            fingerprint.nameHash.toString(),
+        ).joinToString(separator = "\n")
+        stampFile.writeText(text)
+    }
+
+    /**
+     * Clears the persisted compile-success stamp.
+     *
+     * Notes:
+     * - Useful for explicit retry or testing when the caller wants to force
+     *   a fresh warmup path.
+     */
+    fun clearCompileSuccessStamp() {
+        runCatching {
+            compileStampFile().delete()
+        }.onFailure { t ->
+            SafeLog.w(
+                TAG,
+                "Warmup: clear compile stamp failed (non-fatal) type=${t::class.java.simpleName}",
+            )
+        }
+    }
+
+    /**
+     * Returns true when the persisted compile stamp matches the current file fingerprint.
+     */
+    private fun hasReusableCompileStamp(file: File): Boolean {
+        val stampFile = compileStampFile()
+        if (!stampFile.exists()) return false
+
+        val lines =
+            runCatching {
+                stampFile.readLines()
+            }.getOrNull() ?: return false
+
+        if (lines.size < 3) return false
+
+        val stored =
+            ModelReadyFingerprint(
+                lengthBytes = lines[0].toLongOrNull() ?: return false,
+                lastModifiedMs = lines[1].toLongOrNull() ?: return false,
+                nameHash = lines[2].toIntOrNull() ?: return false,
+            )
+
+        return stored == ModelReadyFingerprint.from(file)
+    }
+
+    /**
+     * Returns the compile stamp file for this app process.
+     *
+     * Notes:
+     * - Kept under no_backup to survive process death but avoid cloud restore.
+     * - Single current-model stamp is enough for this startup fast-path.
+     */
+    private fun compileStampFile(): File {
+        return File(app.noBackupFilesDir, "startup_warmup/compile_ready_v1.stamp")
     }
 
     /**

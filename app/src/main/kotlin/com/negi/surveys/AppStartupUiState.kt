@@ -19,6 +19,12 @@ import com.negi.surveys.warmup.WarmupController
 
 /**
  * Root startup UI state exposed to Compose.
+ *
+ * Notes:
+ * - [warmupSatisfiedHint] is a root-owned hint that allows UI to skip
+ *   redundant compile requests when startup already proved the local model
+ *   has a reusable compile stamp for the current fingerprint.
+ * - This hint is process-local and intentionally conservative.
  */
 data class AppStartupUiState(
     val configState: StartupConfigState = StartupConfigState.Loading,
@@ -27,6 +33,7 @@ data class AppStartupUiState(
     val repoMode: AppProcessServices.RepoMode = AppProcessServices.RepoMode.ON_DEVICE,
     val onDeviceEnabled: Boolean = true,
     val servicesReady: Boolean = false,
+    val warmupSatisfiedHint: Boolean = false,
     val repository: ChatValidation.RepositoryI? = null,
     val warmup: WarmupController? = null,
     val modelDownloader: ModelDownloadController? = null,

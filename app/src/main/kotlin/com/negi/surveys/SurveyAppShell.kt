@@ -266,8 +266,10 @@ object SurveyAppShell {
      *
      * Design:
      * - Explicit blocking state from the caller wins.
-     * - A missing repository without explicit blocking state is treated as a safe fallback state.
-     * - Retry is shown only when it is meaningful for the current blocking mode.
+     * - A retry-capable state is treated as a startup anomaly that should stay blocked
+     *   even when a repository object already exists.
+     * - A missing repository without retry availability is treated as a safe loading fallback.
+     * - Retry is shown only for non-spinner blocking modes.
      */
     @Composable
     private fun rememberShellBlockingSpec(
@@ -307,18 +309,35 @@ object SurveyAppShell {
                     )
                 }
 
+                /**
+                 * Root-level anomaly fallback.
+                 *
+                 * Why:
+                 * - The root may detect a meaningful retry state even if it did not supply
+                 *   an explicit title/detail pair.
+                 * - This can happen when service readiness is inconsistent after config is ready.
+                 */
+                retryAvailable -> {
+                    ShellBlockingSpec(
+                        visible = true,
+                        title = "Startup needs attention",
+                        detail = "Some app services are not ready. Retry startup to rebuild them.",
+                        showSpinner = false,
+                        showRetry = true,
+                    )
+                }
+
+                /**
+                 * Safe loading fallback when the repository is still absent and there is no
+                 * explicit anomaly/retry signal yet.
+                 */
                 repository == null -> {
                     ShellBlockingSpec(
                         visible = true,
                         title = "Preparing app services…",
-                        detail =
-                            if (retryAvailable) {
-                                "Startup is taking longer than expected. If this screen does not clear, retry startup."
-                            } else {
-                                "Repository is not ready yet."
-                            },
+                        detail = "Repository is not ready yet.",
                         showSpinner = true,
-                        showRetry = retryAvailable,
+                        showRetry = false,
                     )
                 }
 
@@ -334,6 +353,7 @@ object SurveyAppShell {
             }
         }
     }
+
     /**
      * Shell blocking placeholder spec.
      */
@@ -345,4 +365,3 @@ object SurveyAppShell {
         val showRetry: Boolean,
     )
 }
-

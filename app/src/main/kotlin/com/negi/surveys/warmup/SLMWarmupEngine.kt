@@ -59,7 +59,7 @@ import kotlinx.coroutines.withTimeoutOrNull
  *
  * Properties:
  * - Idempotent under concurrent call races.
- * - Prefetch (IO cache warming) and Compile (heavy init) phases.
+ * - Prefetch (IO cache warming), Compile (heavy init), and Runtime warm phases.
  * - Best-effort EGL context warmup (optional).
  *
  * Key invariants:
@@ -68,13 +68,15 @@ import kotlinx.coroutines.withTimeoutOrNull
  * - "Not ready yet" is treated as retryable.
  *
  * Key change:
- * - Removed Dependencies. Callers must provide explicit [WarmupController.Inputs] via [updateInputs].
- * - Compile calls only [WarmupController.WarmupCapableRepository.warmup] (deterministic).
+ * - Implements [WarmupController.RuntimeAwareEngine].
+ * - Compile warmup and runtime hot preparation are tracked separately.
+ * - Runtime warmup only becomes effective when the repository implements
+ *   [WarmupController.RuntimeWarmCapableRepository].
  */
 class SLMWarmupEngine(
     private val logger: (String) -> Unit = { AppLog.d(TAG, it) },
     externalScope: CoroutineScope? = null,
-) : WarmupController.Engine {
+) : WarmupController.RuntimeAwareEngine {
 
     private val scope: CoroutineScope =
         externalScope ?: CoroutineScope(SupervisorJob() + Dispatchers.Default)
@@ -88,17 +90,30 @@ class SLMWarmupEngine(
     private val _compileState =
         MutableStateFlow<WarmupController.CompileState>(WarmupController.CompileState.Idle)
 
-    override val prefetchState: StateFlow<WarmupController.PrefetchState> = _prefetchState.asStateFlow()
-    override val compileState: StateFlow<WarmupController.CompileState> = _compileState.asStateFlow()
+    private val _runtimeWarmState =
+        MutableStateFlow<WarmupController.RuntimeWarmState>(WarmupController.RuntimeWarmState.Idle)
+
+    override val prefetchState: StateFlow<WarmupController.PrefetchState> =
+        _prefetchState.asStateFlow()
+
+    override val compileState: StateFlow<WarmupController.CompileState> =
+        _compileState.asStateFlow()
+
+    override val runtimeWarmState: StateFlow<WarmupController.RuntimeWarmState> =
+        _runtimeWarmState.asStateFlow()
 
     private val prefetchRunIdGen = AtomicLong(0L)
     private val compileRunIdGen = AtomicLong(0L)
+    private val runtimeRunIdGen = AtomicLong(0L)
 
     private val activePrefetchRunId = AtomicLong(0L)
 
     private val prefetchJobRef = AtomicReference<Job?>(null)
     private val compileJobRef = AtomicReference<Job?>(null)
+    private val runtimeWarmJobRef = AtomicReference<Job?>(null)
+
     private val compileAfterPrefetchJobRef = AtomicReference<Job?>(null)
+    private val runtimeAfterCompileJobRef = AtomicReference<Job?>(null)
 
     private val eglThreadRef = AtomicReference<EglPbufferThread?>(null)
 
@@ -127,11 +142,20 @@ class SLMWarmupEngine(
         val requestedAtMs: Long,
     )
 
+    private data class PendingAutoRuntimeWarm(
+        val requestId: Long,
+        val reason: String,
+        val requestedAtMs: Long,
+    )
+
     private val autoCompileRequestIdGen = AtomicLong(0L)
+    private val autoRuntimeRequestIdGen = AtomicLong(0L)
+
     private val pendingAutoCompileRef = AtomicReference<PendingAutoCompile?>(null)
+    private val pendingAutoRuntimeRef = AtomicReference<PendingAutoRuntimeWarm?>(null)
 
     /**
-     * Safe logger wrapper (engine must never throw).
+     * Safe logger wrapper.
      */
     private fun log(msg: String) {
         runCatching { logger(msg) }
@@ -141,9 +165,8 @@ class SLMWarmupEngine(
         inputsRef.set(inputs)
         log("inputs: updated pid=${Process.myPid()} hasInputs=${inputs != null}")
 
-        // If a compile-after-prefetch request was made before inputs became ready,
-        // try to trigger it now (best effort).
         triggerPendingAutoCompileIfPossible(trigger = "updateInputs")
+        triggerPendingAutoRuntimeIfPossible(trigger = "updateInputs")
     }
 
     /**
@@ -161,7 +184,6 @@ class SLMWarmupEngine(
         val ready = inputs != null && isModelFileReady(inputs.file)
         if (!ready) return
 
-        // Ensure we only trigger once for the currently pending request.
         if (!pendingAutoCompileRef.compareAndSet(pending, null)) return
 
         val safeReason = safeReasonForLogs(pending.reason)
@@ -175,8 +197,38 @@ class SLMWarmupEngine(
         }
     }
 
+    /**
+     * Attempts to run a previously requested runtime warm once inputs and compile become ready.
+     *
+     * IMPORTANT:
+     * - Never blocks the caller thread.
+     * - If prerequisites are still not ready, keeps the pending request as-is.
+     */
+    private fun triggerPendingAutoRuntimeIfPossible(trigger: String) {
+        val pending = pendingAutoRuntimeRef.get() ?: return
+        val ctx = appContextRef.get() ?: return
+
+        val inputs = inputsRef.get() ?: return
+        val fileReady = isModelFileReady(inputs.file)
+        val runtimeCapable = inputs.repository is WarmupController.RuntimeWarmCapableRepository
+        val compileReady = _compileState.value is WarmupController.CompileState.Compiled
+
+        if (!fileReady || !runtimeCapable || !compileReady) return
+
+        if (!pendingAutoRuntimeRef.compareAndSet(pending, null)) return
+
+        val safeReason = safeReasonForLogs(pending.reason)
+        log(
+            "autoRuntimeAfterCompile: prerequisites ready -> triggering pid=${Process.myPid()} " +
+                    "requestId=${pending.requestId} via='$trigger' reason='$safeReason'",
+        )
+
+        scope.launch(warmupDispatcher) {
+            triggerAutoRuntimeWarmNow(ctx = ctx, safeReason = safeReason)
+        }
+    }
+
     private suspend fun triggerAutoCompileNow(ctx: Context, safeReason: String) {
-        // Prefetch first (best effort).
         startPrefetch(ctx)
 
         withTimeoutOrNull(Const.PREFETCH_FINISH_WAIT_TIMEOUT_MS) {
@@ -192,11 +244,20 @@ class SLMWarmupEngine(
         log("autoCompileAfterPrefetch: triggered pid=${Process.myPid()} reason='$safeReason'")
     }
 
+    private suspend fun triggerAutoRuntimeWarmNow(ctx: Context, safeReason: String) {
+        currentCoroutineContext().ensureActive()
+        delay(Const.AUTO_RUNTIME_DELAY_MS)
+        currentCoroutineContext().ensureActive()
+
+        startRuntimeWarm(ctx)
+
+        log("autoRuntimeAfterCompile: triggered pid=${Process.myPid()} reason='$safeReason'")
+    }
+
     override fun startPrefetch(appContext: Context) {
         val ctx = appContext.applicationContext
         appContextRef.set(ctx)
 
-        // Do not restart once prefetched unless the caller resets.
         if (_prefetchState.value is WarmupController.PrefetchState.Prefetched) return
 
         val existing = prefetchJobRef.get()
@@ -244,7 +305,6 @@ class SLMWarmupEngine(
             return
         }
 
-        // Now that the job is installed, mark it as active.
         activePrefetchRunId.set(runId)
         prefetchCancelRequestRef.set(null)
 
@@ -260,8 +320,10 @@ class SLMWarmupEngine(
         val ctx = appContext.applicationContext
         appContextRef.set(ctx)
 
-        // Do not restart once compiled unless the caller resets.
-        if (_compileState.value is WarmupController.CompileState.Compiled) return
+        if (_compileState.value is WarmupController.CompileState.Compiled) {
+            triggerPendingAutoRuntimeIfPossible(trigger = "startCompileAlreadyCompiled")
+            return
+        }
 
         val existing = compileJobRef.get()
         if (existing?.isActive == true) return
@@ -286,7 +348,6 @@ class SLMWarmupEngine(
                         return@launch
                     }
 
-                    // Best effort: start IO warmup first.
                     startPrefetch(ctx)
 
                     runCompile(
@@ -321,6 +382,84 @@ class SLMWarmupEngine(
         job.start()
     }
 
+    override fun startRuntimeWarm(appContext: Context) {
+        val ctx = appContext.applicationContext
+        appContextRef.set(ctx)
+
+        if (_runtimeWarmState.value is WarmupController.RuntimeWarmState.Ready) return
+
+        val existing = runtimeWarmJobRef.get()
+        if (existing?.isActive == true) return
+
+        val runId = runtimeRunIdGen.incrementAndGet()
+        val job =
+            scope.launch(warmupDispatcher, start = CoroutineStart.LAZY) {
+                try {
+                    val inputs = inputsRef.get()
+                    if (inputs == null) {
+                        _runtimeWarmState.value =
+                            WarmupController.RuntimeWarmState.SkippedNotReady("inputs missing")
+                        log("runtimeWarm: skipped(inputs missing) pid=${Process.myPid()} runId=$runId")
+                        return@launch
+                    }
+
+                    val file = inputs.file
+                    if (!isModelFileReady(file)) {
+                        _runtimeWarmState.value =
+                            WarmupController.RuntimeWarmState.SkippedNotReady("file missing/empty")
+                        log("runtimeWarm: skipped(file missing/empty) pid=${Process.myPid()} runId=$runId")
+                        return@launch
+                    }
+
+                    val runtimeRepo =
+                        inputs.repository as? WarmupController.RuntimeWarmCapableRepository
+                    if (runtimeRepo == null) {
+                        _runtimeWarmState.value =
+                            WarmupController.RuntimeWarmState.SkippedNotReady(
+                                "repository not runtime-capable",
+                            )
+                        log(
+                            "runtimeWarm: skipped(repository not runtime-capable) " +
+                                    "pid=${Process.myPid()} runId=$runId",
+                        )
+                        return@launch
+                    }
+
+                    runRuntimeWarm(
+                        file = file!!,
+                        repo = runtimeRepo,
+                        opts = inputs.options,
+                        appContext = ctx,
+                        runId = runId,
+                    )
+                } catch (ce: CancellationException) {
+                    setRuntimeWarmCancelled(nowMs = SystemClock.elapsedRealtime())
+                    log("runtimeWarm: cancelled pid=${Process.myPid()} runId=$runId")
+                    throw ce
+                } catch (t: Throwable) {
+                    setRuntimeWarmFailed(t, nowMs = SystemClock.elapsedRealtime())
+                    log(
+                        "runtimeWarm: failed pid=${Process.myPid()} runId=$runId " +
+                                "err=${t.javaClass.simpleName}",
+                    )
+                } finally {
+                    closeEglThread(reason = "runtimeWarmDone")
+                }
+            }
+
+        if (!runtimeWarmJobRef.compareAndSet(existing, job)) {
+            job.cancel()
+            return
+        }
+
+        job.invokeOnCompletion {
+            runtimeWarmJobRef.compareAndSet(job, null)
+        }
+
+        log("runtimeWarm: scheduled pid=${Process.myPid()} runId=$runId")
+        job.start()
+    }
+
     override fun requestCompileAfterPrefetch(appContext: Context, reason: String) {
         val ctx = appContext.applicationContext
         appContextRef.set(ctx)
@@ -342,16 +481,12 @@ class SLMWarmupEngine(
                             "requestId=$requestId reason='$safeReason'",
                 )
 
-                // If already compiled, drop pending and do nothing.
                 if (_compileState.value is WarmupController.CompileState.Compiled) {
-                    pendingAutoCompileRef.compareAndSet(
-                        pendingAutoCompileRef.get(),
-                        null,
-                    )
+                    pendingAutoCompileRef.compareAndSet(pendingAutoCompileRef.get(), null)
+                    triggerPendingAutoRuntimeIfPossible(trigger = "compileAlreadyReady")
                     return@launch
                 }
 
-                // Wait until inputs + file are ready (best effort, bounded).
                 val ready =
                     withTimeoutOrNull(Const.COMPILE_AFTER_PREFETCH_MAX_WAIT_MS) {
                         while (true) {
@@ -368,7 +503,6 @@ class SLMWarmupEngine(
                 currentCoroutineContext().ensureActive()
 
                 if (!ready) {
-                    // Keep pending and rely on updateInputs() trigger when it becomes ready.
                     log(
                         "autoCompileAfterPrefetch: inputs not ready (timeout) -> pending kept pid=${Process.myPid()} " +
                                 "requestId=$requestId reason='$safeReason'",
@@ -376,7 +510,6 @@ class SLMWarmupEngine(
                     return@launch
                 }
 
-                // Only trigger if this request is still the latest pending request.
                 val pending = pendingAutoCompileRef.get()
                 if (pending == null || pending.requestId != requestId) {
                     log(
@@ -400,14 +533,120 @@ class SLMWarmupEngine(
         job.start()
     }
 
+    override fun requestRuntimeWarmAfterCompile(appContext: Context, reason: String) {
+        val ctx = appContext.applicationContext
+        appContextRef.set(ctx)
+
+        val requestId = autoRuntimeRequestIdGen.incrementAndGet()
+        pendingAutoRuntimeRef.set(
+            PendingAutoRuntimeWarm(
+                requestId = requestId,
+                reason = reason,
+                requestedAtMs = SystemClock.elapsedRealtime(),
+            ),
+        )
+
+        val job =
+            scope.launch(warmupDispatcher, start = CoroutineStart.LAZY) {
+                val safeReason = safeReasonForLogs(reason)
+                log(
+                    "autoRuntimeAfterCompile: requested pid=${Process.myPid()} " +
+                            "requestId=$requestId reason='$safeReason'",
+                )
+
+                if (_runtimeWarmState.value is WarmupController.RuntimeWarmState.Ready) {
+                    pendingAutoRuntimeRef.compareAndSet(pendingAutoRuntimeRef.get(), null)
+                    return@launch
+                }
+
+                val ready =
+                    withTimeoutOrNull(Const.RUNTIME_AFTER_COMPILE_MAX_WAIT_MS) {
+                        while (true) {
+                            currentCoroutineContext().ensureActive()
+
+                            val inputs = inputsRef.get()
+                            val fileReady = inputs != null && isModelFileReady(inputs.file)
+                            val runtimeCapable =
+                                inputs?.repository is WarmupController.RuntimeWarmCapableRepository
+
+                            if (!fileReady) {
+                                delay(Const.AUTO_RUNTIME_POLL_INTERVAL_MS)
+                                continue
+                            }
+
+                            if (!runtimeCapable) {
+                                return@withTimeoutOrNull false
+                            }
+
+                            if (_compileState.value !is WarmupController.CompileState.Compiled) {
+                                startCompile(ctx)
+                                delay(Const.AUTO_RUNTIME_POLL_INTERVAL_MS)
+                                continue
+                            }
+
+                            return@withTimeoutOrNull true
+                        }
+                    }
+
+                currentCoroutineContext().ensureActive()
+
+                if (ready == false) {
+                    _runtimeWarmState.value =
+                        WarmupController.RuntimeWarmState.SkippedNotReady(
+                            "repository not runtime-capable",
+                        )
+                    val pending = pendingAutoRuntimeRef.get()
+                    if (pending != null && pending.requestId == requestId) {
+                        pendingAutoRuntimeRef.compareAndSet(pending, null)
+                    }
+                    log(
+                        "autoRuntimeAfterCompile: skipped(repository not runtime-capable) " +
+                                "pid=${Process.myPid()} requestId=$requestId reason='$safeReason'",
+                    )
+                    return@launch
+                }
+
+                if (ready != true) {
+                    log(
+                        "autoRuntimeAfterCompile: prerequisites not ready (timeout) -> pending kept pid=${Process.myPid()} " +
+                                "requestId=$requestId reason='$safeReason'",
+                    )
+                    return@launch
+                }
+
+                val pending = pendingAutoRuntimeRef.get()
+                if (pending == null || pending.requestId != requestId) {
+                    log(
+                        "autoRuntimeAfterCompile: superseded -> skip pid=${Process.myPid()} " +
+                                "requestId=$requestId reason='$safeReason'",
+                    )
+                    return@launch
+                }
+                pendingAutoRuntimeRef.compareAndSet(pending, null)
+
+                triggerAutoRuntimeWarmNow(ctx = ctx, safeReason = safeReason)
+            }
+
+        runtimeAfterCompileJobRef.getAndSet(job)?.cancel()
+
+        job.invokeOnCompletion {
+            runtimeAfterCompileJobRef.compareAndSet(job, null)
+        }
+
+        log("autoRuntimeAfterCompile: scheduled pid=${Process.myPid()} requestId=$requestId")
+        job.start()
+    }
+
     override fun cancelAll(reason: String) {
         val safeReason = safeReasonForLogs(reason)
         log("cancelAll: pid=${Process.myPid()} reason='$safeReason'")
 
         compileAfterPrefetchJobRef.getAndSet(null)?.cancel()
-        pendingAutoCompileRef.set(null)
+        runtimeAfterCompileJobRef.getAndSet(null)?.cancel()
 
-        // Tag the current prefetch as cancelled (best effort).
+        pendingAutoCompileRef.set(null)
+        pendingAutoRuntimeRef.set(null)
+
         prefetchCancelRequestRef.set(
             PrefetchCancelRequest(
                 runId = activePrefetchRunId.get(),
@@ -418,10 +657,14 @@ class SLMWarmupEngine(
 
         prefetchJobRef.getAndSet(null)?.cancel()
         compileJobRef.getAndSet(null)?.cancel()
+        runtimeWarmJobRef.getAndSet(null)?.cancel()
 
         val now = SystemClock.elapsedRealtime()
         if (!isPrefetchTerminalOrSkipped(_prefetchState.value)) setPrefetchCancelled(nowMs = now)
         if (!isCompileTerminalOrSkipped(_compileState.value)) setCompileCancelled(nowMs = now)
+        if (!isRuntimeTerminalOrSkipped(_runtimeWarmState.value)) {
+            setRuntimeWarmCancelled(nowMs = now)
+        }
 
         closeEglThread(reason = "cancelAll")
     }
@@ -431,12 +674,18 @@ class SLMWarmupEngine(
 
         prefetchRunIdGen.set(0L)
         compileRunIdGen.set(0L)
+        runtimeRunIdGen.set(0L)
+
         activePrefetchRunId.set(0L)
+
         pendingAutoCompileRef.set(null)
+        pendingAutoRuntimeRef.set(null)
+
         appContextRef.set(null)
 
         _prefetchState.value = WarmupController.PrefetchState.Idle
         _compileState.value = WarmupController.CompileState.Idle
+        _runtimeWarmState.value = WarmupController.RuntimeWarmState.Idle
 
         log("resetForRetry: done pid=${Process.myPid()}")
     }
@@ -502,8 +751,9 @@ class SLMWarmupEngine(
             }
 
             log(
-                "prefetch: cancelled(pid=${Process.myPid()} runId=$runId) reason='${safeReasonForLogs(why)}' " +
-                        "downloaded=$downloaded target=$targetTotal fileSize=$fileSize elapsedMs=${end - startedAtMs}",
+                "prefetch: cancelled(pid=${Process.myPid()} runId=$runId) " +
+                        "reason='${safeReasonForLogs(why)}' downloaded=$downloaded " +
+                        "target=$targetTotal fileSize=$fileSize elapsedMs=${end - startedAtMs}",
             )
             throw ce
         }
@@ -512,7 +762,6 @@ class SLMWarmupEngine(
         _prefetchState.value =
             WarmupController.PrefetchState.Prefetched(
                 file = file,
-                // NOTE: Use actual bytes read (downloaded), not file.length().
                 sizeBytes = downloaded.coerceAtLeast(0L),
                 startedAtMs = startedAtMs,
                 elapsedMs = end - startedAtMs,
@@ -551,7 +800,10 @@ class SLMWarmupEngine(
         )
 
         prefetchJobRef.getAndSet(null)?.cancel()
-        log("prefetch: cancel requested pid=${Process.myPid()} runId=$runId reason='${safeReasonForLogs(reason)}'")
+        log(
+            "prefetch: cancel requested pid=${Process.myPid()} runId=$runId " +
+                    "reason='${safeReasonForLogs(reason)}'",
+        )
     }
 
     /**
@@ -580,7 +832,10 @@ class SLMWarmupEngine(
             } != null
 
             if (!finished) {
-                log("compile: prefetch wait timeout; cancelling to reduce IO contention pid=${Process.myPid()} runId=$runId")
+                log(
+                    "compile: prefetch wait timeout; cancelling to reduce IO contention " +
+                            "pid=${Process.myPid()} runId=$runId",
+                )
                 cancelPrefetchIfRunning(reason = "compile-wait-timeout")
                 withTimeoutOrNull(Const.PREFETCH_CANCEL_JOIN_TIMEOUT_MS) {
                     prefetchState.first { isPrefetchTerminalOrSkipped(it) }
@@ -659,7 +914,6 @@ class SLMWarmupEngine(
 
             currentCoroutineContext().ensureActive()
 
-            // Hard budget: avoid infinite hangs in native/driver init.
             withTimeout(Const.INITIALIZE_TIMEOUT_MS) {
                 runCompileViaEglIfPossible(
                     appContext = appContext,
@@ -678,7 +932,158 @@ class SLMWarmupEngine(
                     elapsedMs = end - startedAtMs,
                 )
 
-            log("compile: end pid=${Process.myPid()} runId=$runId elapsedMs=${end - startedAtMs} prefetchWaitMs=$prefetchWaitMs")
+            log(
+                "compile: end pid=${Process.myPid()} runId=$runId elapsedMs=${end - startedAtMs} " +
+                        "prefetchWaitMs=$prefetchWaitMs",
+            )
+
+            triggerPendingAutoRuntimeIfPossible(trigger = "compileComplete")
+        } finally {
+            ticker.cancel()
+        }
+    }
+
+    private suspend fun runRuntimeWarm(
+        file: File,
+        repo: WarmupController.RuntimeWarmCapableRepository,
+        opts: WarmupController.Options,
+        appContext: Context,
+        runId: Long,
+    ) {
+        if (_compileState.value !is WarmupController.CompileState.Compiled) {
+            val requestedAtMs = SystemClock.elapsedRealtime()
+            _runtimeWarmState.value =
+                WarmupController.RuntimeWarmState.WaitingForCompile(
+                    file = file,
+                    requestedAtMs = requestedAtMs,
+                    elapsedMs = 0L,
+                )
+
+            startCompile(appContext)
+
+            val compileResult =
+                withTimeoutOrNull(Const.RUNTIME_WAIT_FOR_COMPILE_TIMEOUT_MS) {
+                    compileState.first { isCompileTerminalOrSkipped(it) }
+                } ?: compileState.value
+
+            when (compileResult) {
+                is WarmupController.CompileState.Compiled -> {
+                    // Continue.
+                }
+
+                is WarmupController.CompileState.Failed -> {
+                    _runtimeWarmState.value =
+                        WarmupController.RuntimeWarmState.Failed(
+                            message = "CompileFailed",
+                            startedAtMs = requestedAtMs,
+                            elapsedMs = elapsedSince(requestedAtMs, SystemClock.elapsedRealtime()),
+                        )
+                    log(
+                        "runtimeWarm: compile prerequisite failed pid=${Process.myPid()} " +
+                                "runId=$runId",
+                    )
+                    return
+                }
+
+                is WarmupController.CompileState.Cancelled -> {
+                    _runtimeWarmState.value =
+                        WarmupController.RuntimeWarmState.Cancelled(
+                            startedAtMs = requestedAtMs,
+                            elapsedMs = elapsedSince(requestedAtMs, SystemClock.elapsedRealtime()),
+                        )
+                    log(
+                        "runtimeWarm: compile prerequisite cancelled pid=${Process.myPid()} " +
+                                "runId=$runId",
+                    )
+                    return
+                }
+
+                is WarmupController.CompileState.SkippedNotReady -> {
+                    _runtimeWarmState.value =
+                        WarmupController.RuntimeWarmState.SkippedNotReady(
+                            reason = "compile not ready",
+                        )
+                    log(
+                        "runtimeWarm: compile prerequisite not ready pid=${Process.myPid()} " +
+                                "runId=$runId",
+                    )
+                    return
+                }
+
+                else -> {
+                    _runtimeWarmState.value =
+                        WarmupController.RuntimeWarmState.Failed(
+                            message = "CompileTimeout",
+                            startedAtMs = requestedAtMs,
+                            elapsedMs = elapsedSince(requestedAtMs, SystemClock.elapsedRealtime()),
+                        )
+                    log(
+                        "runtimeWarm: compile prerequisite timeout pid=${Process.myPid()} " +
+                                "runId=$runId",
+                    )
+                    return
+                }
+            }
+        }
+
+        val ticker =
+            scope.launch(warmupDispatcher) {
+                while (true) {
+                    delay(Const.RUNTIME_EMIT_INTERVAL_MS)
+                    currentCoroutineContext().ensureActive()
+
+                    val now = SystemClock.elapsedRealtime()
+                    when (val st = _runtimeWarmState.value) {
+                        is WarmupController.RuntimeWarmState.WaitingForCompile ->
+                            _runtimeWarmState.value = st.copy(elapsedMs = now - st.requestedAtMs)
+
+                        is WarmupController.RuntimeWarmState.Warming ->
+                            _runtimeWarmState.value = st.copy(elapsedMs = now - st.startedAtMs)
+
+                        else -> return@launch
+                    }
+                }
+            }
+
+        val startedAtMs = SystemClock.elapsedRealtime()
+        try {
+            _runtimeWarmState.value =
+                WarmupController.RuntimeWarmState.Warming(
+                    file = file,
+                    startedAtMs = startedAtMs,
+                    elapsedMs = 0L,
+                )
+
+            log(
+                "runtimeWarm: begin pid=${Process.myPid()} runId=$runId " +
+                        "opts=image=${opts.supportImage} audio=${opts.supportAudio} " +
+                        "tools=${opts.tools.size} system=${opts.systemMessage != null}",
+            )
+
+            currentCoroutineContext().ensureActive()
+
+            withTimeout(Const.RUNTIME_PREPARE_TIMEOUT_MS) {
+                runRuntimeWarmViaEglIfPossible(
+                    appContext = appContext,
+                    repo = repo,
+                    file = file,
+                    opts = opts,
+                    runId = runId,
+                )
+            }
+
+            val end = SystemClock.elapsedRealtime()
+            _runtimeWarmState.value =
+                WarmupController.RuntimeWarmState.Ready(
+                    file = file,
+                    startedAtMs = startedAtMs,
+                    elapsedMs = end - startedAtMs,
+                )
+
+            log(
+                "runtimeWarm: end pid=${Process.myPid()} runId=$runId " +
+                        "elapsedMs=${end - startedAtMs}",
+            )
         } finally {
             ticker.cancel()
         }
@@ -711,10 +1116,51 @@ class SLMWarmupEngine(
                 if (!ok) error("warmup returned false")
             }
         } catch (t: Throwable) {
-            // Best effort fallback: retry once without EGL.
-            log("compile: egl warmup failed; retrying direct pid=${Process.myPid()} runId=$runId err=${t.javaClass.simpleName}")
+            log(
+                "compile: egl warmup failed; retrying direct pid=${Process.myPid()} runId=$runId " +
+                        "err=${t.javaClass.simpleName}",
+            )
             val ok = repo.warmup(appContext, file, opts)
             if (!ok) error("warmup returned false")
+        }
+    }
+
+    private suspend fun runRuntimeWarmViaEglIfPossible(
+        appContext: Context,
+        repo: WarmupController.RuntimeWarmCapableRepository,
+        file: File,
+        opts: WarmupController.Options,
+        runId: Long,
+    ) {
+        currentCoroutineContext().ensureActive()
+
+        val thread = ensureEglThread(runId = runId)
+        currentCoroutineContext().ensureActive()
+
+        if (thread == null) {
+            log(
+                "runtimeWarm: egl unavailable; running prepareRuntime directly " +
+                        "pid=${Process.myPid()} runId=$runId",
+            )
+            val ok = repo.prepareRuntime(appContext, file, opts)
+            if (!ok) error("prepareRuntime returned false")
+            return
+        }
+
+        try {
+            log("runtimeWarm: entering egl context pid=${Process.myPid()} runId=$runId")
+            thread.withEglContext {
+                currentCoroutineContext().ensureActive()
+                val ok = repo.prepareRuntime(appContext, file, opts)
+                if (!ok) error("prepareRuntime returned false")
+            }
+        } catch (t: Throwable) {
+            log(
+                "runtimeWarm: egl prepare failed; retrying direct pid=${Process.myPid()} runId=$runId " +
+                        "err=${t.javaClass.simpleName}",
+            )
+            val ok = repo.prepareRuntime(appContext, file, opts)
+            if (!ok) error("prepareRuntime returned false")
         }
     }
 
@@ -739,7 +1185,11 @@ class SLMWarmupEngine(
         val thread = eglThreadRef.getAndSet(null) ?: return
         runCatching { thread.close() }
             .onFailure { t ->
-                AppLog.w(TAG, "eglThread close failed: reason='${safeReasonForLogs(reason)}' err=${t.javaClass.simpleName}")
+                AppLog.w(
+                    TAG,
+                    "eglThread close failed: reason='${safeReasonForLogs(reason)}' " +
+                            "err=${t.javaClass.simpleName}",
+                )
             }
         log("eglThread closed: reason='${safeReasonForLogs(reason)}' pid=${Process.myPid()}")
     }
@@ -788,8 +1238,27 @@ class SLMWarmupEngine(
             )
     }
 
+    private fun setRuntimeWarmFailed(t: Throwable, nowMs: Long) {
+        val startedAt = startedAtForRuntime(_runtimeWarmState.value)
+        _runtimeWarmState.value =
+            WarmupController.RuntimeWarmState.Failed(
+                message = safeFailureMessage(t),
+                startedAtMs = startedAt,
+                elapsedMs = elapsedSince(startedAt, nowMs),
+            )
+    }
+
+    private fun setRuntimeWarmCancelled(nowMs: Long) {
+        val startedAt = startedAtForRuntime(_runtimeWarmState.value)
+        _runtimeWarmState.value =
+            WarmupController.RuntimeWarmState.Cancelled(
+                startedAtMs = startedAt,
+                elapsedMs = elapsedSince(startedAt, nowMs),
+            )
+    }
+
     /**
-     * Returns a failure message safe to surface in UI/state without leaking file paths or other sensitive data.
+     * Returns a failure message safe to surface in UI/state without leaking file paths.
      */
     private fun safeFailureMessage(t: Throwable): String {
         return when (t) {
@@ -819,6 +1288,17 @@ class SLMWarmupEngine(
         }
     }
 
+    private fun startedAtForRuntime(state: WarmupController.RuntimeWarmState): Long? {
+        return when (state) {
+            is WarmupController.RuntimeWarmState.WaitingForCompile -> state.requestedAtMs
+            is WarmupController.RuntimeWarmState.Warming -> state.startedAtMs
+            is WarmupController.RuntimeWarmState.Ready -> state.startedAtMs
+            is WarmupController.RuntimeWarmState.Failed -> state.startedAtMs
+            is WarmupController.RuntimeWarmState.Cancelled -> state.startedAtMs
+            else -> null
+        }
+    }
+
     private fun elapsedSince(startedAtMs: Long?, nowMs: Long): Long {
         return if (startedAtMs == null) 0L else (nowMs - startedAtMs).coerceAtLeast(0L)
     }
@@ -839,6 +1319,16 @@ class SLMWarmupEngine(
             is WarmupController.CompileState.Failed,
             is WarmupController.CompileState.Cancelled,
             is WarmupController.CompileState.SkippedNotReady -> true
+            else -> false
+        }
+    }
+
+    private fun isRuntimeTerminalOrSkipped(state: WarmupController.RuntimeWarmState): Boolean {
+        return when (state) {
+            is WarmupController.RuntimeWarmState.Ready,
+            is WarmupController.RuntimeWarmState.Failed,
+            is WarmupController.RuntimeWarmState.Cancelled,
+            is WarmupController.RuntimeWarmState.SkippedNotReady -> true
             else -> false
         }
     }
@@ -891,6 +1381,7 @@ class SLMWarmupEngine(
                     isDaemon = true
                 }
             }
+
         val background: CoroutineDispatcher = executor.asCoroutineDispatcher()
     }
 
@@ -928,16 +1419,15 @@ class SLMWarmupEngine(
                 }
 
                 try {
-                    // Best-effort bind to OpenGL ES API.
                     runCatching { EGL14.eglBindAPI(EGL14.EGL_OPENGL_ES_API) }
-
                     stateRef.set(createEglState(preferredGlesVersion))
                 } catch (t: Throwable) {
                     stateRef.set(null)
                     if (loggedInitFailure.compareAndSet(false, true)) {
                         AppLog.w(
                             TAG,
-                            "EGL init failed (will run without current context): preferredGles=$preferredGlesVersion err=${t.javaClass.simpleName}",
+                            "EGL init failed (will run without current context): " +
+                                    "preferredGles=$preferredGlesVersion err=${t.javaClass.simpleName}",
                         )
                     }
                 } finally {
@@ -950,7 +1440,7 @@ class SLMWarmupEngine(
          * Runs [block] on the EGL thread after initialization completes.
          *
          * NOTE:
-         * - initGate.await() is performed inside the dispatcher context to avoid leaving awaits on caller threads.
+         * - initGate.await() is performed inside the dispatcher context.
          */
         suspend fun withEglContext(block: suspend () -> Unit) {
             withContext(dispatcher) {
@@ -967,7 +1457,11 @@ class SLMWarmupEngine(
 
                 if (!EGL14.eglMakeCurrent(st.display, st.surface, st.surface, st.context)) {
                     if (loggedNoContext.compareAndSet(false, true)) {
-                        AppLog.w(TAG, "eglMakeCurrent failed: err=${eglErrorString()}; running without current context")
+                        AppLog.w(
+                            TAG,
+                            "eglMakeCurrent failed: err=${eglErrorString()}; " +
+                                    "running without current context",
+                        )
                     }
                     block()
                     return@withContext
@@ -976,7 +1470,6 @@ class SLMWarmupEngine(
                 try {
                     block()
                 } finally {
-                    // Best effort: release current context.
                     runCatching {
                         EGL14.eglMakeCurrent(
                             st.display,
@@ -990,15 +1483,15 @@ class SLMWarmupEngine(
         }
 
         override fun close() {
-            // Run EGL cleanup on the owner thread.
             executor.execute {
                 runCatching { stateRef.getAndSet(null)?.close() }
             }
 
             executor.shutdown()
             val terminated =
-                runCatching { executor.awaitTermination(CLOSE_AWAIT_TERMINATION_MS, TimeUnit.MILLISECONDS) }
-                    .getOrDefault(false)
+                runCatching {
+                    executor.awaitTermination(CLOSE_AWAIT_TERMINATION_MS, TimeUnit.MILLISECONDS)
+                }.getOrDefault(false)
 
             if (!terminated) {
                 executor.shutdownNow()
@@ -1035,7 +1528,9 @@ class SLMWarmupEngine(
 
             try {
                 display = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
-                check(display != EGL14.EGL_NO_DISPLAY) { "eglGetDisplay failed: err=${eglErrorString()}" }
+                check(display != EGL14.EGL_NO_DISPLAY) {
+                    "eglGetDisplay failed: err=${eglErrorString()}"
+                }
 
                 val version = IntArray(2)
                 check(EGL14.eglInitialize(display, version, 0, version, 1)) {
@@ -1046,8 +1541,12 @@ class SLMWarmupEngine(
                 surface = createPbufferSurface(display, config)
                 context = createContext(display, config, preferred)
 
-                check(context != EGL14.EGL_NO_CONTEXT) { "eglCreateContext failed: err=${eglErrorString()}" }
-                check(surface != EGL14.EGL_NO_SURFACE) { "eglCreatePbufferSurface failed: err=${eglErrorString()}" }
+                check(context != EGL14.EGL_NO_CONTEXT) {
+                    "eglCreateContext failed: err=${eglErrorString()}"
+                }
+                check(surface != EGL14.EGL_NO_SURFACE) {
+                    "eglCreatePbufferSurface failed: err=${eglErrorString()}"
+                }
 
                 return EglState(display = display, config = config, surface = surface, context = context)
             } catch (t: Throwable) {
@@ -1064,8 +1563,6 @@ class SLMWarmupEngine(
 
         /**
          * Chooses an EGLConfig with ES3 -> ES2 fallback.
-         *
-         * Some devices/drivers fail eglChooseConfig with ES3 bits even though ES2 works.
          */
         private fun chooseConfigWithFallback(display: EGLDisplay, preferred: Int): EGLConfig {
             if (preferred >= 3) {
@@ -1075,7 +1572,8 @@ class SLMWarmupEngine(
             val es2 = runCatching { chooseConfig(display, EGL14.EGL_OPENGL_ES2_BIT) }.getOrNull()
             if (es2 != null) return es2
 
-            val renderable = if (preferred >= 3) EGL_OPENGL_ES3_BIT_KHR else EGL14.EGL_OPENGL_ES2_BIT
+            val renderable =
+                if (preferred >= 3) EGL_OPENGL_ES3_BIT_KHR else EGL14.EGL_OPENGL_ES2_BIT
             return chooseConfig(display, renderable)
         }
 
@@ -1113,7 +1611,11 @@ class SLMWarmupEngine(
             return EGL14.eglCreatePbufferSurface(display, config, attribs, 0)
         }
 
-        private fun createContext(display: EGLDisplay, config: EGLConfig, preferred: Int): EGLContext {
+        private fun createContext(
+            display: EGLDisplay,
+            config: EGLConfig,
+            preferred: Int,
+        ): EGLContext {
             var ctx = eglCreateContext(display, config, preferred)
             if (ctx != EGL14.EGL_NO_CONTEXT) return ctx
 
@@ -1123,7 +1625,11 @@ class SLMWarmupEngine(
             return ctx
         }
 
-        private fun eglCreateContext(display: EGLDisplay, config: EGLConfig, version: Int): EGLContext {
+        private fun eglCreateContext(
+            display: EGLDisplay,
+            config: EGLConfig,
+            version: Int,
+        ): EGLContext {
             val attribs =
                 intArrayOf(
                     EGL14.EGL_CONTEXT_CLIENT_VERSION, version,
@@ -1160,11 +1666,15 @@ class SLMWarmupEngine(
             const val AUTO_COMPILE_POLL_INTERVAL_MS: Long = 250L
             const val COMPILE_AFTER_PREFETCH_MAX_WAIT_MS: Long = 15_000L
 
+            const val RUNTIME_EMIT_INTERVAL_MS: Long = 250L
+            const val AUTO_RUNTIME_DELAY_MS: Long = 80L
+            const val AUTO_RUNTIME_POLL_INTERVAL_MS: Long = 250L
+            const val RUNTIME_AFTER_COMPILE_MAX_WAIT_MS: Long = 120_000L
+            const val RUNTIME_WAIT_FOR_COMPILE_TIMEOUT_MS: Long = 120_000L
+            const val RUNTIME_PREPARE_TIMEOUT_MS: Long = 120_000L
+
             /**
-             * Hard timeout for repository warmup (including EGL warmup).
-             *
-             * Rationale:
-             * - Protect against native/driver hangs.
+             * Hard timeout for repository compile warmup (including EGL warmup).
              */
             const val INITIALIZE_TIMEOUT_MS: Long = 120_000L
         }
