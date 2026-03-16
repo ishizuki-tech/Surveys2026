@@ -128,17 +128,24 @@ object SurveyStartScreen {
                     val state by warmupController.compileState.collectAsStateWithLifecycle()
                     state
                 } else {
-                    WarmupController.CompileState.SkippedNotReady(reason = "WarmupNotRequired")
+                    WarmupController.CompileState.SkippedNotReady(reason = "WarmupControllerMissing")
                 }
 
             val latestCompileState by rememberUpdatedState(compileState)
 
             val effectiveWarmupReady =
-                remember(requireWarmup, warmupSatisfiedHint, compileState) {
-                    isWarmupReady(
+                isWarmupReady(
+                    requireWarmup = requireWarmup,
+                    warmupSatisfiedHint = warmupSatisfiedHint,
+                    state = compileState,
+                )
+
+            val compileLogKey =
+                remember(compileState, requireWarmup, warmupSatisfiedHint) {
+                    buildCompileLogKey(
+                        state = compileState,
                         requireWarmup = requireWarmup,
                         warmupSatisfiedHint = warmupSatisfiedHint,
-                        state = compileState,
                     )
                 }
 
@@ -231,19 +238,30 @@ object SurveyStartScreen {
                     }
             }
 
-            LaunchedEffect(compileState, requireWarmup, warmupSatisfiedHint, effectiveWarmupReady) {
-                SafeLog.d(
-                    TAG,
-                    "compileState: ${compileState.javaClass.simpleName} " +
-                            "requireWarmup=$requireWarmup hint=$warmupSatisfiedHint " +
-                            "effectiveReady=$effectiveWarmupReady elapsedMs=${compileState.elapsedMs}",
-                )
+            /**
+             * Log only on meaningful state transitions.
+             *
+             * Why:
+             * - CompileState may update elapsedMs frequently while compiling.
+             * - Logging on every object change causes noisy release logs.
+             */
+            LaunchedEffect(compileLogKey) {
+                SafeLog.d(TAG, compileLogKey)
             }
 
-            LaunchedEffect(Unit, requireWarmup, warmupSatisfiedHint) {
+            /**
+             * Request compile once after the screen is visible when:
+             * - warmup is required
+             * - readiness hint is not already satisfied
+             * - a controller is available
+             *
+             * Keys include [warmupController] so the effect can rerun when the controller
+             * becomes available after an earlier composition.
+             */
+            LaunchedEffect(warmupController, requireWarmup, warmupSatisfiedHint) {
                 SafeLog.d(
                     TAG,
-                    "composed requireWarmup=$requireWarmup warmupSatisfiedHint=$warmupSatisfiedHint",
+                    "composed requireWarmup=$requireWarmup warmupSatisfiedHint=$warmupSatisfiedHint controllerPresent=${warmupController != null}",
                 )
 
                 if (!requireWarmup) return@LaunchedEffect
@@ -482,7 +500,7 @@ object SurveyStartScreen {
                     compileState is WarmupController.CompileState.Compiling -> "Compiling…"
                     compileState is WarmupController.CompileState.Compiled -> "Compiled"
                     compileState is WarmupController.CompileState.Cancelled -> "Cancelled"
-                    compileState is WarmupController.CompileState.SkippedNotReady -> "Not configured"
+                    compileState is WarmupController.CompileState.SkippedNotReady -> "Warmup not ready"
                     compileState is WarmupController.CompileState.Failed -> {
                         val msg = compileState.message.replace('\n', ' ').take(FAILED_MSG_MAX)
                         "Failed: $msg"
@@ -496,7 +514,8 @@ object SurveyStartScreen {
                 Text("$label  (elapsed=${elapsed}ms)")
                 if (
                     compileState is WarmupController.CompileState.Failed ||
-                    compileState is WarmupController.CompileState.Cancelled
+                    compileState is WarmupController.CompileState.Cancelled ||
+                    compileState is WarmupController.CompileState.SkippedNotReady
                 ) {
                     OutlinedButton(
                         onClick = onRetry,
@@ -514,8 +533,8 @@ object SurveyStartScreen {
          * Policy:
          * - If warmup is not required, proceed.
          * - Caller-provided readiness hint wins.
-         * - Compiled means ready.
-         * - SkippedNotReady is treated as ready to avoid hard-blocking UI on missing wiring.
+         * - Only an observed Compiled state counts as process-local readiness.
+         * - SkippedNotReady is NOT treated as ready when warmup is required.
          */
         private fun isWarmupReady(
             requireWarmup: Boolean,
@@ -526,10 +545,37 @@ object SurveyStartScreen {
             if (warmupSatisfiedHint) return true
 
             return when (state) {
-                is WarmupController.CompileState.Compiled,
-                is WarmupController.CompileState.SkippedNotReady -> true
+                is WarmupController.CompileState.Compiled -> true
                 else -> false
             }
+        }
+
+        /**
+         * Builds a coarse-grained log key to avoid logging on every elapsedMs tick.
+         */
+        private fun buildCompileLogKey(
+            state: WarmupController.CompileState,
+            requireWarmup: Boolean,
+            warmupSatisfiedHint: Boolean,
+        ): String {
+            val stateLabel =
+                when (state) {
+                    is WarmupController.CompileState.Idle -> "Idle"
+                    is WarmupController.CompileState.WaitingForPrefetch -> "WaitingForPrefetch"
+                    is WarmupController.CompileState.Compiling -> "Compiling"
+                    is WarmupController.CompileState.Compiled -> "Compiled"
+                    is WarmupController.CompileState.Cancelled -> "Cancelled"
+                    is WarmupController.CompileState.SkippedNotReady -> {
+                        val reason = state.reason.take(48)
+                        "SkippedNotReady:$reason"
+                    }
+                    is WarmupController.CompileState.Failed -> {
+                        val msg = state.message.replace('\n', ' ').take(48)
+                        "Failed:$msg"
+                    }
+                }
+
+            return "compileState=$stateLabel requireWarmup=$requireWarmup hint=$warmupSatisfiedHint"
         }
     }
 }

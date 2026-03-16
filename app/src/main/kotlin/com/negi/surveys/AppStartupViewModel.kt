@@ -50,10 +50,14 @@ import kotlinx.coroutines.launch
  * - Local model warmup wiring policy
  *
  * Important policy:
- * - Persisted compile stamps are allowed to influence scheduling decisions.
- * - Persisted compile stamps must NOT directly mark the current process as warmup-ready.
- * - The UI-facing warmup satisfied hint is process-local and is granted only after
- *   this process observes an actual terminal compiled state.
+ * - Persisted compile stamps may influence startup/UI readiness decisions.
+ * - Persisted compile stamps do NOT mutate the process-local compile state.
+ * - The UI-facing warmup satisfied hint may be granted from a reusable compile
+ *   stamp when the current model fingerprint matches.
+ * - A process-local compiled state still remains the strongest signal and always
+ *   upgrades the UI-facing hint to true.
+ * - Reusable compile acceptance may trigger a non-blocking background compile
+ *   refresh so strict question gates can observe a real process-local compiled state.
  * - servicesReady means "startup services exist and can be used by the UI shell".
  *   It does NOT mean compile warmup has already completed in this process.
  */
@@ -68,6 +72,17 @@ class AppStartupViewModel(
     private val startupGeneration = AtomicLong(0L)
     private val lastWarmupReadyFingerprint =
         AtomicReference<StartupModelWiring.ModelReadyFingerprint?>(null)
+
+    /**
+     * Guards duplicate background compile refresh requests within the same active startup epoch.
+     *
+     * Notes:
+     * - Reset on full startup restart and explicit retry reset paths.
+     * - Best-effort only; the WarmupController is still the ultimate source of truth.
+     */
+    private val backgroundCompileRefreshRequested = AtomicBoolean(false)
+    private val pendingPreparedConfigRef =
+        AtomicReference<StartupCoordinator.StartupPreparedConfig?>(null)
 
     private val modelWiring = StartupModelWiring(app)
     private val startupCoordinator = StartupCoordinator(app)
@@ -103,6 +118,7 @@ class AppStartupViewModel(
         val generation = currentGeneration()
         viewModelScope.launch(Dispatchers.Default) {
             delay(STARTUP_AFTER_FIRST_FRAME_DELAY_MS)
+            activatePendingPreparedServicesIfNeeded(generation = generation)
             tryStartStartup(
                 reason = "firstFrame",
                 expectedGeneration = generation,
@@ -133,7 +149,10 @@ class AppStartupViewModel(
 
         if (needsPipelineRestart) {
             SafeLog.w(TAG, "RetryAll: restart startup pipeline from=$from")
-            startStartupPipeline(reason = "retry:$from")
+            restartStartupPipelineFromRoot(
+                reason = "retry:$from",
+                clearWarmupInputs = shouldClearWarmupInputsForFullRebuild(snapshot),
+            )
             return
         }
 
@@ -159,6 +178,7 @@ class AppStartupViewModel(
              * - Without clearing this fingerprint, onModelReady() can be skipped.
              */
             lastWarmupReadyFingerprint.set(null)
+            backgroundCompileRefreshRequested.set(false)
 
             runCatching {
                 modelWiring.clearCompileSuccessStamp()
@@ -215,22 +235,12 @@ class AppStartupViewModel(
                             lastReadyFingerprintRef = lastWarmupReadyFingerprint,
                         )
 
-                    updateUiIfCurrent(generation) { state ->
-                        state.copy(
-                            warmupSatisfiedHint = warmupHintAfterOutcome(
-                                outcome = outcome,
-                                currentHint = state.warmupSatisfiedHint,
-                                currentCompileState = state.compileState,
-                            ),
-                        )
-                    }
-
-                    if (!isProcessLocalWarmupSatisfied(_uiState.value.compileState)) {
-                        SafeLog.i(
-                            TAG,
-                            "RetryAll: local-only wiring completed but process-local compile is still pending",
-                        )
-                    }
+                    applyModelReadyOutcome(
+                        generation = generation,
+                        warmup = warmup,
+                        outcome = outcome,
+                        logPrefix = "RetryAll",
+                    )
 
                     return@launch
                 }
@@ -267,6 +277,8 @@ class AppStartupViewModel(
             }
 
             if (warmup != null && isGenerationCurrent(generation)) {
+                backgroundCompileRefreshRequested.set(false)
+
                 runCatching { warmup.resetForRetry(reason = "uiRetry") }
                     .onFailure { t ->
                         SafeLog.e(
@@ -312,7 +324,9 @@ class AppStartupViewModel(
         startupPipelineJob?.cancel()
         serviceCollectorsJob?.cancel()
         startupRequested.set(false)
+        pendingPreparedConfigRef.set(null)
         lastWarmupReadyFingerprint.set(null)
+        backgroundCompileRefreshRequested.set(false)
 
         updateUiIfCurrent(generation) {
             it.copy(
@@ -361,10 +375,18 @@ class AppStartupViewModel(
                         )
                     }
 
-                    activatePreparedServices(
-                        prepared = prepared,
-                        generation = generation,
-                    )
+                    if (firstFrameSeen.get()) {
+                        activatePreparedServices(
+                            prepared = prepared,
+                            generation = generation,
+                        )
+                    } else {
+                        pendingPreparedConfigRef.set(prepared)
+                        SafeLog.i(
+                            TAG,
+                            "Startup: prepared config deferred until first frame generation=$generation source=${prepared.startupModelSource}",
+                        )
+                    }
                 }
             }
         }
@@ -381,8 +403,9 @@ class AppStartupViewModel(
 
         startupRequested.set(false)
         lastWarmupReadyFingerprint.set(null)
+        backgroundCompileRefreshRequested.set(false)
 
-        val services =
+        val buildResult =
             startupCoordinator.buildServices(
                 repoMode = prepared.repoMode,
                 modelSpec = prepared.modelSpec,
@@ -391,16 +414,20 @@ class AppStartupViewModel(
 
         if (!isGenerationCurrent(generation)) return
 
-        if (services == null) {
-            failStartup(
-                safeReason = "ServiceInitFailed",
-                repoMode = prepared.repoMode,
-                modelSpec = prepared.modelSpec,
-                modelSpecKey = prepared.modelSpecKey,
-                generation = generation,
-            )
-            return
-        }
+        val services =
+            when (buildResult) {
+                is StartupCoordinator.StartupBuildServicesResult.Ready -> buildResult.services
+                is StartupCoordinator.StartupBuildServicesResult.Failed -> {
+                    failStartup(
+                        safeReason = buildResult.safeReason,
+                        repoMode = prepared.repoMode,
+                        modelSpec = prepared.modelSpec,
+                        modelSpecKey = prepared.modelSpecKey,
+                        generation = generation,
+                    )
+                    return
+                }
+            }
 
         SafeLog.i(
             TAG,
@@ -452,27 +479,40 @@ class AppStartupViewModel(
                     lastReadyFingerprintRef = lastWarmupReadyFingerprint,
                 )
 
-            updateUiIfCurrent(generation) { state ->
-                state.copy(
-                    warmupSatisfiedHint = warmupHintAfterOutcome(
-                        outcome = outcome,
-                        currentHint = state.warmupSatisfiedHint,
-                        currentCompileState = state.compileState,
-                    ),
-                )
-            }
-
-            if (!isProcessLocalWarmupSatisfied(_uiState.value.compileState)) {
-                SafeLog.i(
-                    TAG,
-                    "Services: local model wired; waiting for a process-local compiled state",
-                )
-            }
+            applyModelReadyOutcome(
+                generation = generation,
+                warmup = services.warmup,
+                outcome = outcome,
+                logPrefix = "Services",
+            )
         }
 
         tryStartStartup(
             reason = "servicesReady",
             expectedGeneration = generation,
+        )
+    }
+
+    /**
+     * Activates a prepared startup config that was intentionally deferred until the first frame.
+     */
+    private suspend fun activatePendingPreparedServicesIfNeeded(
+        generation: Long,
+    ) {
+        if (!firstFrameSeen.get()) return
+        if (!isGenerationCurrent(generation)) return
+
+        val prepared = pendingPreparedConfigRef.getAndSet(null) ?: return
+        if (!isGenerationCurrent(generation)) return
+
+        SafeLog.i(
+            TAG,
+            "Startup: activating deferred services generation=$generation source=${prepared.startupModelSource}",
+        )
+
+        activatePreparedServices(
+            prepared = prepared,
+            generation = generation,
         )
     }
 
@@ -506,15 +546,12 @@ class AppStartupViewModel(
                                         lastReadyFingerprintRef = lastWarmupReadyFingerprint,
                                     )
 
-                                updateUiIfCurrent(generation) { state ->
-                                    state.copy(
-                                        warmupSatisfiedHint = warmupHintAfterOutcome(
-                                            outcome = outcome,
-                                            currentHint = state.warmupSatisfiedHint,
-                                            currentCompileState = state.compileState,
-                                        ),
-                                    )
-                                }
+                                applyModelReadyOutcome(
+                                    generation = generation,
+                                    warmup = warmup,
+                                    outcome = outcome,
+                                    logPrefix = "ModelReady",
+                                )
                             }
                         }
                     } catch (t: Throwable) {
@@ -576,7 +613,13 @@ class AppStartupViewModel(
                             )
                         }
 
+                        /**
+                         * Once we observe a terminal compiled state in this process,
+                         * no additional background refresh request is needed for the current epoch.
+                         */
                         if (compileState is WarmupController.CompileState.Compiled) {
+                            backgroundCompileRefreshRequested.set(false)
+
                             val stampFile = resolveCurrentModelFileForStamp(_uiState.value)
                             if (stampFile != null) {
                                 runCatching {
@@ -590,6 +633,15 @@ class AppStartupViewModel(
                                     )
                                 }
                             }
+                        } else if (
+                            compileState is WarmupController.CompileState.Failed ||
+                            compileState is WarmupController.CompileState.Cancelled ||
+                            compileState is WarmupController.CompileState.SkippedNotReady
+                        ) {
+                            /**
+                             * Allow future best-effort background refresh attempts after a terminal non-ready state.
+                             */
+                            backgroundCompileRefreshRequested.set(false)
                         }
                     }
                 } catch (t: Throwable) {
@@ -667,6 +719,16 @@ class AppStartupViewModel(
             TAG,
             "Services: collector failed reason=${sanitizeLabel(safeReason)} type=${t::class.java.simpleName} generation=$generation",
         )
+
+        serviceCollectorsJob?.cancel()
+        AppProcessServices.clearStartupGraphForRebuild(
+            reason = safeReason,
+            clearWarmupInputs = shouldClearWarmupInputsForCollectorFailure(repoMode),
+            clearDownloader = true,
+            clearRepository = true,
+            clearWarmup = true,
+        )
+
         failStartup(
             safeReason = safeReason,
             repoMode = repoMode,
@@ -681,7 +743,7 @@ class AppStartupViewModel(
      *
      * Notes:
      * - The reason must never contain exception.message.
-     * - Existing process-scoped singletons are left intact; only root orchestration state is reset.
+     * - Process-scoped graph destruction is decided by the caller before entering this UI reset path.
      */
     private fun failStartup(
         safeReason: String,
@@ -693,7 +755,9 @@ class AppStartupViewModel(
         if (!isGenerationCurrent(generation)) return
 
         startupRequested.set(false)
+        pendingPreparedConfigRef.set(null)
         lastWarmupReadyFingerprint.set(null)
+        backgroundCompileRefreshRequested.set(false)
 
         updateUiIfCurrent(generation) {
             it.copy(
@@ -714,6 +778,164 @@ class AppStartupViewModel(
         }
 
         serviceCollectorsJob?.cancel()
+    }
+
+    /**
+     * Applies a model-ready outcome to UI state and logs the resulting semantic branch.
+     *
+     * Rules:
+     * - CompileSatisfied grants the UI-facing warmup hint immediately.
+     * - CompileSatisfied also requests a non-blocking background compile refresh
+     *   when the current process still lacks a compiled runtime.
+     * - CompileScheduled keeps the hint false until this process observes Compiled.
+     * - AlreadyHandled / NotHandled preserve the current hint unless compile is
+     *   already known to be satisfied in this process.
+     */
+    private fun applyModelReadyOutcome(
+        generation: Long,
+        warmup: WarmupController?,
+        outcome: StartupModelWiring.ModelReadyOutcome,
+        logPrefix: String,
+    ) {
+        if (!isGenerationCurrent(generation)) return
+
+        updateUiIfCurrent(generation) { state ->
+            state.copy(
+                warmupSatisfiedHint = warmupHintAfterOutcome(
+                    outcome = outcome,
+                    currentHint = state.warmupSatisfiedHint,
+                    currentCompileState = state.compileState,
+                ),
+            )
+        }
+
+        when (outcome) {
+            StartupModelWiring.ModelReadyOutcome.NotHandled -> {
+                SafeLog.w(TAG, "$logPrefix: model ready wiring not handled")
+            }
+
+            StartupModelWiring.ModelReadyOutcome.AlreadyHandled -> {
+                SafeLog.i(TAG, "$logPrefix: model ready wiring already handled")
+            }
+
+            StartupModelWiring.ModelReadyOutcome.CompileSatisfied -> {
+                val requested =
+                    requestBackgroundCompileRefreshIfNeeded(
+                        generation = generation,
+                        warmup = warmup,
+                        reason = "${sanitizeLabel(logPrefix)}:reusableStampRefresh",
+                    )
+
+                if (requested) {
+                    SafeLog.i(
+                        TAG,
+                        "$logPrefix: reusable compile stamp accepted; warmup hint granted and background compile refresh requested",
+                    )
+                } else {
+                    SafeLog.i(
+                        TAG,
+                        "$logPrefix: reusable compile stamp accepted; warmup hint granted",
+                    )
+                }
+            }
+
+            StartupModelWiring.ModelReadyOutcome.CompileScheduled -> {
+                SafeLog.i(
+                    TAG,
+                    "$logPrefix: compile scheduled after model-ready wiring; waiting for process-local compiled state",
+                )
+            }
+        }
+    }
+
+    private fun restartStartupPipelineFromRoot(
+        reason: String,
+        clearWarmupInputs: Boolean,
+    ) {
+        val safeReason = sanitizeLabel(reason)
+        serviceCollectorsJob?.cancel()
+        AppProcessServices.clearStartupGraphForRebuild(
+            reason = safeReason,
+            clearWarmupInputs = clearWarmupInputs,
+            clearDownloader = true,
+            clearRepository = true,
+            clearWarmup = true,
+        )
+        startStartupPipeline(reason = safeReason)
+    }
+
+    private fun shouldClearWarmupInputsForFullRebuild(
+        state: AppStartupUiState,
+    ): Boolean {
+        if (state.repoMode != AppProcessServices.RepoMode.ON_DEVICE) return true
+        return state.configState is StartupConfigState.Failed
+    }
+
+    private fun shouldClearWarmupInputsForCollectorFailure(
+        repoMode: AppProcessServices.RepoMode,
+    ): Boolean {
+        return repoMode != AppProcessServices.RepoMode.ON_DEVICE
+    }
+
+    /**
+     * Requests a best-effort non-blocking compile refresh when strict gates still
+     * need a process-local compiled state.
+     *
+     * Returns:
+     * - true when a background refresh request was launched
+     * - false when no request was needed or it was already requested
+     */
+    private fun requestBackgroundCompileRefreshIfNeeded(
+        generation: Long,
+        warmup: WarmupController?,
+        reason: String,
+    ): Boolean {
+        if (!isGenerationCurrent(generation)) return false
+
+        val controller = warmup ?: return false
+        val currentState = controller.compileState.value
+
+        if (!shouldRequestBackgroundCompileRefresh(currentState)) {
+            return false
+        }
+
+        if (!backgroundCompileRefreshRequested.compareAndSet(false, true)) {
+            return false
+        }
+
+        viewModelScope.launch(Dispatchers.IO) {
+            if (!isGenerationCurrent(generation)) {
+                backgroundCompileRefreshRequested.set(false)
+                return@launch
+            }
+
+            runCatching {
+                controller.requestCompileAfterPrefetch(reason = sanitizeLabel(reason))
+            }.onFailure { t ->
+                backgroundCompileRefreshRequested.set(false)
+                SafeLog.w(
+                    TAG,
+                    "Warmup: background compile refresh request failed (non-fatal) type=${t::class.java.simpleName}",
+                )
+            }
+        }
+
+        return true
+    }
+
+    /**
+     * Returns true when a background compile refresh is still useful for strict gates.
+     */
+    private fun shouldRequestBackgroundCompileRefresh(
+        compileState: WarmupController.CompileState,
+    ): Boolean {
+        return when (compileState) {
+            is WarmupController.CompileState.Compiled,
+            is WarmupController.CompileState.WaitingForPrefetch,
+            is WarmupController.CompileState.Compiling -> false
+
+            else -> true
+        }
     }
 
     /**
@@ -764,11 +986,15 @@ class AppStartupViewModel(
      * Resolves the UI-facing warmup satisfied hint after model-ready handling.
      *
      * Rules:
-     * - Only a process-local compiled state can grant the hint.
-     * - CompileSatisfied from persisted state must NOT directly grant the hint.
-     * - CompileScheduled keeps the hint false.
+     * - A process-local compiled state always grants the hint.
+     * - CompileSatisfied from persisted state also grants the hint.
+     * - CompileScheduled keeps the hint false until this process reaches Compiled.
      * - AlreadyHandled / NotHandled preserve the current hint unless compile is
      *   already known to be satisfied in this process.
+     *
+     * Notes:
+     * - This hint is for UI gating such as SurveyStart.
+     * - Strict question entry may still wait for a real process-local Compiled state.
      */
     private fun warmupHintAfterOutcome(
         outcome: StartupModelWiring.ModelReadyOutcome,
@@ -781,7 +1007,7 @@ class AppStartupViewModel(
         return when (outcome) {
             StartupModelWiring.ModelReadyOutcome.NotHandled -> currentHint
             StartupModelWiring.ModelReadyOutcome.AlreadyHandled -> currentHint
-            StartupModelWiring.ModelReadyOutcome.CompileSatisfied -> currentHint
+            StartupModelWiring.ModelReadyOutcome.CompileSatisfied -> true
             StartupModelWiring.ModelReadyOutcome.CompileScheduled -> false
         }
     }

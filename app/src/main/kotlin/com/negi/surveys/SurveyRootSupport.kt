@@ -168,13 +168,15 @@ internal fun SlmGateScreen(
     onBack: () -> Unit,
     onRetryAll: () -> Unit,
 ) {
+    val modelReady = SurveyRootSupportUiSupport.isModelReady(modelState)
+    val compileReady = SurveyRootSupportUiSupport.isCompileReady(compileState)
     val prefetchInProgress = SurveyRootSupportUiSupport.isPrefetchInProgress(prefetchState)
     val compileInProgress = SurveyRootSupportUiSupport.isCompileInProgress(compileState)
     val modelInProgress = SurveyRootSupportUiSupport.isModelInProgress(modelState)
 
     val nowMs = SurveyRootSupportUiSupport.rememberWarmupUiNowMs(
         inProgress = modelInProgress || prefetchInProgress || compileInProgress,
-        tickIntervalMs = 50L,
+        tickIntervalMs = 250L,
     )
 
     val prefetchElapsedMs = SurveyRootSupportUiSupport.rememberDynamicElapsedMs(
@@ -192,11 +194,13 @@ internal fun SlmGateScreen(
         modelState,
         prefetchState,
         compileState,
+        modelReady,
+        compileReady,
         prefetchElapsedMs,
         compileElapsedMs,
     ) {
         when {
-            modelState !is ModelDownloadController.ModelState.Ready ->
+            !modelReady ->
                 SurveyRootSupportUiSupport.modelLabelForUi(modelState)
 
             prefetchInProgress ->
@@ -206,7 +210,7 @@ internal fun SlmGateScreen(
                     format = WARMUP_UI_FORMAT_GATE,
                 )
 
-            compileInProgress ->
+            !compileReady ->
                 SurveyRootSupportUiSupport.compileLabelForUi(
                     state = compileState,
                     elapsedMs = compileElapsedMs,
@@ -221,7 +225,8 @@ internal fun SlmGateScreen(
         modelState is ModelDownloadController.ModelState.Failed ||
                 modelState is ModelDownloadController.ModelState.Cancelled ||
                 compileState is WarmupController.CompileState.Failed ||
-                compileState is WarmupController.CompileState.Cancelled
+                compileState is WarmupController.CompileState.Cancelled ||
+                compileState is WarmupController.CompileState.SkippedNotReady
     }
 
     Surface(
@@ -255,7 +260,7 @@ internal fun SlmGateScreen(
 
             Spacer(modifier = Modifier.height(18.dp))
 
-            val hint = remember(modelState, compileState) {
+            val hint = remember(modelState, prefetchState, compileState, modelReady, compileReady) {
                 when (modelState) {
                     is ModelDownloadController.ModelState.Downloading ->
                         "Downloading the model file. Keep the app open (first run may take a while)."
@@ -267,7 +272,7 @@ internal fun SlmGateScreen(
                         "Model URL is not configured in SurveyConfig."
 
                     is ModelDownloadController.ModelState.Failed ->
-                        "Download failed. Check connectivity / credentials / configuration."
+                        "Download failed. Check connectivity, credentials, or configuration."
 
                     is ModelDownloadController.ModelState.Cancelled ->
                         "Download cancelled."
@@ -277,13 +282,23 @@ internal fun SlmGateScreen(
                             "Waiting for prefetch to complete before compilation."
 
                         is WarmupController.CompileState.Compiling ->
-                            "Compiling/initializing the model. UI may stutter briefly."
+                            "Compiling and initializing the model. This can take a while."
+
+                        is WarmupController.CompileState.Idle ->
+                            if (!compileReady) {
+                                "Preparing the model runtime before entering the question flow."
+                            } else {
+                                ""
+                            }
 
                         is WarmupController.CompileState.Failed ->
-                            "Warmup compile failed. Try retry."
+                            "Warmup compile failed. Retry to rebuild the model runtime."
 
                         is WarmupController.CompileState.Cancelled ->
-                            "Warmup compile cancelled. Try retry."
+                            "Warmup compile was cancelled. Retry to continue."
+
+                        is WarmupController.CompileState.SkippedNotReady ->
+                            "Warmup inputs are not ready yet. Retry or go back."
 
                         else -> ""
                     }
@@ -412,14 +427,21 @@ private object SurveyRootSupportUiSupport {
         prefetchState: WarmupController.PrefetchState,
         compileState: WarmupController.CompileState,
     ): Boolean {
-        val modelBlocking = modelState !is ModelDownloadController.ModelState.Ready
-        val prefetchBusy = isPrefetchInProgress(prefetchState)
-        val compileBusy = isCompileInProgress(compileState)
+        val modelReady = isModelReady(modelState)
+        val compileReady = isCompileReady(compileState)
 
         return when (policy) {
-            GatePolicy.MODEL_ONLY -> modelBlocking
-            GatePolicy.MODEL_PREFETCH_COMPILE -> modelBlocking || prefetchBusy || compileBusy
+            GatePolicy.MODEL_ONLY -> !modelReady
+            GatePolicy.MODEL_PREFETCH_COMPILE -> !modelReady || !compileReady
         }
+    }
+
+    fun isModelReady(state: ModelDownloadController.ModelState): Boolean {
+        return state is ModelDownloadController.ModelState.Ready
+    }
+
+    fun isCompileReady(state: WarmupController.CompileState): Boolean {
+        return state is WarmupController.CompileState.Compiled
     }
 
     fun isPrefetchInProgress(state: WarmupController.PrefetchState): Boolean {
@@ -486,8 +508,25 @@ private object SurveyRootSupportUiSupport {
             is WarmupController.CompileState.Compiling ->
                 "${format.compileCompilingPrefix} $elapsed"
 
-            is WarmupController.CompileState.Idle -> format.idleLabel
-            else -> "${state.javaClass.simpleName} $elapsed"
+            is WarmupController.CompileState.Idle ->
+                format.idleLabel
+
+            is WarmupController.CompileState.Compiled ->
+                "Compiled ${elapsed}"
+
+            is WarmupController.CompileState.Cancelled ->
+                "Cancelled ${elapsed}"
+
+            is WarmupController.CompileState.Failed -> {
+                val msg = state.message.replace('\n', ' ').take(80)
+                "Failed ${elapsed}: $msg"
+            }
+
+            is WarmupController.CompileState.SkippedNotReady -> {
+                val reason = state.reason.replace('\n', ' ').take(80)
+                "Not ready ${elapsed}: $reason"
+            }
+
         }
     }
 

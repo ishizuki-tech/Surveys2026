@@ -58,6 +58,7 @@ object AppProcessServices {
     private const val TAG = "AppProcessServices"
     private const val FORCE_FAKE_REPO: Boolean = false
     private const val TAG_WARMUP_LOG = "WarmupController"
+    private const val MODEL_DIR_NAME = "models"
 
     enum class RepoMode {
         ON_DEVICE,
@@ -97,6 +98,10 @@ object AppProcessServices {
      * - Explicit [spec].fileName when provided
      * - Installed config resolved model spec file name
      * - Installed config modelDefaults.defaultFileName
+     *
+     * Root order:
+     * - Preferred no-backup model root
+     * - Legacy filesDir root (migration compatibility)
      *
      * Notes:
      * - Never scans arbitrary files.
@@ -165,19 +170,79 @@ object AppProcessServices {
     }
 
     /**
-     * Returns the repository-supported app-private roots for configured model files.
+     * Returns the preferred app-private root for model artifacts.
+     *
+     * Contract:
+     * - Preferred storage is no-backup app storage under a dedicated "models" directory.
+     * - The directory is created on demand.
      *
      * Notes:
-     * - Keep this aligned with the runtime repository path contract.
-     * - Avoid probing alternate directories that the repository cannot open later.
+     * - Returns null when the preferred root cannot be prepared.
+     * - Callers should fall back to legacy roots only for compatibility.
+     */
+    fun preferredModelStorageRootOrNull(context: Context): File? {
+        val appCtx = context.applicationContext
+
+        return runCatching {
+            val root = File(appCtx.noBackupFilesDir, MODEL_DIR_NAME)
+            if (root.isDirectory || root.mkdirs()) {
+                root.canonicalFile
+            } else {
+                null
+            }
+        }.getOrElse { t ->
+            SafeLog.w(
+                TAG,
+                "preferredModelStorageRootOrNull: unavailable errType=${t::class.java.simpleName} at=${t.toStackHint()}",
+            )
+            null
+        }
+    }
+
+    /**
+     * Returns the legacy app-private root used before no-backup storage migration.
+     *
+     * Notes:
+     * - This exists only for compatibility with already-downloaded local models.
+     */
+    fun legacyModelStorageRoot(context: Context): File {
+        val appCtx = context.applicationContext
+        return runCatching { appCtx.filesDir.canonicalFile }.getOrDefault(appCtx.filesDir)
+    }
+
+    /**
+     * Returns the repository-supported app-private roots for configured model files.
+     *
+     * Order:
+     * - Preferred no-backup root first
+     * - Legacy filesDir root second
+     *
+     * Notes:
+     * - Keep this aligned with the downloader/runtime repository path contract.
+     * - Avoid probing unrelated directories.
      */
     fun candidateModelRoots(context: Context): List<File> {
         val appCtx = context.applicationContext
-        return listOf(appCtx.filesDir)
+        val roots = ArrayList<File>(2)
+
+        preferredModelStorageRootOrNull(appCtx)?.let { preferred ->
+            roots.add(preferred)
+        }
+
+        val legacy = legacyModelStorageRoot(appCtx)
+        if (roots.none { sameCanonicalFile(it, legacy) }) {
+            roots.add(legacy)
+        }
+
+        return roots
     }
 
     /**
      * Sanitizes a simple file name to avoid traversal-like inputs.
+     *
+     * Notes:
+     * - This function intentionally accepts only a single file name segment.
+     * - Directory layout is controlled by repository/downloader roots, not by config.
      */
     private fun sanitizeSimpleFileName(name: String?): String? {
         val n = name?.trim().orEmpty()
@@ -187,6 +252,10 @@ object AppProcessServices {
         if (n.contains("..")) return null
         if (n.length > 200) return null
         return n
+    }
+
+    private fun sameCanonicalFile(a: File, b: File): Boolean {
+        return runCatching { a.canonicalFile == b.canonicalFile }.getOrDefault(false)
     }
 
     // ---------------------------------------------------------------------
@@ -217,7 +286,13 @@ object AppProcessServices {
      */
     fun setRepoDebugOverrides(overrides: RepoDebugOverrides?) {
         repoDebugOverridesRef.set(overrides)
-        clearRepositoryForRebuild()
+        clearStartupGraphForRebuild(
+            reason = "repoDebugOverrides",
+            clearWarmupInputs = false,
+            clearDownloader = false,
+            clearRepository = true,
+            clearWarmup = true,
+        )
     }
 
     private fun resolveRepoDebugOptions(): RepoDebugOptions {
@@ -241,17 +316,47 @@ object AppProcessServices {
         )
     }
 
-    private fun clearRepositoryForRebuild() {
+    private fun clearRepositoryForRebuild(
+        reason: String,
+        detachWarmupInputsFromActiveController: Boolean,
+    ) {
+        if (detachWarmupInputsFromActiveController) {
+            detachWarmupInputsFromActiveControllerBestEffort(reason = reason)
+        }
+
         var toClose: Any? = null
+        var cleared = false
 
         synchronized(repoLock) {
-            toClose = repoRef.get()
-            repoRef.set(null)
-            repoModeRef.set(null)
+            if (repoRef.get() != null || repoModeRef.get() != null) {
+                toClose = repoRef.get()
+                repoRef.set(null)
+                repoModeRef.set(null)
+                cleared = true
+            }
         }
 
         toClose?.let { closeIfSupportedSafely(it) }
-        SafeLog.i(TAG, "repository: cleared for rebuild")
+
+        if (cleared) {
+            SafeLog.i(TAG, "repository: cleared for rebuild reason=${sanitizeReason(reason)}")
+        }
+    }
+
+    private fun detachWarmupInputsFromActiveControllerBestEffort(reason: String) {
+        val controller = warmupRef.get() ?: return
+        val mode = warmupModeRef.get()
+        if (mode != RepoMode.ON_DEVICE) return
+
+        runCatching {
+            controller.updateInputs(null)
+        }.onFailure { t ->
+            SafeLog.w(
+                TAG,
+                "warmupInputs: detach active controller failed " +
+                        "reason=${sanitizeReason(reason)} errType=${t::class.java.simpleName} at=${t.toStackHint()}",
+            )
+        }
     }
 
     fun repository(
@@ -314,18 +419,17 @@ object AppProcessServices {
                 created
             }
 
-        toClose?.let { closeIfSupportedSafely(it) }
-
         createdNow?.let { created ->
             SafeLog.i(TAG, "repository: created mode=$mode type=${created.javaClass.simpleName}")
 
             if (mode == RepoMode.ON_DEVICE) {
                 rebindWarmupInputsToCurrentRepoBestEffort(
-                    context = appCtx,
                     repo = created,
                 )
             }
         }
+
+        toClose?.let { closeIfSupportedSafely(it) }
 
         return installed
     }
@@ -514,7 +618,13 @@ object AppProcessServices {
             return
         }
 
-        val repo = repository(context, mode)
+        val repo = repoRef.get()
+        val repoMode = repoModeRef.get()
+        if (repo == null || repoMode != mode) {
+            SafeLog.d(TAG, "warmupInputs: skip best-effort update (repo not ready)")
+            return
+        }
+
         val warmupRepo = repo as? WarmupController.WarmupCapableRepository
         if (warmupRepo == null) {
             SafeLog.w(TAG, "warmupInputs: repo is not WarmupCapableRepository type=${repo.javaClass.simpleName}")
@@ -632,7 +742,6 @@ object AppProcessServices {
      * - If rebinding fails, previous cached inputs are left untouched.
      */
     private fun rebindWarmupInputsToCurrentRepoBestEffort(
-        context: Context,
         repo: ChatValidation.RepositoryI,
     ) {
         val cached = warmupInputsRef.get() ?: return
@@ -657,6 +766,100 @@ object AppProcessServices {
             )
 
         updateWarmupInputs(rebound)
+    }
+
+    /**
+     * Clears the process-scoped warmup controller.
+     *
+     * Contract:
+     * - Active controller inputs are detached before the previous instance is closed.
+     * - Cached durable inputs are preserved by default so a future repository rebuild
+     *   can rebind them safely.
+     */
+    fun clearWarmupControllerForRebuild(
+        reason: String,
+        clearWarmupInputs: Boolean = false,
+    ) {
+        var toClose: WarmupController? = null
+        var cleared = false
+
+        synchronized(warmupLock) {
+            val current = warmupRef.get()
+            if (current != null || warmupModeRef.get() != null) {
+                toClose = current
+                warmupRef.set(null)
+                warmupModeRef.set(null)
+                cleared = true
+            }
+        }
+
+        toClose?.let { controller ->
+            runCatching { controller.updateInputs(null) }
+            closeIfSupportedSafely(controller)
+        }
+
+        if (clearWarmupInputs) {
+            clearWarmupInputsCache(reason = reason)
+        }
+
+        if (cleared) {
+            SafeLog.i(
+                TAG,
+                "warmupController: cleared for rebuild " +
+                        "reason=${sanitizeReason(reason)} keepCachedInputs=${!clearWarmupInputs}",
+            )
+        }
+    }
+
+    /**
+     * Clears the process-scoped startup graph.
+     *
+     * Why:
+     * - Full startup restart must invalidate stale singleton instances, not only UI state.
+     * - The clear path is intentionally destroy-only; recreation remains the caller's job.
+     */
+    fun clearStartupGraphForRebuild(
+        reason: String,
+        clearWarmupInputs: Boolean = false,
+        clearDownloader: Boolean = true,
+        clearRepository: Boolean = true,
+        clearWarmup: Boolean = true,
+    ) {
+        val safeReason = sanitizeReason(reason)
+
+        if (clearDownloader) {
+            clearModelDownloaderForRebuild(reason = safeReason)
+        }
+
+        if (clearWarmup) {
+            clearWarmupControllerForRebuild(
+                reason = safeReason,
+                clearWarmupInputs = clearWarmupInputs,
+            )
+        } else if (clearWarmupInputs) {
+            clearWarmupInputsCache(reason = safeReason)
+        }
+
+        if (clearRepository) {
+            clearRepositoryForRebuild(
+                reason = safeReason,
+                detachWarmupInputsFromActiveController = !clearWarmup,
+            )
+        }
+
+        SafeLog.i(
+            TAG,
+            "startupGraph: cleared " +
+                    "reason=$safeReason clearDownloader=$clearDownloader clearRepository=$clearRepository " +
+                    "clearWarmup=$clearWarmup clearWarmupInputs=$clearWarmupInputs",
+        )
+    }
+
+    private fun clearWarmupInputsCache(reason: String) {
+        val hadInputs = warmupInputsRef.getAndSet(null) != null
+        if (hadInputs) {
+            SafeLog.i(TAG, "warmupInputs: cache cleared reason=${sanitizeReason(reason)}")
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -747,6 +950,10 @@ object AppProcessServices {
      * - Reusing the last non-null spec here would resurrect stale remote-download state.
      */
     fun clearModelDownloader() {
+        clearModelDownloaderForRebuild(reason = "manual")
+    }
+
+    private fun clearModelDownloaderForRebuild(reason: String) {
         var toClose: Any? = null
         var cleared = false
 
@@ -763,7 +970,7 @@ object AppProcessServices {
         toClose?.let { closeIfSupportedSafely(it) }
 
         if (cleared) {
-            SafeLog.i(TAG, "modelDownloader: cleared")
+            SafeLog.i(TAG, "modelDownloader: cleared reason=${sanitizeReason(reason)}")
         }
     }
 
@@ -832,6 +1039,23 @@ object AppProcessServices {
      * - This is intentionally conservative.
      * - It may redact non-sensitive details, but strongly reduces accidental leakage.
      */
+    private fun sanitizeReason(raw: String): String {
+        val trimmed = raw.trim()
+        if (trimmed.isEmpty()) return "unknown"
+
+        val safe =
+            buildString {
+                for (c in trimmed) {
+                    if (c.isLetterOrDigit() || c == '_' || c == '-' || c == ':' || c == '.') {
+                        append(c)
+                    }
+                    if (length >= 48) break
+                }
+            }
+
+        return safe.ifBlank { "unknown" }
+    }
+
     private fun sanitizeWarmupLog(raw: String): String {
         var s = raw
 

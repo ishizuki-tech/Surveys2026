@@ -32,6 +32,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import com.negi.surveys.AppProcessServices
 import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.AppLog
 import java.io.File
@@ -180,12 +181,12 @@ object HeavyInitializer {
 
         // Launch heavy work now.
         scope.launch(ownerJob) {
-            val dir = app.filesDir
-            val finalFile = resolveSafeFileUnder(dir, fileName)
-
-            val tmpFile = resolveSafeFileUnder(dir, "$fileName.tmp")
-            val tmpPartFile = File(tmpFile.parentFile, tmpFile.name + ".part")
-            val tmpMetaFile = File(tmpFile.parentFile, tmpPartFile.name + ".meta")
+            val storage = resolveStoragePaths(app, fileName)
+            val preferredDir = storage.preferredBaseDir
+            val finalFile = storage.preferredFinal
+            val tmpFile = storage.preferredTmp
+            val tmpPartFile = storage.preferredPart
+            val tmpMetaFile = storage.preferredMeta
 
             val watchdogJob = startStallWatchdog(runId, gen, stableKey, phaseRef, lastBeatMs, ownerJob)
 
@@ -194,17 +195,14 @@ object HeavyInitializer {
                 phaseRef.set(Phase.PREPARE)
 
                 if (forceFresh) {
-                    runCatching { tmpFile.delete() }
-                    runCatching { tmpPartFile.delete() }
-                    runCatching { tmpMetaFile.delete() }
-                    runCatching { finalFile.delete() }
+                    deleteForceFreshArtifacts(storage)
                 }
 
-                // Validate resume safety using meta.
+                // Validate resume safety using preferred meta.
                 val meta = readMetaIfPresent(tmpMetaFile)
                 if (!forceFresh) {
                     if (meta != null && meta.url != modelUrl) {
-                        AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' meta url mismatch -> discard part/meta")
+                        AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' meta url mismatch -> discard preferred part/meta")
                         runCatching { tmpPartFile.delete() }
                         runCatching { tmpMetaFile.delete() }
                     }
@@ -222,24 +220,43 @@ object HeavyInitializer {
 
                 phaseRef.set(Phase.CHECK_EXISTING)
 
-                // Final already exists and is acceptable.
-                if (!forceFresh && finalFile.exists() && finalFile.isFile && finalFile.length() > 0L) {
-                    val ok = when {
-                        expectedLen != null -> finalFile.length() == expectedLen
-                        else -> true
-                    }
-                    if (ok) {
+                // Preferred final already exists and is acceptable.
+                if (!forceFresh && isAcceptableFinalFile(finalFile, expectedLen)) {
+                    val len = finalFile.length()
+                    created.emitProgress(len, expectedLen ?: len)
+                    deferred.complete(Result.success(finalFile))
+                    return@launch
+                }
+
+                // Legacy final exists. Try to migrate it into preferred storage first.
+                if (!forceFresh && isAcceptableFinalFile(storage.legacyFinal, expectedLen)) {
+                    phaseRef.set(Phase.MIGRATE_LEGACY)
+
+                    val migrated = migrateLegacyFinalToPreferred(
+                        legacyFile = storage.legacyFinal,
+                        preferredFile = finalFile,
+                    )
+
+                    if (migrated && isAcceptableFinalFile(finalFile, expectedLen)) {
                         val len = finalFile.length()
                         created.emitProgress(len, expectedLen ?: len)
                         deferred.complete(Result.success(finalFile))
                         return@launch
                     }
+
+                    // Compatibility fallback for already-installed devices.
+                    // This should disappear once all readers prefer no-backup storage.
+                    val legacyLen = storage.legacyFinal.length()
+                    created.emitProgress(legacyLen, expectedLen ?: legacyLen)
+                    AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' using legacy final as compatibility fallback")
+                    deferred.complete(Result.success(storage.legacyFinal))
+                    return@launch
                 }
 
-                // Part sanity.
+                // Preferred part sanity.
                 if (!forceFresh && tmpPartFile.exists() && tmpPartFile.length() > 0L) {
                     if (expectedLen != null && tmpPartFile.length() > expectedLen) {
-                        AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' part > expectedLen -> discard part/meta")
+                        AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' preferred part > expectedLen -> discard preferred part/meta")
                         runCatching { tmpPartFile.delete() }
                         runCatching { tmpMetaFile.delete() }
                     }
@@ -253,7 +270,7 @@ object HeavyInitializer {
                 if (expectedLen != null) {
                     val remaining = max(0L, expectedLen - existingPartial)
                     val needed = remaining + FREE_SPACE_MARGIN_BYTES
-                    if (dir.usableSpace < needed) {
+                    if (preferredDir.usableSpace < needed) {
                         deferred.complete(Result.failure(IOException("Not enough free space")))
                         return@launch
                     }
@@ -261,13 +278,13 @@ object HeavyInitializer {
 
                 AppLog.i(
                     TAG,
-                    "run=$runId gen=$gen key='$stableKey' start forceFresh=$forceFresh expectedLen=${expectedLen ?: -1L} existingPartial=$existingPartial"
+                    "run=$runId gen=$gen key='$stableKey' start forceFresh=$forceFresh expectedLen=${expectedLen ?: -1L} existingPartial=$existingPartial storage=preferred"
                 )
 
                 val runDownload: suspend () -> Unit = {
                     currentCoroutineContext().ensureActive()
 
-                    // Bind partial to url/expectedLen.
+                    // Bind preferred partial to url/expectedLen.
                     runCatching { writeMeta(tmpMetaFile, modelUrl, expectedLen) }
 
                     phaseRef.set(Phase.DOWNLOAD)
@@ -324,27 +341,21 @@ object HeavyInitializer {
             } catch (ce: CancellationException) {
                 AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' cancelled type=${ce::class.java.simpleName}")
                 if (forceFresh) {
-                    runCatching { tmpFile.delete() }
-                    runCatching { tmpPartFile.delete() }
-                    runCatching { tmpMetaFile.delete() }
+                    deleteForceFreshArtifacts(storage)
                 }
                 deferred.complete(Result.failure(IOException("Canceled", ce)))
 
             } catch (ie: InterruptedIOException) {
                 AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' interrupted type=${ie::class.java.simpleName}")
                 if (forceFresh) {
-                    runCatching { tmpFile.delete() }
-                    runCatching { tmpPartFile.delete() }
-                    runCatching { tmpMetaFile.delete() }
+                    deleteForceFreshArtifacts(storage)
                 }
                 deferred.complete(Result.failure(IOException("Canceled", ie)))
 
             } catch (te: TimeoutCancellationException) {
                 AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' timeout after ${timeoutMs}ms")
                 if (forceFresh) {
-                    runCatching { tmpFile.delete() }
-                    runCatching { tmpPartFile.delete() }
-                    runCatching { tmpMetaFile.delete() }
+                    deleteForceFreshArtifacts(storage)
                 }
                 deferred.complete(Result.failure(IOException("Timeout", te)))
 
@@ -359,7 +370,7 @@ object HeavyInitializer {
                     runCatching { tmpPartFile.delete() }
                     runCatching { tmpMetaFile.delete() }
                 } else {
-                    AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' keeping partial for resume")
+                    AppLog.w(TAG, "run=$runId gen=$gen key='$stableKey' keeping preferred partial for resume")
                 }
 
                 deferred.complete(Result.failure(IOException(safe, t)))
@@ -461,6 +472,7 @@ object HeavyInitializer {
         PREPARE,
         HEAD_PROBE,
         CHECK_EXISTING,
+        MIGRATE_LEGACY,
         CHECK_SPACE,
         DOWNLOAD,
         PROMOTE_TMP,
@@ -471,6 +483,111 @@ object HeavyInitializer {
 
     private fun defaultKey(modelUrl: String, fileName: String): String {
         return "heavy|" + modelUrl.trim() + "|" + fileName.trim()
+    }
+
+    // ---------------------------------------------------------------------
+    // Storage paths
+    // ---------------------------------------------------------------------
+
+    private data class StoragePaths(
+        val preferredBaseDir: File,
+        val preferredFinal: File,
+        val preferredTmp: File,
+        val preferredPart: File,
+        val preferredMeta: File,
+        val legacyFinal: File,
+        val legacyTmp: File,
+        val legacyPart: File,
+        val legacyMeta: File,
+    )
+
+    private fun resolveStoragePaths(context: Context, relativePath: String): StoragePaths {
+        val preferredBaseDir =
+            AppProcessServices.preferredModelStorageRootOrNull(context)
+                ?: throw IOException("Preferred model storage unavailable")
+
+        val legacyBaseDir = AppProcessServices.legacyModelStorageRoot(context)
+
+        val preferredFinal = resolveSafeFileUnder(preferredBaseDir, relativePath)
+        val preferredTmp = resolveSafeFileUnder(preferredBaseDir, "$relativePath.tmp")
+        val preferredPart = File(preferredTmp.parentFile, preferredTmp.name + ".part").canonicalFile
+        val preferredMeta = File(preferredTmp.parentFile, preferredPart.name + ".meta").canonicalFile
+
+        val legacyFinal = resolveSafeFileUnder(legacyBaseDir, relativePath)
+        val legacyTmp = resolveSafeFileUnder(legacyBaseDir, "$relativePath.tmp")
+        val legacyPart = File(legacyTmp.parentFile, legacyTmp.name + ".part").canonicalFile
+        val legacyMeta = File(legacyTmp.parentFile, legacyPart.name + ".meta").canonicalFile
+
+        return StoragePaths(
+            preferredBaseDir = preferredBaseDir,
+            preferredFinal = preferredFinal,
+            preferredTmp = preferredTmp,
+            preferredPart = preferredPart,
+            preferredMeta = preferredMeta,
+            legacyFinal = legacyFinal,
+            legacyTmp = legacyTmp,
+            legacyPart = legacyPart,
+            legacyMeta = legacyMeta,
+        )
+    }
+
+    private fun isAcceptableFinalFile(file: File, expectedLen: Long?): Boolean {
+        if (!file.exists() || !file.isFile) return false
+        val len = file.length()
+        if (len <= 0L) return false
+        return expectedLen == null || len == expectedLen
+    }
+
+    private fun migrateLegacyFinalToPreferred(
+        legacyFile: File,
+        preferredFile: File,
+    ): Boolean {
+        if (!legacyFile.exists() || !legacyFile.isFile || legacyFile.length() <= 0L) return false
+
+        val legacyLen = legacyFile.length()
+        preferredFile.parentFile?.mkdirs()
+
+        if (preferredFile.exists()) {
+            if (!preferredFile.delete()) {
+                return false
+            }
+        }
+
+        if (legacyFile.renameTo(preferredFile)) {
+            return preferredFile.exists() && preferredFile.length() == legacyLen
+        }
+
+        return try {
+            legacyFile.inputStream().use { input ->
+                FileOutputStream(preferredFile, false).use { fos ->
+                    input.copyTo(fos, BUFFER_BYTES)
+                    fos.flush()
+                    trySync(fos)
+                }
+            }
+            if (preferredFile.exists() && preferredFile.length() == legacyLen) {
+                runCatching { legacyFile.delete() }
+                true
+            } else {
+                runCatching { preferredFile.delete() }
+                false
+            }
+        } catch (_: Throwable) {
+            runCatching { preferredFile.delete() }
+            false
+        }
+    }
+
+    private fun deleteForceFreshArtifacts(paths: StoragePaths) {
+        runCatching { paths.preferredTmp.delete() }
+        runCatching { paths.preferredPart.delete() }
+        runCatching { paths.preferredMeta.delete() }
+        runCatching { paths.preferredFinal.delete() }
+
+        runCatching { paths.legacyTmp.delete() }
+        runCatching { paths.legacyPart.delete() }
+        runCatching { paths.legacyMeta.delete() }
+        runCatching { paths.legacyFinal.delete() }
     }
 
     // ---------------------------------------------------------------------

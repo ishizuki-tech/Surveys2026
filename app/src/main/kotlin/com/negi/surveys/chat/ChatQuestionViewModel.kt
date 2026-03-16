@@ -41,6 +41,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 /**
@@ -68,7 +70,7 @@ import kotlinx.coroutines.withContext
  * - Show TTFT by creating a placeholder MODEL bubble immediately on submit.
  * - Keep the "stream window" open for the whole validation attempt.
  * - Ignore late results using [activeAttemptId].
- * - Snapshot draft persistence on Main to avoid ConcurrentModificationException.
+ * - Build draft snapshots on Main, then persist them on IO.
  * - Roll back transcript/state mutations when validation throws before producing
  *   a stable assistant outcome.
  */
@@ -255,6 +257,17 @@ class ChatQuestionViewModel(
     private var deferredPersistReason: String? = null
 
     /**
+     * Persist sequencing.
+     *
+     * Notes:
+     * - Snapshots are captured on Main.
+     * - Actual store.save() runs on IO.
+     * - Older queued saves are skipped when a newer snapshot is already requested.
+     */
+    private val persistSaveMutex = Mutex()
+    private val persistRequestedSeq = AtomicLong(0L)
+
+    /**
      * Active or most recently retained MODEL bubble.
      */
     @Volatile
@@ -404,7 +417,7 @@ class ChatQuestionViewModel(
             }
         }
 
-        if (Looper.getMainLooper().thread === Thread.currentThread()) {
+        if (isMainThread()) {
             cleanup()
         } else {
             viewModelScope.launch(Dispatchers.Main.immediate) { cleanup() }
@@ -498,7 +511,10 @@ class ChatQuestionViewModel(
         }
         logAnswerDigest("main", answer)
 
-        val out = validator.validateMain(qid, answer)
+        val out =
+            runValidationOffMain(label = "main", attemptId = attemptId) {
+                validator.validateMain(qid, answer)
+            }
         if (!isAttemptActive(attemptId)) return
 
         val followUp = if (out.status == ChatModels.ValidationStatus.NEED_FOLLOW_UP) {
@@ -553,7 +569,8 @@ class ChatQuestionViewModel(
         withStateLock {
             followUps += ChatDrafts.FollowUpTurn(question = q, answer = userAnswer)
         }
-        logAnswerDigest("followup#${withStateLock { followUps.size }}", userAnswer)
+        val followUpIndex = withStateLock { followUps.size }
+        logAnswerDigest("followup#$followUpIndex", userAnswer)
 
         val followUpPayloadForValidator =
             buildFollowUpContextForValidator(
@@ -562,15 +579,20 @@ class ChatQuestionViewModel(
                 previousTurns = priorTurns,
             )
         logFollowUpPayloadDigest(
-            turns = withStateLock { followUps.size },
+            turns = followUpIndex,
             payload = followUpPayloadForValidator,
         )
 
-        val out = validator.validateFollowUp(
-            questionId = qid,
-            mainAnswer = withStateLock { mainAnswer }.trim(),
-            followUpAnswer = followUpPayloadForValidator,
-        )
+        val mainAnswerSnapshot = withStateLock { mainAnswer }.trim()
+
+        val out =
+            runValidationOffMain(label = "followup#$followUpIndex", attemptId = attemptId) {
+                validator.validateFollowUp(
+                    questionId = qid,
+                    mainAnswer = mainAnswerSnapshot,
+                    followUpAnswer = followUpPayloadForValidator,
+                )
+            }
         if (!isAttemptActive(attemptId)) return
 
         val followUp = if (out.status == ChatModels.ValidationStatus.NEED_FOLLOW_UP) {
@@ -633,6 +655,37 @@ class ChatQuestionViewModel(
     private suspend fun isAttemptActive(attemptId: Long): Boolean {
         if (activeAttemptId != attemptId) return false
         return currentCoroutineContext().isActive
+    }
+
+    /**
+     * Runs validator work off Main and records metadata-only timing.
+     *
+     * Notes:
+     * - UI mutations remain on Main.
+     * - Only the validation call itself is moved to Default.
+     */
+    private suspend fun <T> runValidationOffMain(
+        label: String,
+        attemptId: Long,
+        block: suspend () -> T,
+    ): T {
+        val callerOnMain = isMainThread()
+        val t0 = System.nanoTime()
+        var succeeded = false
+
+        AppLog.d(TAG, "validation[$label] dispatch q=$qid attempt=$attemptId callerMain=$callerOnMain")
+
+        return try {
+            val result = withContext(Dispatchers.Default) { block() }
+            succeeded = true
+            result
+        } finally {
+            val dtMs = (System.nanoTime() - t0) / 1_000_000L
+            AppLog.d(
+                TAG,
+                "validation[$label] finished q=$qid attempt=$attemptId ok=$succeeded dtMs=$dtMs",
+            )
+        }
     }
 
     // ---------------------------------------------------------------------
@@ -1327,6 +1380,9 @@ class ChatQuestionViewModel(
      * - Drop transient MODEL streaming bubbles.
      * - Keep final MODEL step messages as stable transcript entries.
      * - Migrate legacy assistant-side raw fields into stable MODEL messages.
+     *
+     * Threading:
+     * - Must be called on Main because [messagesBacking] is UI-owned mutable state.
      */
     private fun buildPersistableMessagesSnapshot(): List<ChatMessage> {
         return normalizePersistedMessages(messagesBacking.toList())
@@ -1484,21 +1540,55 @@ class ChatQuestionViewModel(
     // Draft persistence
     // ---------------------------------------------------------------------
 
-    private fun persistDraftOnMain() {
+    /**
+     * Builds a stable draft snapshot on Main.
+     *
+     * Notes:
+     * - Message snapshot is UI-owned and must be captured on Main.
+     * - The returned value is safe to persist later on IO.
+     */
+    private fun buildDraftSnapshotOnMain(): ChatDrafts.ChatDraft {
         val messagesSnapshot = buildPersistableMessagesSnapshot()
-        val snapshot =
-            synchronized(stateLock) {
-                ChatDrafts.ChatDraft(
-                    stage = stage,
-                    messages = messagesSnapshot,
-                    mainAnswer = mainAnswer,
-                    followUps = followUps.toList(),
-                    currentFollowUpQuestion = currentFollowUpQuestion,
-                    completionPayload = _completionPayload.value,
-                    inputDraft = _input.value,
+        return synchronized(stateLock) {
+            ChatDrafts.ChatDraft(
+                stage = stage,
+                messages = messagesSnapshot,
+                mainAnswer = mainAnswer,
+                followUps = followUps.toList(),
+                currentFollowUpQuestion = currentFollowUpQuestion,
+                completionPayload = _completionPayload.value,
+                inputDraft = _input.value,
+            )
+        }
+    }
+
+    /**
+     * Enqueues snapshot persistence on IO.
+     *
+     * Notes:
+     * - Older snapshots are skipped when a newer request is already queued.
+     * - Saving is serialized to keep file/store writes ordered and stable.
+     */
+    private fun enqueueDraftSave(
+        snapshot: ChatDrafts.ChatDraft,
+        reason: String,
+        seq: Long,
+    ) {
+        viewModelScope.launch(Dispatchers.IO) {
+            runCatching {
+                persistSaveMutex.withLock {
+                    if (seq < persistRequestedSeq.get()) {
+                        return@withLock
+                    }
+                    draftStore.save(draftKey, snapshot)
+                }
+            }.onFailure { t ->
+                AppLog.w(
+                    TAG,
+                    "persistDraft failed (non-fatal) reason=$reason seq=$seq err=${t.javaClass.simpleName}",
                 )
             }
-        draftStore.save(draftKey, snapshot)
+        }
     }
 
     /**
@@ -1556,20 +1646,27 @@ class ChatQuestionViewModel(
         }
     }
 
+    /**
+     * Captures a snapshot on Main and persists it on IO.
+     */
     private fun safePersistDraft(reason: String) {
-        if (Looper.getMainLooper().thread === Thread.currentThread()) {
-            runCatching { persistDraftOnMain() }
-                .onFailure { t ->
-                    AppLog.w(TAG, "persistDraft failed (non-fatal) reason=$reason err=${t.javaClass.simpleName}")
-                }
+        val captureAndEnqueue: () -> Unit = {
+            val snapshot = buildDraftSnapshotOnMain()
+            val seq = persistRequestedSeq.incrementAndGet()
+            enqueueDraftSave(
+                snapshot = snapshot,
+                reason = reason,
+                seq = seq,
+            )
+        }
+
+        if (isMainThread()) {
+            captureAndEnqueue()
             return
         }
 
         viewModelScope.launch(Dispatchers.Main.immediate) {
-            runCatching { persistDraftOnMain() }
-                .onFailure { t ->
-                    AppLog.w(TAG, "persistDraft failed (non-fatal) reason=$reason err=${t.javaClass.simpleName}")
-                }
+            captureAndEnqueue()
         }
     }
 
@@ -1609,6 +1706,10 @@ class ChatQuestionViewModel(
 
     private inline fun <T> withStateLock(block: () -> T): T {
         return synchronized(stateLock) { block() }
+    }
+
+    private fun isMainThread(): Boolean {
+        return Looper.getMainLooper().thread === Thread.currentThread()
     }
 
     private fun captureRollbackSnapshot(): SubmitRollbackSnapshot {

@@ -15,6 +15,11 @@
  *  Fix (2026-02-28):
  *   - Remove reflective invocation.
  *   - Call LiteRtLM APIs directly to avoid “API not present / signature mismatch” false negatives.
+ *
+ *  Update (2026-03-14):
+ *   - Remove raw prompt/token logging from normal runtime paths.
+ *   - Make release logging metadata-only.
+ *   - Avoid exception.message in logs and callback error strings.
  * =====================================================================
  */
 
@@ -25,6 +30,7 @@ package com.negi.surveys.slm
 import android.content.Context
 import android.graphics.Bitmap
 import com.google.ai.edge.litertlm.Message
+import com.negi.surveys.BuildConfig
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.slm.liteRT.LiteRtLM
 import java.util.concurrent.atomic.AtomicBoolean
@@ -36,8 +42,12 @@ import kotlinx.coroutines.CancellationException
  * Responsibilities:
  * - Keep call sites stable (SLM.* API surface).
  * - Avoid reflection to prevent signature drift false negatives.
- * - Provide consistent logging for synchronous failures.
+ * - Provide consistent metadata-only logging for synchronous failures.
  * - Guard callbacks to avoid double delivery in mixed sync/async failure modes.
+ *
+ * Privacy:
+ * - Never log raw prompt text, raw user answers, raw partial tokens, or raw model output.
+ * - Never log exception.message because runtime/library errors may contain sensitive content.
  *
  * Non-goals:
  * - Do not re-implement LiteRtLM session management or concurrency control.
@@ -46,7 +56,15 @@ import kotlinx.coroutines.CancellationException
 object SLM {
 
     private const val TAG: String = "SLM"
-    private val DEBUG_SLM: Boolean = true //BuildConfig.DEBUG
+
+    /**
+     * Debug gate for metadata-only diagnostic logs.
+     *
+     * Notes:
+     * - This must never enable raw prompt or raw token logging.
+     * - Keep release builds quiet and safe by default.
+     */
+    private val DEBUG_SLM: Boolean = BuildConfig.DEBUG
 
     // ---------------------------------------------------------------------
     // Logging helpers
@@ -61,33 +79,32 @@ object SLM {
     }
 
     private inline fun w(t: Throwable? = null, msg: () -> String) {
-        if (t != null) SafeLog.w(TAG, msg(), t) else SafeLog.w(TAG, msg())
+        if (t != null) {
+            SafeLog.w(TAG, "${msg()} ${t.safeTypeAndHint()}")
+        } else {
+            SafeLog.w(TAG, msg())
+        }
+    }
+
+    private inline fun e(t: Throwable? = null, msg: () -> String) {
+        if (t != null) {
+            SafeLog.e(TAG, "${msg()} ${t.safeTypeAndHint()}")
+        } else {
+            SafeLog.e(TAG, msg())
+        }
     }
 
     /**
-     * Truncate text for logs to avoid spam and accidental leakage.
-     *
-     * Notes:
-     * - This is surrogate-safe to avoid splitting an emoji or other multi-char sequences.
+     * Returns a safe throwable summary without using exception.message.
      */
-    private fun String.ellipsize(maxChars: Int): String {
-        if (maxChars <= 0) return ""
-        if (length <= maxChars) return this
-
-        var end = maxChars.coerceAtMost(length)
-        if (end <= 0) return ""
-
-        // Avoid splitting a surrogate pair.
-        if (end < length) {
-            val last = this[end - 1]
-            val next = this[end]
-            if (Character.isHighSurrogate(last) && Character.isLowSurrogate(next)) {
-                end -= 1
-            }
+    private fun Throwable.safeTypeAndHint(): String {
+        val top = stackTrace.firstOrNull()
+        val hint = if (top != null) {
+            "${top.className}.${top.methodName}:${top.lineNumber}"
+        } else {
+            "unknown"
         }
-
-        if (end <= 0) return ""
-        return take(end) + "…(len=$length)"
+        return "type=${this::class.java.simpleName} at=$hint"
     }
 
     // ---------------------------------------------------------------------
@@ -154,7 +171,8 @@ object SLM {
      * Initialize a model runtime.
      *
      * Failure model:
-     * - If LiteRtLM.initialize throws synchronously, we catch and notify [onDone] with an error string.
+     * - If LiteRtLM.initialize throws synchronously, we catch and notify [onDone]
+     *   with a stable metadata-only error token.
      *
      * Callback safety:
      * - [onDone] is guarded to be invoked at most once by this facade.
@@ -171,7 +189,7 @@ object SLM {
         val onDoneOnce = once1(onDone)
 
         d {
-            "initialize: model='${model.name}' path='${model.taskPath}' " +
+            "initialize: model='${model.name}' " +
                     "image=$supportImage audio=$supportAudio tools=${tools.size}"
         }
 
@@ -186,8 +204,8 @@ object SLM {
                 tools = tools,
             )
         }.onFailure { t ->
-            w(t) { "initialize: failed err=${t.javaClass.simpleName}(${t.message})" }
-            onDoneOnce("error: ${t.javaClass.simpleName}(${t.message})")
+            w(t) { "initialize: failed" }
+            onDoneOnce("error:${t::class.java.simpleName}")
         }
     }
 
@@ -222,7 +240,7 @@ object SLM {
         } catch (ce: CancellationException) {
             throw ce
         } catch (t: Throwable) {
-            w(t) { "initializeIfNeeded: failed err=${t.javaClass.simpleName}(${t.message})" }
+            w(t) { "initializeIfNeeded: failed" }
             throw t
         }
     }
@@ -255,7 +273,7 @@ object SLM {
                 tools = tools,
             )
         }.onFailure { t ->
-            w(t) { "resetConversation: failed err=${t.javaClass.simpleName}(${t.message})" }
+            w(t) { "resetConversation: failed" }
         }
     }
 
@@ -290,7 +308,7 @@ object SLM {
                 timeoutMs = timeoutMs,
             )
         }.onFailure { t ->
-            w(t) { "resetConversationAndAwait: failed err=${t.javaClass.simpleName}(${t.message})" }
+            w(t) { "resetConversationAndAwait: failed" }
         }.getOrDefault(false)
     }
 
@@ -307,7 +325,7 @@ object SLM {
         runCatching {
             LiteRtLM.cleanUp(model = model, onDone = onDoneOnce)
         }.onFailure { t ->
-            w(t) { "cleanUp: failed err=${t.javaClass.simpleName}(${t.message})" }
+            w(t) { "cleanUp: failed" }
             onDoneOnce()
         }
     }
@@ -328,7 +346,7 @@ object SLM {
         runCatching {
             LiteRtLM.forceCleanUp(model = model, onDone = onDoneOnce)
         }.onFailure { t ->
-            w(t) { "forceCleanUp: failed err=${t.javaClass.simpleName}(${t.message})" }
+            w(t) { "forceCleanUp: failed" }
             cleanUp(model = model, onDone = onDoneOnce)
         }
     }
@@ -338,7 +356,7 @@ object SLM {
      *
      * Failure model:
      * - If LiteRtLM.runInference throws synchronously, we:
-     *   1) log
+     *   1) log metadata only
      *   2) call [onError]
      *   3) call [cleanUpListener]
      *
@@ -346,9 +364,9 @@ object SLM {
      * - [cleanUpListener] is guarded to "at most once" to avoid double unlock/unblock bugs.
      * - [onError] is guarded to avoid duplicate UI error surfaces across sync/async paths.
      *
-     * Note:
-     * - We intentionally do not guard [resultListener] because it is expected to be invoked
-     *   multiple times for streaming partials.
+     * Privacy:
+     * - Never log raw input text or raw partial model output here.
+     * - Only log metadata such as lengths/counts and lifecycle markers.
      */
     fun runInference(
         model: Model,
@@ -368,11 +386,9 @@ object SLM {
                     "images=${images.size} audio=${audioClips.size} notifyCancel=$notifyCancelToOnError"
         }
 
-        // Keep logs minimal in release builds.
-        if (DEBUG_SLM) {
-            i {"input(len=${input.length}) :: ${input.ellipsize(256)}"}
-        } else {
-            i {"input(len=${input.length})"}
+        i {
+            "inference:start model='${model.name}' textLen=${input.length} " +
+                    "images=${images.size} audio=${audioClips.size}"
         }
 
         runCatching {
@@ -381,16 +397,22 @@ object SLM {
                 input = input,
                 resultListener = { partialResult, done ->
                     if (DEBUG_SLM) {
-                        i {"done=$done partialLen=${partialResult.length} :: ${partialResult.ellipsize(256)}"}
+                        d {
+                            "inference:partial model='${model.name}' done=$done " +
+                                    "partialLen=${partialResult.length}"
+                        }
                     }
                     resultListener(partialResult, done)
                 },
                 cleanUpListener = {
-                    i {"cleanUpListener"}
+                    i { "inference:cleanup model='${model.name}'" }
                     cleanUpOnce()
                 },
                 onError = { message ->
-                    i {"onError :: ${message.ellipsize(512)}"}
+                    val safeToken = message.trim().ifBlank { "unknown" }
+                        .take(64)
+                        .replace(Regex("[^A-Za-z0-9_:\\-.]"), "_")
+                    w { "inference:error model='${model.name}' token=$safeToken" }
                     onErrorOnce(message)
                 },
                 images = images,
@@ -398,8 +420,8 @@ object SLM {
                 notifyCancelToOnError = notifyCancelToOnError,
             )
         }.onFailure { t ->
-            w(t) { "runInference: failed err=${t.javaClass.simpleName}(${t.message})" }
-            onErrorOnce("runInference failed: ${t.javaClass.simpleName}(${t.message})")
+            e(t) { "runInference: failed model='${model.name}'" }
+            onErrorOnce("runInference_failed:${t::class.java.simpleName}")
             runCatching { cleanUpOnce() }
         }
     }
@@ -444,6 +466,6 @@ object SLM {
     fun cancel(model: Model) {
         d { "cancel: model='${model.name}'" }
         runCatching { LiteRtLM.cancel(model) }
-            .onFailure { t -> w(t) { "cancel: failed err=${t.javaClass.simpleName}(${t.message})" } }
+            .onFailure { t -> w(t) { "cancel: failed" } }
     }
 }

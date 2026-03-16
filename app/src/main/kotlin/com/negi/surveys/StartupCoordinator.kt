@@ -17,7 +17,6 @@ import com.negi.surveys.chat.ChatValidation
 import com.negi.surveys.config.InstalledSurveyConfigStore
 import com.negi.surveys.config.ModelDownloadSpec
 import com.negi.surveys.config.SurveyConfig
-import com.negi.surveys.config.SurveyConfigLoader
 import com.negi.surveys.config.resolveModelDownloadSpec
 import com.negi.surveys.logging.SafeLog
 import com.negi.surveys.utils.ModelDownloadController
@@ -29,11 +28,15 @@ import kotlinx.coroutines.delay
  * Coordinates startup preparation that does not belong in the ViewModel itself.
  *
  * Responsibilities:
- * - Wait for the installed process config.
- * - Recover the config from assets when needed.
+ * - Wait for the installed process config prepared by Application bootstrap.
  * - Resolve startup mode + model requirements.
  * - Prefer a ready local model over remote download when both are available.
  * - Build process-scoped repository / warmup / downloader services.
+ *
+ * Non-responsibilities:
+ * - Installing or recovering the process config from assets.
+ * - Owning retry policy.
+ * - Mutating root UI state.
  */
 internal class StartupCoordinator(
     appContext: Context,
@@ -58,20 +61,21 @@ internal class StartupCoordinator(
         repoModeProvider: () -> AppProcessServices.RepoMode,
         modelWiring: StartupModelWiring,
     ): StartupPreparationResult {
+        val repoMode = repoModeProvider()
         val t0 = SystemClock.elapsedRealtime()
         SafeLog.i(TAG, "Config: waiting for installed config (Application-owned)")
 
         val installed =
-            waitForInstalledConfigOrRecoverOrNull(
+            waitForInstalledConfigOrNull(
                 deadlineAt = t0 + INSTALLED_CONFIG_WAIT_MS,
             )
 
         if (installed == null) {
             val dt = SystemClock.elapsedRealtime() - t0
-            SafeLog.e(TAG, "Config: missing after recovery attempt dt=${dt}ms")
+            SafeLog.e(TAG, "Config: missing before deadline dt=${dt}ms")
             return StartupPreparationResult.Failed(
                 safeReason = "InstalledConfigMissing",
-                repoMode = repoModeProvider(),
+                repoMode = repoMode,
                 modelSpec = null,
                 modelSpecKey = null,
             )
@@ -82,7 +86,6 @@ internal class StartupCoordinator(
 
         val declaredModelSpec = installed.resolveModelDownloadSpec()
         val declaredRemoteModelSpecKey = modelWiring.buildModelSpecKey(declaredModelSpec)
-        val repoMode = repoModeProvider()
         val onDeviceEnabled = repoMode == AppProcessServices.RepoMode.ON_DEVICE
 
         val initialLocalModelFile =
@@ -141,6 +144,7 @@ internal class StartupCoordinator(
                     remoteDownloadEligible -> StartupModelSource.REMOTE_DOWNLOAD
                     else -> StartupModelSource.NONE
                 },
+                remoteDownloadEligible = remoteDownloadEligible,
             ),
         )
     }
@@ -153,51 +157,75 @@ internal class StartupCoordinator(
      * - A missing [modelSpecKey] here means "do not create downloader for this startup path".
      * - Local-ready startup intentionally passes null [modelSpecKey] to keep the
      *   boot path downloader-free even when remote download would also be possible.
+     * - Partial build failures clear the startup graph before returning failure.
      */
     fun buildServices(
         repoMode: AppProcessServices.RepoMode,
         modelSpec: ModelDownloadSpec?,
         modelSpecKey: ModelSpecKey?,
-    ): StartupBuiltServices? {
-        return runCatching {
-            val repo = AppProcessServices.repository(app, repoMode)
-            val warmup = AppProcessServices.warmupController(app, repoMode)
+    ): StartupBuildServicesResult {
+        val repo =
+            runCatching {
+                AppProcessServices.repository(app, repoMode)
+            }.onFailure { t ->
+                SafeLog.e(
+                    TAG,
+                    "Services: repository init failed type=${t::class.java.simpleName}",
+                )
+            }.getOrNull() ?: return buildFailure("RepoInitFailed")
 
-            val downloader =
-                if (
-                    repoMode == AppProcessServices.RepoMode.ON_DEVICE &&
-                    modelSpec != null &&
-                    modelSpecKey != null
-                ) {
+        val warmup =
+            runCatching {
+                AppProcessServices.warmupController(app, repoMode)
+            }.onFailure { t ->
+                SafeLog.e(
+                    TAG,
+                    "Services: warmup init failed type=${t::class.java.simpleName}",
+                )
+            }.getOrNull() ?: return buildFailure("WarmupInitFailed")
+
+        val downloader =
+            if (
+                repoMode == AppProcessServices.RepoMode.ON_DEVICE &&
+                modelSpec != null &&
+                modelSpecKey != null
+            ) {
+                runCatching {
                     AppProcessServices.modelDownloader(app, spec = modelSpec)
-                } else {
-                    AppProcessServices.clearModelDownloader()
-                    null
-                }
+                }.onFailure { t ->
+                    SafeLog.e(
+                        TAG,
+                        "Services: downloader init failed type=${t::class.java.simpleName}",
+                    )
+                }.getOrNull() ?: return buildFailure("DownloaderInitFailed")
+            } else {
+                AppProcessServices.clearModelDownloader()
+                null
+            }
 
-            SafeLog.i(
-                TAG,
-                "Services: built mode=$repoMode downloaderEnabled=${downloader != null}",
-            )
+        SafeLog.i(
+            TAG,
+            "Services: built mode=$repoMode downloaderEnabled=${downloader != null}",
+        )
 
-            StartupBuiltServices(
-                repository = repo,
-                warmup = warmup,
-                downloader = downloader,
-            )
-        }.onFailure { t ->
-            SafeLog.e(
-                TAG,
-                "Services: build failed type=${t::class.java.simpleName}",
-            )
-        }.getOrNull()
+        return StartupBuildServicesResult.Ready(
+            services =
+                StartupBuiltServices(
+                    repository = repo,
+                    warmup = warmup,
+                    downloader = downloader,
+                ),
+        )
     }
 
     /**
-     * Polls the installed-config store until a deadline is reached and then
-     * performs a best-effort recovery from assets if needed.
+     * Polls the installed-config store until a deadline is reached.
+     *
+     * Notes:
+     * - Config installation remains Application-owned.
+     * - This coordinator intentionally does not re-install from assets.
      */
-    private suspend fun waitForInstalledConfigOrRecoverOrNull(
+    private suspend fun waitForInstalledConfigOrNull(
         deadlineAt: Long,
     ): SurveyConfig? {
         var installed: SurveyConfig? = null
@@ -208,27 +236,24 @@ internal class StartupCoordinator(
             delay(INSTALLED_CONFIG_POLL_MS)
         }
 
-        if (installed != null) return installed
+        if (installed == null) {
+            SafeLog.w(TAG, "Config: install not observed before deadline")
+        }
 
-        SafeLog.w(TAG, "Config: install not observed; attempting best-effort recovery")
-        return recoverInstalledConfigBestEffort()
+        return installed
     }
 
-    /**
-     * Rebuilds the process config from the bundled asset as a last-resort recovery path.
-     */
-    private fun recoverInstalledConfigBestEffort(): SurveyConfig? {
-        return runCatching {
-            SurveyConfigLoader.installProcessConfigFromAssetsValidated(
-                context = app,
-                fileName = CONFIG_ASSET_NAME,
-            )
-        }.onFailure { t ->
-            SafeLog.e(
-                TAG,
-                "Config: recovery install failed type=${t::class.java.simpleName}",
-            )
-        }.getOrNull()
+    private fun buildFailure(
+        safeReason: String,
+    ): StartupBuildServicesResult.Failed {
+        AppProcessServices.clearStartupGraphForRebuild(
+            reason = safeReason,
+            clearWarmupInputs = false,
+            clearDownloader = true,
+            clearRepository = true,
+            clearWarmup = true,
+        )
+        return StartupBuildServicesResult.Failed(safeReason = safeReason)
     }
 
     /**
@@ -245,6 +270,19 @@ internal class StartupCoordinator(
             val modelSpec: ModelDownloadSpec?,
             val modelSpecKey: ModelSpecKey?,
         ) : StartupPreparationResult
+    }
+
+    /**
+     * Result of building the process-scoped startup services.
+     */
+    sealed interface StartupBuildServicesResult {
+        data class Ready(
+            val services: StartupBuiltServices,
+        ) : StartupBuildServicesResult
+
+        data class Failed(
+            val safeReason: String,
+        ) : StartupBuildServicesResult
     }
 
     /**
@@ -267,6 +305,7 @@ internal class StartupCoordinator(
         val onDeviceEnabled: Boolean,
         val initialLocalModelFile: File?,
         val startupModelSource: StartupModelSource,
+        val remoteDownloadEligible: Boolean,
     )
 
     /**
@@ -280,7 +319,6 @@ internal class StartupCoordinator(
 
     companion object {
         private const val TAG = "StartupCoordinator"
-        private const val CONFIG_ASSET_NAME = "survey.yaml"
         private const val INSTALLED_CONFIG_WAIT_MS: Long = 1_500L
         private const val INSTALLED_CONFIG_POLL_MS: Long = 25L
     }

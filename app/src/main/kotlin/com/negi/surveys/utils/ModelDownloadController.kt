@@ -38,6 +38,7 @@ import kotlinx.coroutines.launch
  * - At most one active download job per controller instance.
  * - Targeted cancellation via HeavyInitializer.Handle.
  * - UI updates are throttled to avoid recomposition storms.
+ * - Follow the process-wide model storage contract from AppProcessServices.
  *
  * Privacy / Safety:
  * - Never expose raw URLs, tokens, file paths, or exception messages in state/logs.
@@ -155,11 +156,36 @@ class ModelDownloadController(
             return
         }
 
-        val dst = resolveSafeFileUnder(app.filesDir, name)
+        val modelPaths = try {
+            resolveModelPaths(name)
+        } catch (t: Throwable) {
+            startedGuard.set(false)
+            _state.value = ModelState.Failed(
+                safeReason = MODEL_STORAGE_UNAVAILABLE,
+                startedAtMs = null,
+                elapsedMs = 0L,
+            )
+            AppLog.w(TAG, "ensureModelOnce: storage unavailable type=${t::class.java.simpleName}")
+            return
+        }
+
+        val initialLocal = if (!forceFresh) findUsableLocalModelFile(modelPaths) else null
+        if (initialLocal == null && modelPaths.preferred == null) {
+            startedGuard.set(false)
+            _state.value = ModelState.Failed(
+                safeReason = MODEL_STORAGE_UNAVAILABLE,
+                startedAtMs = null,
+                elapsedMs = 0L,
+            )
+            AppLog.w(TAG, "ensureModelOnce: preferred storage unavailable and no usable legacy model")
+            return
+        }
+
+        val stateFile = initialLocal ?: modelPaths.preferred ?: modelPaths.legacy
         val startedAt = SystemClock.elapsedRealtime()
 
         _state.value = ModelState.Checking(
-            file = dst,
+            file = stateFile,
             startedAtMs = startedAt,
             elapsedMs = 0L,
         )
@@ -174,29 +200,38 @@ class ModelDownloadController(
         AppLog.d(
             TAG,
             "ensureModelOnce: begin pid=${Process.myPid()} reason='${sanitizeLabel(reason)}' " +
-                    "urlHost='${safeHost(url)}' fileName='${dst.name}' " +
+                    "urlHost='${safeHost(url)}' fileName='${stateFile.name}' " +
+                    "storage='${safeStorageLabel(stateFile, modelPaths)}' " +
                     "uiThrottleMs=$uiThrottleMs uiMinDeltaBytes=$uiMinDeltaBytes timeoutMs=$timeoutMs forceFresh=$forceFresh",
         )
 
         val job = scope.launch(Dispatchers.Default) {
             try {
                 // Fast-path: local file already ready under the shared process-wide validation rules.
-                if (!forceFresh && AppProcessServices.isUsableLocalModelFile(dst)) {
+                val readyLocal = if (!forceFresh) findUsableLocalModelFile(modelPaths) else null
+                if (readyLocal != null) {
                     val end = SystemClock.elapsedRealtime()
                     _state.value = ModelState.Ready(
-                        file = dst,
-                        sizeBytes = dst.length(),
+                        file = readyLocal,
+                        sizeBytes = readyLocal.length(),
                         startedAtMs = startedAt,
                         elapsedMs = end - startedAt,
                     )
-                    AppLog.i(TAG, "ensureModelOnce: local ready size=${dst.length()}B elapsedMs=${end - startedAt}")
+                    AppLog.i(
+                        TAG,
+                        "ensureModelOnce: local ready storage='${safeStorageLabel(readyLocal, modelPaths)}' " +
+                                "size=${readyLocal.length()}B elapsedMs=${end - startedAt}",
+                    )
                     return@launch
                 }
 
-                if (!forceFresh && dst.exists() && dst.isFile) {
+                val unusableLocal = if (!forceFresh) findPresentButUnusableLocalModelFile(modelPaths) else null
+                if (unusableLocal != null) {
                     AppLog.w(
                         TAG,
-                        "ensureModelOnce: local file present but unusable; redownload required size=${safeLength(dst)}B",
+                        "ensureModelOnce: local file present but unusable " +
+                                "storage='${safeStorageLabel(unusableLocal, modelPaths)}' " +
+                                "size=${safeLength(unusableLocal)}B",
                     )
                 }
 
@@ -220,7 +255,7 @@ class ModelDownloadController(
                         if (!shouldEmitUi(downloadedBytes = downloaded, nowMs = now)) return@progress
 
                         _state.value = ModelState.Downloading(
-                            file = dst,
+                            file = stateFile,
                             startedAtMs = startedAt,
                             downloaded = downloaded,
                             total = total,
@@ -243,7 +278,8 @@ class ModelDownloadController(
                         )
                         AppLog.w(
                             TAG,
-                            "ensureModelOnce: downloaded file unusable elapsedMs=${end - startedAt} size=${safeLength(file)}B",
+                            "ensureModelOnce: downloaded file unusable elapsedMs=${end - startedAt} " +
+                                    "size=${safeLength(file)}B",
                         )
                         return@onSuccess
                     }
@@ -254,7 +290,11 @@ class ModelDownloadController(
                         startedAtMs = startedAt,
                         elapsedMs = end - startedAt,
                     )
-                    AppLog.i(TAG, "ensureModelOnce: success elapsedMs=${end - startedAt} size=${file.length()}B")
+                    AppLog.i(
+                        TAG,
+                        "ensureModelOnce: success storage='${safeStorageLabel(file, modelPaths)}' " +
+                                "elapsedMs=${end - startedAt} size=${file.length()}B",
+                    )
                 }.onFailure { t ->
                     _state.value = ModelState.Failed(
                         safeReason = safeFailureReason(t),
@@ -340,6 +380,50 @@ class ModelDownloadController(
         runCatching { scope.coroutineContext[Job]?.cancel(CancellationException("close")) }
     }
 
+    private fun resolveModelPaths(relativePath: String): ModelPaths {
+        val preferredRoot = AppProcessServices.preferredModelStorageRootOrNull(app)
+        val legacyRoot = AppProcessServices.legacyModelStorageRoot(app)
+
+        val preferredFile =
+            preferredRoot?.let { root ->
+                resolveSafeFileUnder(root, relativePath)
+            }
+
+        val legacyFile = resolveSafeFileUnder(legacyRoot, relativePath)
+
+        return ModelPaths(
+            preferred = preferredFile,
+            legacy = legacyFile,
+        )
+    }
+
+    private fun findUsableLocalModelFile(paths: ModelPaths): File? {
+        val preferred = paths.preferred
+        if (preferred != null && AppProcessServices.isUsableLocalModelFile(preferred)) return preferred
+        if (AppProcessServices.isUsableLocalModelFile(paths.legacy)) return paths.legacy
+        return null
+    }
+
+    private fun findPresentButUnusableLocalModelFile(paths: ModelPaths): File? {
+        val preferred = paths.preferred
+        if (preferred != null && preferred.exists() && preferred.isFile) return preferred
+        if (paths.legacy.exists() && paths.legacy.isFile) return paths.legacy
+        return null
+    }
+
+    private fun safeStorageLabel(file: File, paths: ModelPaths): String {
+        return when {
+            sameCanonicalFile(file, paths.preferred) -> STORAGE_PREFERRED
+            sameCanonicalFile(file, paths.legacy) -> STORAGE_LEGACY
+            else -> STORAGE_OTHER
+        }
+    }
+
+    private fun sameCanonicalFile(a: File, b: File?): Boolean {
+        if (b == null) return false
+        return runCatching { a.canonicalFile == b.canonicalFile }.getOrDefault(false)
+    }
+
     private fun resolveSafeFileUnder(baseDir: File, relativePath: String): File {
         val p = relativePath.trim()
         require(p.isNotEmpty()) { "fileName must not be empty" }
@@ -385,8 +469,17 @@ class ModelDownloadController(
         return safe.ifBlank { "unknown" }
     }
 
+    private data class ModelPaths(
+        val preferred: File?,
+        val legacy: File,
+    )
+
     companion object {
         private const val TAG = "ModelDownloader"
         private const val DOWNLOADED_FILE_NOT_USABLE = "DownloadedFileNotUsable"
+        private const val MODEL_STORAGE_UNAVAILABLE = "ModelStorageUnavailable"
+        private const val STORAGE_PREFERRED = "noBackupModels"
+        private const val STORAGE_LEGACY = "legacyFilesDir"
+        private const val STORAGE_OTHER = "other"
     }
 }
